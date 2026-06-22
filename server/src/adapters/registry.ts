@@ -480,6 +480,40 @@ const hermesLocalAdapter: ServerAdapterModule = {
       "Never use a board, browser, or local-board session for Paperclip API writes.",
     ].join("\n");
 
+    // The external hermes-paperclip-adapter renders its {{#taskId}}/{{#noTask}}
+    // prompt branches AND sets PAPERCLIP_TASK_ID for the subprocess from
+    // ctx.config.taskId — the top-level execute `config` (runtimeConfig), NOT
+    // ctx.context and NOT adapterConfig.env (see dist/server/execute.js buildPrompt:
+    // `cfgString(ctx.config?.taskId)`). The server never populates
+    // runtimeConfig.taskId, so a scoped wake left it empty → the adapter rendered
+    // the noTask branch and the agent heartbeated instead of working the assigned
+    // issue. Bridge the wake context into config here so Hermes honors scoped wakes.
+    const wakeContext = (normalizedCtx.context ?? {}) as Record<string, unknown>;
+    const readWakeStr = (key: string): string | null => {
+      const value = wakeContext[key];
+      return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+    };
+    const wakeIssue =
+      wakeContext.paperclipIssue && typeof wakeContext.paperclipIssue === "object"
+        ? (wakeContext.paperclipIssue as Record<string, unknown>)
+        : {};
+    const readIssueStr = (key: string): string | null => {
+      const value = wakeIssue[key];
+      return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+    };
+    const wakeConfig: Record<string, unknown> = {};
+    const wakeTaskId = readWakeStr("taskId") ?? readWakeStr("issueId");
+    if (wakeTaskId) wakeConfig.taskId = wakeTaskId;
+    const wakeReason = readWakeStr("wakeReason");
+    if (wakeReason) wakeConfig.wakeReason = wakeReason;
+    const wakeCommentId =
+      readWakeStr("wakeCommentId") ?? readWakeStr("latestCommentId") ?? readWakeStr("commentId");
+    if (wakeCommentId) wakeConfig.commentId = wakeCommentId;
+    const wakeTaskTitle = readIssueStr("title");
+    if (wakeTaskTitle) wakeConfig.taskTitle = wakeTaskTitle;
+    const wakeTaskBody = readIssueStr("description");
+    if (wakeTaskBody) wakeConfig.taskBody = wakeTaskBody;
+
     const patchedConfig: Record<string, unknown> = {
       ...existingConfig,
       env: {
@@ -499,6 +533,10 @@ const hermesLocalAdapter: ServerAdapterModule = {
 
     const patchedCtx = {
       ...normalizedCtx,
+      config: {
+        ...((normalizedCtx.config ?? {}) as Record<string, unknown>),
+        ...wakeConfig,
+      },
       agent: {
         ...normalizedCtx.agent,
         adapterConfig: effectivePatchedConfig,

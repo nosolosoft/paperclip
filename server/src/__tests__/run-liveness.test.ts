@@ -89,6 +89,38 @@ describe("run liveness classifier", () => {
     expect(classification.livenessState).toBe("advanced");
   });
 
+  it("classifies an agent-specific heartbeat sentinel as empty_response with no artifacts", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      issue: {
+        status: "in_progress",
+        title: "Product strategy research plan",
+        description: "Produce the market research plan.",
+      },
+      issueCommentBodies: ["PRODUCT_STRATEGY_HEARTBEAT_OK"],
+      evidence: { issueCommentsCreated: 1 },
+    });
+
+    expect(classification.livenessState).toBe("empty_response");
+  });
+
+  it("does not treat a sentinel followed by real prose as a no-op", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      issue: {
+        status: "in_progress",
+        title: "Product strategy research plan",
+        description: "Produce the market research plan.",
+      },
+      issueCommentBodies: [
+        "PRODUCT_STRATEGY_HEARTBEAT_OK: completed the competitor benchmark and recorded findings.",
+      ],
+      evidence: { issueCommentsCreated: 1 },
+    });
+
+    expect(classification.livenessState).not.toBe("empty_response");
+  });
+
   it("treats issue comments, documents, products, and actions as progress", () => {
     const latestEvidenceAt = new Date("2026-04-18T12:00:00Z");
     const classification = classifyRunLiveness({

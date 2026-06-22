@@ -291,6 +291,10 @@ export function classifyRunActionability(input: RunLivenessClassificationInput):
 
 function isNoopHeartbeatText(text: string) {
   const normalized = text.trim().toLowerCase();
+  // Pure <PREFIX>_HEARTBEAT_OK or bare HEARTBEAT_OK sentinel (no trailing prose).
+  // Trailing whitespace/punctuation allowed; real comments after the sentinel are NOT a no-op.
+  if (/^[a-z0-9_]*heartbeat_ok[\s.!:;-]*$/.test(normalized)) return true;
+  // Legacy form: "HEARTBEAT_OK no assigned <X> tasks/work"
   return (
     normalized.startsWith("heartbeat_ok") &&
     /\bno\s+assigned\b/.test(normalized) &&

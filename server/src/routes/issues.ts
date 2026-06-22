@@ -913,7 +913,9 @@ function agentLooksLikeBrowserQa(agent: { name: string; role: string; capabiliti
 
 function issueLooksLikeBrowserQaWork(input: { title?: string | null; description?: string | null }) {
   const haystack = normalizeAgentNameKey(`${input.title ?? ""} ${input.description ?? ""}`);
-  return /(browser|frontend|front-end|ui|visual|playwright|screenshot|e2e|css|layout|responsive|mobile|angular|react|next\.js|page|screen|web)/.test(haystack);
+  const looksLikeCodeOrBackendWork = /\b(api|backend|django|python|pytest|command|cli|management command|stripe|webhook|webhooks|billing|database|migration|sql|server|worker|cron|test|tests|pr|pull request)\b/.test(haystack);
+  if (looksLikeCodeOrBackendWork) return false;
+  return /\b(browser|frontend|front-end|ui|visual|playwright|screenshot|e2e|css|layout|responsive|mobile|angular|react|next\.js|page|screen)\b/.test(haystack);
 }
 
 function buildExecutionStageWakeup(input: {
@@ -1709,7 +1711,21 @@ export function issueRoutes(
     const nextAssigneeAgentId = input.updateFields.assigneeAgentId === undefined
       ? input.existing.assigneeAgentId
       : input.updateFields.assigneeAgentId;
-    if (typeof nextAssigneeAgentId === "string" && nextAssigneeAgentId.trim().length > 0) return;
+    if (typeof nextAssigneeAgentId === "string" && nextAssigneeAgentId.trim().length > 0) {
+      const nextAssigneeAgent = await agentsSvc.getById(nextAssigneeAgentId);
+      if (nextAssigneeAgent?.role === "engineer") {
+        const qaAgent = await resolveDefaultQaAgentForIssue(input.existing);
+        if (!qaAgent) {
+          throw unprocessable(INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE, {
+            code: "invalid_issue_disposition",
+            missing: "qa_agent",
+          });
+        }
+        input.updateFields.assigneeAgentId = qaAgent.id;
+        input.updateFields.assigneeUserId = null;
+      }
+      if (nextAssigneeAgent?.role === "qa") return;
+    }
 
     const nextAssigneeUserId = input.updateFields.assigneeUserId === undefined
       ? input.existing.assigneeUserId
@@ -3174,7 +3190,18 @@ export function issueRoutes(
     }
 
     const actor = getActorInfo(req);
-    const updateFields = sourceIssueStatus ? { status: sourceIssueStatus } : {};
+    const restoredReturnAgentId =
+      outcome === "restored" && sourceIssueStatus === "todo"
+        ? (activeRecoveryAction?.returnOwnerAgentId ?? null)
+        : null;
+    const updateFields = sourceIssueStatus
+      ? {
+          status: sourceIssueStatus,
+          ...(restoredReturnAgentId
+            ? { assigneeAgentId: restoredReturnAgentId, assigneeUserId: null }
+            : {}),
+        }
+      : {};
     await applyDefaultQaDispositionRouting({
       existing,
       updateFields,
@@ -3213,6 +3240,9 @@ export function issueRoutes(
           id,
           {
             status: sourceIssueStatus,
+            ...(restoredReturnAgentId
+              ? { assigneeAgentId: restoredReturnAgentId, assigneeUserId: null }
+              : {}),
             actorAgentId: actor.agentId ?? null,
             actorUserId: actor.actorType === "user" ? actor.actorId : null,
           },

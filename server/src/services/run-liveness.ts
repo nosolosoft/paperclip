@@ -289,6 +289,39 @@ export function classifyRunActionability(input: RunLivenessClassificationInput):
   return "unknown";
 }
 
+function isNoopHeartbeatText(text: string) {
+  const normalized = text.trim().toLowerCase();
+  return (
+    normalized.startsWith("heartbeat_ok") &&
+    /\bno\s+assigned\b/.test(normalized) &&
+    /\b(?:task|tasks|issue|issues|work)\b/.test(normalized)
+  );
+}
+
+// A "HEARTBEAT_OK no assigned <X> tasks" run means the agent looked and had
+// nothing to act on for this issue. It must NOT be treated as a productive
+// (advanced) run: that classification makes the successful-run-missing-state
+// recovery fire, re-own the issue to the CEO, and loop forever. We only treat a
+// run as a no-op heartbeat when every high-signal source the agent produced is
+// that heartbeat AND the run created no durable artifact (documents, work
+// products, workspace ops, activity, tool/action events). The heartbeat's own
+// issue comment is intentionally ignored here.
+function isNoopHeartbeatRun(
+  input: RunLivenessClassificationInput,
+  evidence: RunLivenessEvidenceInput,
+) {
+  const sources = highSignalSources(input);
+  if (sources.length === 0 || !sources.every(isNoopHeartbeatText)) return false;
+  return (
+    evidence.documentRevisionsCreated === 0 &&
+    evidence.planDocumentRevisionsCreated === 0 &&
+    evidence.workProductsCreated === 0 &&
+    evidence.workspaceOperationsCreated === 0 &&
+    evidence.activityEventsCreated === 0 &&
+    evidence.toolOrActionEventsCreated === 0
+  );
+}
+
 export function classifyRunLiveness(input: RunLivenessClassificationInput): RunLivenessClassification {
   const evidence = normalizeEvidence(input.evidence);
   const continuationAttempt = normalizeContinuationAttempt(input.continuationAttempt);
@@ -319,6 +352,10 @@ export function classifyRunLiveness(input: RunLivenessClassificationInput): RunL
 
   if (declaredBlocker(input)) {
     return output("blocked", issueStatus === "blocked" ? "Issue status is blocked" : "Run output declared a concrete blocker", nextAction);
+  }
+
+  if (isNoopHeartbeatRun(input, evidence)) {
+    return output("empty_response", "No-op heartbeat: agent reported no assigned work for this issue");
   }
 
   if (!usefulOutput && !concreteEvidence) {

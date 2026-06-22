@@ -12,6 +12,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueDocuments,
+  agents as agentsTable,
   issueExecutionDecisions,
   issueRelations,
   issues as issueRows,
@@ -896,6 +897,25 @@ function diffExecutionParticipants(
   };
 }
 
+function normalizeAgentNameKey(value: string | null | undefined) {
+  return value?.trim().toLowerCase().replace(/\s+/g, " ") ?? "";
+}
+
+function agentLooksLikeCodeQa(agent: { name: string; role: string; capabilities?: string | null }) {
+  const haystack = normalizeAgentNameKey([agent.name, agent.role, agent.capabilities ?? ""].join(" "));
+  return haystack.includes("qa") && (haystack.includes("code") || haystack.includes("api") || haystack.includes("backend"));
+}
+
+function agentLooksLikeBrowserQa(agent: { name: string; role: string; capabilities?: string | null }) {
+  const haystack = normalizeAgentNameKey([agent.name, agent.role, agent.capabilities ?? ""].join(" "));
+  return haystack.includes("qa") && (haystack.includes("browser") || haystack.includes("frontend") || haystack.includes("visual") || haystack.includes("ui"));
+}
+
+function issueLooksLikeBrowserQaWork(input: { title?: string | null; description?: string | null }) {
+  const haystack = normalizeAgentNameKey(`${input.title ?? ""} ${input.description ?? ""}`);
+  return /(browser|frontend|front-end|ui|visual|playwright|screenshot|e2e|css|layout|responsive|mobile|angular|react|next\.js|page|screen|web)/.test(haystack);
+}
+
 function buildExecutionStageWakeup(input: {
   issueId: string;
   previousState: ParsedExecutionState | null;
@@ -1593,11 +1613,87 @@ export function issueRoutes(
     );
   }
 
-  async function assertAgentInReviewReviewPath(input: {
+  async function resolveDefaultQaAgentForIssue(input: {
+    companyId: string;
+    title?: string | null;
+    description?: string | null;
+  }) {
+    const candidates = await db
+      .select({
+        id: agentsTable.id,
+        name: agentsTable.name,
+        role: agentsTable.role,
+        status: agentsTable.status,
+        capabilities: agentsTable.capabilities,
+      })
+      .from(agentsTable)
+      .where(and(eq(agentsTable.companyId, input.companyId), eq(agentsTable.role, "qa")));
+
+    const assignable = candidates.filter((agent) => !["terminated", "pending_approval"].includes(agent.status));
+    if (assignable.length === 0) return null;
+
+    const wantsBrowser = issueLooksLikeBrowserQaWork(input);
+    const browserQa = assignable.find(agentLooksLikeBrowserQa);
+    const codeQa = assignable.find(agentLooksLikeCodeQa);
+    return (wantsBrowser ? browserQa ?? codeQa : codeQa ?? browserQa) ?? assignable[0] ?? null;
+  }
+
+  async function resolveDefaultEngineerAgent(companyId: string) {
+    const candidates = await db
+      .select({
+        id: agentsTable.id,
+        name: agentsTable.name,
+        role: agentsTable.role,
+        status: agentsTable.status,
+      })
+      .from(agentsTable)
+      .where(and(eq(agentsTable.companyId, companyId), eq(agentsTable.role, "engineer")));
+
+    return candidates.find((agent) => !["terminated", "pending_approval"].includes(agent.status)) ?? null;
+  }
+
+  async function applyDefaultQaDispositionRouting(input: {
     existing: {
       id: string;
       companyId: string;
       status: string;
+      assigneeAgentId?: string | null;
+      assigneeUserId?: string | null;
+    };
+    updateFields: Record<string, unknown>;
+    actorAgentId?: string | null;
+  }) {
+    if (!input.actorAgentId) return;
+    const actorAgent = await agentsSvc.getById(input.actorAgentId);
+    if (actorAgent?.role !== "qa") return;
+
+    const nextStatus = typeof input.updateFields.status === "string"
+      ? input.updateFields.status
+      : input.existing.status;
+
+    if (nextStatus === "blocked" || nextStatus === "in_progress") {
+      const engineer = await resolveDefaultEngineerAgent(input.existing.companyId);
+      if (!engineer) return;
+      input.updateFields.status = "in_progress";
+      input.updateFields.assigneeAgentId = engineer.id;
+      input.updateFields.assigneeUserId = null;
+      return;
+    }
+
+    if (nextStatus === "done") {
+      input.updateFields.assigneeAgentId = null;
+      input.updateFields.assigneeUserId = null;
+    }
+  }
+
+  async function applyDefaultAgentReviewRouting(input: {
+    existing: {
+      id: string;
+      companyId: string;
+      title?: string | null;
+      description?: string | null;
+      status: string;
+      assigneeAgentId?: string | null;
       assigneeUserId?: string | null;
       executionState?: unknown;
       monitorNextCheckAt?: Date | null;
@@ -1610,10 +1706,26 @@ export function issueRoutes(
       : input.existing.status;
     if (input.actorType !== "agent" || input.existing.status === "in_review" || nextStatus !== "in_review") return;
 
+    const nextAssigneeAgentId = input.updateFields.assigneeAgentId === undefined
+      ? input.existing.assigneeAgentId
+      : input.updateFields.assigneeAgentId;
+    if (typeof nextAssigneeAgentId === "string" && nextAssigneeAgentId.trim().length > 0) return;
+
     const nextAssigneeUserId = input.updateFields.assigneeUserId === undefined
       ? input.existing.assigneeUserId
       : input.updateFields.assigneeUserId;
-    if (typeof nextAssigneeUserId === "string" && nextAssigneeUserId.trim().length > 0) return;
+    if (typeof nextAssigneeUserId === "string" && nextAssigneeUserId.trim().length > 0) {
+      const sourceAgentId = input.existing.assigneeAgentId;
+      const sourceAgent = sourceAgentId ? await agentsSvc.getById(sourceAgentId) : null;
+      if (sourceAgent?.role === "engineer") {
+        const qaAgent = await resolveDefaultQaAgentForIssue(input.existing);
+        if (qaAgent) {
+          input.updateFields.assigneeAgentId = qaAgent.id;
+          input.updateFields.assigneeUserId = null;
+        }
+      }
+      return;
+    }
 
     const nextExecutionState = input.updateFields.executionState === undefined
       ? input.existing.executionState
@@ -1633,17 +1745,98 @@ export function issueRoutes(
     const approvals = await issueApprovalsSvc.listApprovalsForIssue(input.existing.id);
     if (approvals.some((approval) => ACTIVE_REVIEW_APPROVAL_STATUSES.has(String(approval.status)))) return;
 
+    const sourceAgentId = input.existing.assigneeAgentId;
+    const sourceAgent = sourceAgentId ? await agentsSvc.getById(sourceAgentId) : null;
+    if (sourceAgent?.role === "engineer") {
+      const qaAgent = await resolveDefaultQaAgentForIssue(input.existing);
+      if (!qaAgent) {
+        throw unprocessable(INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE, {
+          code: "invalid_issue_disposition",
+          missing: "qa_agent",
+        });
+      }
+      input.updateFields.assigneeAgentId = qaAgent.id;
+      input.updateFields.assigneeUserId = null;
+      return;
+    }
+
+    if (sourceAgent?.role === "researcher" || sourceAgent?.role === "cmo") {
+      input.updateFields.assigneeAgentId = null;
+      input.updateFields.assigneeUserId = "local-board";
+      return;
+    }
+
     throw unprocessable(INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE, {
       code: "invalid_issue_disposition",
       missing: "review_path",
       validReviewPaths: [
+        "qa_agent_assignee",
+        "human_assignee_user_id",
         "pending_issue_thread_interaction",
         "linked_pending_approval",
-        "human_assignee_user_id",
         "typed_execution_state_current_participant",
         "scheduled_issue_monitor",
       ],
     });
+  }
+
+  async function assertAgentProjectIssuePullRequestPreflight(input: {
+    existing: {
+      id: string;
+      status: string;
+      assigneeUserId?: string | null;
+      projectId?: string | null;
+      projectWorkspaceId?: string | null;
+      executionWorkspaceId?: string | null;
+    };
+    updateFields: Record<string, unknown>;
+    actorType: string;
+  }) {
+    const nextStatus = typeof input.updateFields.status === "string"
+      ? input.updateFields.status
+      : input.existing.status;
+    if (input.actorType !== "agent" || input.existing.status === "in_review" || nextStatus !== "in_review") return;
+
+    const projectScoped = Boolean(
+      input.existing.projectId ||
+      input.existing.projectWorkspaceId ||
+      input.existing.executionWorkspaceId,
+    );
+    if (!projectScoped) return;
+
+    const workProducts = await workProductsSvc.listForIssue(input.existing.id);
+    const pullRequests = workProducts.filter((product) =>
+      product.type === "pull_request" &&
+      product.status !== "closed" &&
+      product.status !== "archived" &&
+      product.status !== "failed");
+    const primaryPullRequest = pullRequests.find((product) => product.isPrimary) ?? pullRequests[0] ?? null;
+
+    if (!primaryPullRequest) {
+      const nextAssigneeUserId = input.updateFields.assigneeUserId === undefined
+        ? input.existing.assigneeUserId
+        : input.updateFields.assigneeUserId;
+      if (typeof nextAssigneeUserId === "string" && nextAssigneeUserId.trim().length > 0) return;
+
+      throw unprocessable("Agent cannot move a project-scoped issue to review without a linked pull request work product", {
+        code: "missing_pull_request_preflight",
+        required: ["pull_request_work_product"],
+      });
+    }
+
+    const reviewReady = ["ready_for_review", "approved"].includes(primaryPullRequest.status);
+    if (primaryPullRequest.healthStatus !== "healthy" || !reviewReady) {
+      throw unprocessable("Agent cannot move a project-scoped issue to review until the linked pull request is preflight-clean", {
+        code: "pull_request_preflight_failed",
+        pullRequestWorkProductId: primaryPullRequest.id,
+        pullRequestStatus: primaryPullRequest.status,
+        pullRequestHealthStatus: primaryPullRequest.healthStatus,
+        required: {
+          status: ["ready_for_review", "approved"],
+          healthStatus: "healthy",
+        },
+      });
+    }
   }
 
   async function logExpiredRequestConfirmations(input: {
@@ -2982,7 +3175,12 @@ export function issueRoutes(
 
     const actor = getActorInfo(req);
     const updateFields = sourceIssueStatus ? { status: sourceIssueStatus } : {};
-    await assertAgentInReviewReviewPath({
+    await applyDefaultQaDispositionRouting({
+      existing,
+      updateFields,
+      actorAgentId: actor.agentId ?? null,
+    });
+    await applyDefaultAgentReviewRouting({
       existing,
       updateFields,
       actorType: req.actor.type,
@@ -5058,7 +5256,17 @@ export function issueRoutes(
       }
     }
 
-    await assertAgentInReviewReviewPath({
+    await applyDefaultQaDispositionRouting({
+      existing,
+      updateFields,
+      actorAgentId: actor.agentId ?? null,
+    });
+    await applyDefaultAgentReviewRouting({
+      existing,
+      updateFields,
+      actorType: req.actor.type,
+    });
+    await assertAgentProjectIssuePullRequestPreflight({
       existing,
       updateFields,
       actorType: req.actor.type,
@@ -5070,17 +5278,18 @@ export function issueRoutes(
       updateFields.assigneeUserId === undefined ? existing.assigneeUserId : (updateFields.assigneeUserId as string | null);
     const assigneeWillChange =
       nextAssigneeAgentId !== existing.assigneeAgentId || nextAssigneeUserId !== existing.assigneeUserId;
-    const isAgentReturningIssueToCreator =
+    const nextStatusForAssignment = typeof updateFields.status === "string" ? updateFields.status : existing.status;
+    const isAgentHandingOffIssueToHumanReviewer =
       req.actor.type === "agent" &&
       !!req.actor.agentId &&
       existing.assigneeAgentId === req.actor.agentId &&
       nextAssigneeAgentId === null &&
       typeof nextAssigneeUserId === "string" &&
-      !!existing.createdByUserId &&
-      nextAssigneeUserId === existing.createdByUserId;
+      nextAssigneeUserId.trim().length > 0 &&
+      nextStatusForAssignment === "in_review";
 
     if (assigneeWillChange && !transition.workflowControlledAssignment) {
-      if (!isAgentReturningIssueToCreator) {
+      if (!isAgentHandingOffIssueToHumanReviewer) {
         await assertCanAssignTasks(req, existing.companyId, {
           issueId: existing.id,
           projectId: await resolveAssignmentProjectId({

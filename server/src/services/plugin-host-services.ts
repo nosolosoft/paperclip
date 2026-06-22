@@ -76,6 +76,30 @@ import { accessService } from "./access.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { sanitizeRecord } from "../redaction.js";
 
+
+function normalizeAgentRoutingText(value: string | null | undefined) {
+  return value?.trim().toLowerCase().replace(/\s+/g, " ") ?? "";
+}
+
+function issueLooksLikeBrowserQaRouting(input: { title?: string | null; description?: string | null }) {
+  const haystack = normalizeAgentRoutingText(`${input.title ?? ""} ${input.description ?? ""}`);
+  return /(browser|frontend|front-end|ui|visual|playwright|screenshot|e2e|css|layout|responsive|mobile|angular|react|next\.js|page|screen|web)/.test(haystack);
+}
+
+function agentLooksLikeCodeQaRouting(agent: { name?: string | null; role?: string | null; capabilities?: string | null }) {
+  const haystack = normalizeAgentRoutingText([agent.name ?? "", agent.role ?? "", agent.capabilities ?? ""].join(" "));
+  return haystack.includes("qa") && (haystack.includes("code") || haystack.includes("api") || haystack.includes("backend"));
+}
+
+function agentLooksLikeBrowserQaRouting(agent: { name?: string | null; role?: string | null; capabilities?: string | null }) {
+  const haystack = normalizeAgentRoutingText([agent.name ?? "", agent.role ?? "", agent.capabilities ?? ""].join(" "));
+  return haystack.includes("qa") && (haystack.includes("browser") || haystack.includes("frontend") || haystack.includes("visual") || haystack.includes("ui"));
+}
+
+function agentLooksLikeEngineerRouting(agent: { role?: string | null; status?: string | null }) {
+  return agent.role === "engineer" && !["terminated", "pending_approval"].includes(agent.status ?? "");
+}
+
 // ---------------------------------------------------------------------------
 // SSRF protection for plugin HTTP fetch
 // ---------------------------------------------------------------------------
@@ -1589,6 +1613,43 @@ export function buildHostServices(
         if (patch.originKind !== undefined) {
           patch.originKind = normalizePluginOriginKind(patch.originKind);
         }
+
+        const nextStatus = typeof patch.status === "string" ? patch.status : existing.status;
+        const nextAssigneeAgentId = patch.assigneeAgentId === undefined ? existing.assigneeAgentId : patch.assigneeAgentId;
+        const nextAssigneeUserId = patch.assigneeUserId === undefined ? existing.assigneeUserId : patch.assigneeUserId;
+        if (actorAgentId) {
+          const sourceAgent = await agents.getById(actorAgentId);
+          if (sourceAgent?.role === "qa" && (nextStatus === "blocked" || nextStatus === "in_progress")) {
+            const candidateAgents = await agents.list(companyId);
+            const engineer = candidateAgents.find(agentLooksLikeEngineerRouting);
+            if (engineer) {
+              patch.status = "in_progress";
+              patch.assigneeAgentId = engineer.id;
+              patch.assigneeUserId = null;
+            }
+          } else if (sourceAgent?.role === "qa" && nextStatus === "done") {
+            patch.assigneeAgentId = null;
+            patch.assigneeUserId = null;
+          } else if (existing.status !== "in_review" && nextStatus === "in_review" && !nextAssigneeAgentId) {
+            if (sourceAgent?.role === "engineer") {
+              const candidateAgents = await agents.list(companyId);
+              const assignableQaAgents = candidateAgents.filter((agent) =>
+                agent.role === "qa" && !["terminated", "pending_approval"].includes(agent.status));
+              const wantsBrowser = issueLooksLikeBrowserQaRouting(existing);
+              const browserQa = assignableQaAgents.find(agentLooksLikeBrowserQaRouting);
+              const codeQa = assignableQaAgents.find(agentLooksLikeCodeQaRouting);
+              const qaAgent = (wantsBrowser ? browserQa ?? codeQa : codeQa ?? browserQa) ?? assignableQaAgents[0] ?? null;
+              if (qaAgent) {
+                patch.assigneeAgentId = qaAgent.id;
+                patch.assigneeUserId = null;
+              }
+            } else if ((sourceAgent?.role === "researcher" || sourceAgent?.role === "cmo") && !nextAssigneeUserId) {
+              patch.assigneeAgentId = null;
+              patch.assigneeUserId = "local-board";
+            }
+          }
+        }
+
         const updated = (await issues.update(params.issueId, {
           ...(patch as any),
           actorAgentId,

@@ -38,6 +38,57 @@ describe("run liveness classifier", () => {
     expect(classification.actionability).toBe("unknown");
   });
 
+  it("classifies a no-op heartbeat as empty_response even on a research/plan issue", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      issue: {
+        status: "in_progress",
+        title: "Benchmark legal competencia + gap report + diffs propuestos",
+        description: "Produce the competitor legal benchmark.",
+      },
+      issueCommentBodies: ["HEARTBEAT_OK no assigned research tasks"],
+      evidence: { issueCommentsCreated: 1 },
+    });
+
+    expect(classification.livenessState).toBe("empty_response");
+  });
+
+  it("treats a real comment alongside heartbeat text as progress, not a no-op", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      issue: {
+        status: "in_progress",
+        title: "Research report",
+        description: "Produce the report.",
+      },
+      issueCommentBodies: [
+        "HEARTBEAT_OK no assigned research tasks",
+        "Completed the competitor benchmark and recorded findings.",
+      ],
+      evidence: { workProductsCreated: 1, latestEvidenceAt: new Date("2026-04-18T12:00:00Z") },
+    });
+
+    expect(classification.livenessState).toBe("advanced");
+  });
+
+  it("does not treat a heartbeat run that produced a durable artifact as a no-op", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      issue: {
+        status: "in_progress",
+        title: "Research report",
+        description: "Produce the report.",
+      },
+      issueCommentBodies: ["HEARTBEAT_OK no assigned research tasks"],
+      evidence: {
+        documentRevisionsCreated: 1,
+        latestEvidenceAt: new Date("2026-04-18T12:00:00Z"),
+      },
+    });
+
+    expect(classification.livenessState).toBe("advanced");
+  });
+
   it("treats issue comments, documents, products, and actions as progress", () => {
     const latestEvidenceAt = new Date("2026-04-18T12:00:00Z");
     const classification = classifyRunLiveness({

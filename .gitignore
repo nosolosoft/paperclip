@@ -63,3 +63,10 @@ tests/release-smoke/playwright-report/
 
 # Local hardened agent instructions (source of truth, copied to agent-home by restore)
 scripts/local-agent-instructions/
+
+# Local maintenance artifacts — never commit (public repo, may contain state/secrets)
+.paperclip-rollback-*.json
+.paperclip-agy-migration-backup-*.json
+*-backup-*.json
+*.bundle
+scripts/__pycache__/

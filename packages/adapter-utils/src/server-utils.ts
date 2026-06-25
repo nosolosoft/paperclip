@@ -812,6 +812,7 @@ export function renderPaperclipWakePrompt(
       lines.push(
         "You are waking because changes were requested in the execution workflow.",
         "Address the requested changes on this issue and resubmit when the work is ready.",
+        "Before moving the issue to review, link/update the pull_request work product and mark it ready_for_review + healthy only after a clean preflight: diff reviewed, no unrelated files, local tests/lint/typecheck relevant to the change passed, and GitHub checks are not failing.",
         "",
       );
     }
@@ -945,6 +946,7 @@ export function buildPaperclipEnv(agent: { id: string; companyId: string }): Rec
   const vars: Record<string, string> = {
     PAPERCLIP_AGENT_ID: agent.id,
     PAPERCLIP_COMPANY_ID: agent.companyId,
+    PAPERCLIP_SPAWNED: "true",
   };
   const runtimeHost = resolveHostForUrl(
     process.env.PAPERCLIP_LISTEN_HOST ?? process.env.HOST ?? "localhost",

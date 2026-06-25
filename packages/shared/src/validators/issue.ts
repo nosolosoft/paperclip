@@ -280,6 +280,8 @@ export const resolveIssueRecoveryActionSchema = z.object({
   actionId: z.string().uuid().optional(),
   outcome: z.enum(RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES),
   sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked"]),
+  assigneeAgentId: z.string().uuid().optional().nullable(),
+  clearAssignee: z.boolean().optional(),
   resolutionNote: multilineTextSchema.optional().nullable(),
 }).strict().superRefine((value, ctx) => {
   if (value.outcome === "restored") {

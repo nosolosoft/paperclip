@@ -152,6 +152,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const companyId = randomUUID();
     const managerId = randomUUID();
     const coderId = randomUUID();
+    const qaCodeId = randomUUID();
+    const qaBrowserId = randomUUID();
     const sourceIssueId = randomUUID();
     const prefix = `RA${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`;
     await db.insert(companies).values({
@@ -184,6 +186,30 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         runtimeConfig: {},
         permissions: {},
       },
+      {
+        id: qaCodeId,
+        companyId,
+        name: "QA (Code)",
+        role: "qa",
+        status: "idle",
+        reportsTo: managerId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: qaBrowserId,
+        companyId,
+        name: "QA (Browser)",
+        role: "qa",
+        status: "idle",
+        reportsTo: managerId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
     ]);
     await db.insert(issues).values({
       id: sourceIssueId,
@@ -196,7 +222,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       identifier: `${prefix}-1`,
     });
     const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
-    return { companyId, managerId, coderId, sourceIssueId, prefix, sourceIssue: sourceIssue! };
+    return { companyId, managerId, coderId, qaCodeId, qaBrowserId, sourceIssueId, prefix, sourceIssue: sourceIssue! };
   }
 
   async function seedHeartbeatRun(input: {
@@ -542,8 +568,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         outcome: "restored",
         sourceIssueStatus: "done",
         resolutionNote: "Operator confirmed the source issue is complete.",
-      })
-      .expect(200);
+      });
+    expect(resolved.status, JSON.stringify(resolved.body)).toBe(200);
 
     expect(resolved.body.issue).toMatchObject({
       id: sourceIssueId,
@@ -663,6 +689,101 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       assigneeAgentId: coderId,
       assigneeUserId: null,
     });
+  });
+
+
+  it("resolves a review-ready recovery directly to QA instead of the return owner", async () => {
+    const { companyId, managerId, coderId, qaCodeId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "blocked", assigneeAgentId: managerId, assigneeUserId: null })
+      .where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      previousOwnerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      cause: "successful_run_missing_state",
+      fingerprint: "missing-disposition:review-ready",
+      evidence: { sourceRunId: "run-1", reviewReady: true },
+      nextAction: "Send review-ready work to QA.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const app = createApp();
+
+    const resolved = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        sourceIssueStatus: "in_review",
+        assigneeAgentId: qaCodeId,
+        resolutionNote: "PR is ready; route to QA instead of returning to the executor.",
+      })
+      .expect(200);
+
+    expect(resolved.body.issue).toMatchObject({
+      id: sourceIssueId,
+      status: "in_review",
+      assigneeAgentId: qaCodeId,
+      assigneeUserId: null,
+      activeRecoveryAction: null,
+    });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+  });
+
+  it("allows QA Browser recovery resolution to complete the issue and clear assignment", async () => {
+    const { companyId, managerId, qaBrowserId, sourceIssueId } = await seedCompany();
+    await db
+      .update(issues)
+      .set({ status: "in_review", assigneeAgentId: qaBrowserId, assigneeUserId: null })
+      .where(eq(issues.id, sourceIssueId));
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "agent",
+      ownerAgentId: qaBrowserId,
+      previousOwnerAgentId: qaBrowserId,
+      returnOwnerAgentId: qaBrowserId,
+      cause: "successful_run_missing_state",
+      fingerprint: "missing-disposition:qa-browser-pass",
+      evidence: { qaBrowserPass: true },
+      nextAction: "Record the QA Browser pass disposition.",
+      wakePolicy: { type: "wake_owner" },
+    });
+    const app = createApp({
+      type: "agent",
+      agentId: qaBrowserId,
+      actorId: qaBrowserId,
+      companyId,
+      source: "agent",
+    });
+
+    const resolved = await request(app)
+      .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({
+        actionId: action.id,
+        outcome: "restored",
+        sourceIssueStatus: "done",
+        clearAssignee: true,
+        resolutionNote: "QA Browser PASS; complete the agent loop.",
+      });
+    expect(resolved.status, JSON.stringify(resolved.body)).toBe(200);
+
+    expect(resolved.body.issue).toMatchObject({
+      id: sourceIssueId,
+      status: "done",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      activeRecoveryAction: null,
+    });
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
   });
 
   it("marks a recovery action stale when a blocked source issue is manually moved to todo", async () => {

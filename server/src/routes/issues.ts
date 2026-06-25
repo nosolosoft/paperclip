@@ -3190,16 +3190,25 @@ export function issueRoutes(
     }
 
     const actor = getActorInfo(req);
+    const explicitAssigneeAgentId = typeof req.body.assigneeAgentId === "string"
+      ? req.body.assigneeAgentId
+      : null;
+    const clearAssignee = req.body.clearAssignee === true;
     const restoredReturnAgentId =
       outcome === "restored" && sourceIssueStatus === "todo"
         ? (activeRecoveryAction?.returnOwnerAgentId ?? null)
         : null;
+    const recoveryAssigneePatch = explicitAssigneeAgentId
+      ? { assigneeAgentId: explicitAssigneeAgentId, assigneeUserId: null }
+      : clearAssignee
+        ? { assigneeAgentId: null, assigneeUserId: null }
+        : restoredReturnAgentId
+          ? { assigneeAgentId: restoredReturnAgentId, assigneeUserId: null }
+          : {};
     const updateFields = sourceIssueStatus
       ? {
           status: sourceIssueStatus,
-          ...(restoredReturnAgentId
-            ? { assigneeAgentId: restoredReturnAgentId, assigneeUserId: null }
-            : {}),
+          ...recoveryAssigneePatch,
         }
       : {};
     await applyDefaultQaDispositionRouting({
@@ -3240,9 +3249,7 @@ export function issueRoutes(
           id,
           {
             status: sourceIssueStatus,
-            ...(restoredReturnAgentId
-              ? { assigneeAgentId: restoredReturnAgentId, assigneeUserId: null }
-              : {}),
+            ...recoveryAssigneePatch,
             actorAgentId: actor.agentId ?? null,
             actorUserId: actor.actorType === "user" ? actor.actorId : null,
           },
@@ -6176,6 +6183,24 @@ export function issueRoutes(
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
     const actorRunId = requireAgentRunId(req, res);
     if (req.actor.type === "agent" && !actorRunId) return;
+
+    // Guard: an agent releasing an issue that is in_review silently resets it to an
+    // ownerless `todo` (release hard-sets status:"todo", assigneeAgentId:null) with no
+    // review/wake path, so a passed review becomes an invisible stall (see NSS-442/NSS-439).
+    // Force a real disposition instead. Board/admin force-release is unaffected.
+    if (req.actor.type === "agent" && existing.status === "in_review") {
+      throw unprocessable(
+        "Cannot release an issue that is in_review. Submit a disposition via PATCH with a valid " +
+          "review path (e.g. status with assigneeUserId or a QA assigneeAgentId) instead of releasing " +
+          "it back to an ownerless todo.",
+        {
+          code: "invalid_issue_disposition",
+          missing: "review_path",
+          issueId: existing.id,
+          status: existing.status,
+        },
+      );
+    }
 
     const released = await svc.release(
       id,

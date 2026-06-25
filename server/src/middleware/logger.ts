@@ -30,7 +30,12 @@ const sharedOpts = {
 
 export const logger = pino({
   level: "debug",
-  redact: ["req.headers.authorization"],
+  redact: [
+    "req.headers.authorization",
+    "req.headers.cookie",
+    "req.headers['set-cookie']",
+    "res.headers['set-cookie']",
+  ],
 }, pino.transport({
   targets: [
     {

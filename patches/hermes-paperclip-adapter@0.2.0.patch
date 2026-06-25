@@ -1,0 +1,18 @@
+diff --git a/dist/server/execute.js b/dist/server/execute.js
+index 93cddf8243271f5fb3ab101617f9114257e41328..ce579051d69255f3f121989b51609fc19c44de1b 100644
+--- a/dist/server/execute.js
++++ b/dist/server/execute.js
+@@ -344,6 +344,13 @@ export async function execute(ctx) {
+         timeoutSec,
+         graceSec,
+         onLog: wrappedOnLog,
++        // Forward the host onSpawn so Paperclip persists the child pid. Without
++        // this the server never records processPid, so the orphaned-run reaper
++        // cannot tell a silent-but-alive hermes child (no stdout streaming, e.g.
++        // long browser-QA turns) from a dead one and false-positives it as
++        // process_lost at the 5-min staleness threshold. With the pid persisted,
++        // the reaper's isProcessAlive(processPid) guard keeps the live run.
++        onSpawn: ctx.onSpawn,
+     });
+     // ── Parse output ───────────────────────────────────────────────────────
+     const parsed = parseHermesOutput(result.stdout || "", result.stderr || "");

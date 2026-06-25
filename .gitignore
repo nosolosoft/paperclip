@@ -60,3 +60,6 @@ tests/release-smoke/playwright-report/
 .superpowers/
 .claude/worktrees/
 .herenow
+
+# Local hardened agent instructions (source of truth, copied to agent-home by restore)
+scripts/local-agent-instructions/

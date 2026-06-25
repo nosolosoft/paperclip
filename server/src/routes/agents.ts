@@ -1988,7 +1988,7 @@ export function agentRoutes(
     const recoveryActionsSvc = issueRecoveryActionService(db);
     const rows = await issuesSvc.list(req.actor.companyId, {
       assigneeAgentId: req.actor.agentId,
-      status: "todo,in_progress,blocked",
+      status: "todo,in_progress,blocked,in_review",
       includeRoutineExecutions: true,
       limit: ISSUE_LIST_DEFAULT_LIMIT,
     });
@@ -3306,17 +3306,25 @@ export function agentRoutes(
     }
 
     const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: agent.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "heartbeat.invoked",
-      entityType: "heartbeat_run",
-      entityId: run.id,
-      details: { agentId: id },
-    });
+    // Best-effort audit log: a side-effect log must never abort the invoke or
+    // leave the run unregistered. runId is null on purpose — entityId is already
+    // run.id, and actor.runId may be a JWT run_id that is not a persisted run
+    // (operator scoped-wake helper), which would FK-fail and 500 the invoke.
+    try {
+      await logActivity(db, {
+        companyId: agent.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: null,
+        action: "heartbeat.invoked",
+        entityType: "heartbeat_run",
+        entityId: run.id,
+        details: { agentId: id },
+      });
+    } catch (err) {
+      console.warn("activity log failed (non-fatal) for heartbeat.invoked", err);
+    }
 
     res.status(202).json(run);
   };
@@ -3397,17 +3405,25 @@ export function agentRoutes(
     }
 
     const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: agent.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "heartbeat.invoked",
-      entityType: "heartbeat_run",
-      entityId: run.id,
-      details: { agentId: id },
-    });
+    // Best-effort audit log: a side-effect log must never abort the invoke or
+    // leave the run unregistered. runId is null on purpose — entityId is already
+    // run.id, and actor.runId may be a JWT run_id that is not a persisted run
+    // (operator scoped-wake helper), which would FK-fail and 500 the invoke.
+    try {
+      await logActivity(db, {
+        companyId: agent.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: null,
+        action: "heartbeat.invoked",
+        entityType: "heartbeat_run",
+        entityId: run.id,
+        details: { agentId: id },
+      });
+    } catch (err) {
+      console.warn("activity log failed (non-fatal) for heartbeat.invoked", err);
+    }
 
     res.status(202).json(run);
   });

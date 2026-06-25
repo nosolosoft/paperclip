@@ -303,13 +303,6 @@ function isCommentDrivenWake(run: HeartbeatRunRow) {
     wakeReason === "issue_reopened_via_comment";
 }
 
-function isProductiveSuccessfulRun(input: {
-  livenessState: RunLivenessState | null;
-  detectedProgressSummary: string | null;
-}) {
-  if (input.livenessState && PRODUCTIVE_SUCCESS_LIVENESS_STATES.has(input.livenessState)) return true;
-  return Boolean(input.detectedProgressSummary);
-}
 
 export function buildSuccessfulRunHandoffInstruction(input: {
   issueIdentifier: string | null;
@@ -336,6 +329,25 @@ export function buildSuccessfulRunHandoffInstruction(input: {
     "Comments, document revisions, work-product writes, and continuation summaries are supporting evidence only — they do not satisfy this handoff unless the issue state/path also records one valid disposition. If this wake is status-only recovery, document or plan updates are not allowed.",
   ].join("\n");
 }
+
+function isNoopHeartbeatProgressSummary(summary: string | null) {
+  if (!summary) return false;
+  const normalized = summary.trim().toLowerCase();
+  return normalized.startsWith("heartbeat_ok") &&
+    /\bno\s+assigned\b/.test(normalized) &&
+    /\b(task|tasks|issue|issues|work)\b/.test(normalized);
+}
+
+function isProductiveSuccessfulRun(input: {
+  livenessState: RunLivenessState | null;
+  detectedProgressSummary: string | null;
+}) {
+  if (isNoopHeartbeatProgressSummary(input.detectedProgressSummary)) return false;
+  return Boolean(
+    input.livenessState && PRODUCTIVE_SUCCESS_LIVENESS_STATES.has(input.livenessState),
+  ) || Boolean(input.detectedProgressSummary);
+}
+
 
 export function decideSuccessfulRunHandoff(input: {
   run: HeartbeatRunRow;

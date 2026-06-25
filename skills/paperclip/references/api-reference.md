@@ -798,6 +798,29 @@ Best practice:
 - After creating a pending checkbox confirmation, move the source issue to `in_review` with a comment that names exactly what the board must decide. Pending interactions are an explicit waiting path, not a synonym for `done`.
 - When a `superseded_by_comment` or `stale_target` wake fires, address the new comment or rebuild the target, then create a fresh checkbox confirmation with an idempotency key that includes the new revision id.
 
+### PR merge approval (required before any merge)
+
+Agents MUST request board approval before merging any PR. Use type `merge_pr`:
+
+```
+POST /api/companies/{companyId}/approvals
+{
+  "type": "merge_pr",
+  "requestedByAgentId": "{your-agent-id}",
+  "issueIds": ["{issue-id}"],
+  "payload": {
+    "prNumber": 123,
+    "prTitle": "feat: add feature X",
+    "prUrl": "https://github.com/org/repo/pull/123",
+    "baseBranch": "master",
+    "ciStatus": "passing",
+    "reviewStatus": "current"
+  }
+}
+```
+
+After posting: set the issue to `blocked`, exit the heartbeat, and wait for the board to approve. On the next wake, check `PAPERCLIP_APPROVAL_STATUS` - proceed with `gh pr merge` only if it equals `"approved"`.
+
 ### Checking approval status
 
 ```

@@ -314,6 +314,27 @@ For commands, response fields, and MCP tools, read:
 - **Escalate** via `chainOfCommand` when stuck. Reassign to manager or create a task for them.
 - **Hiring**: use the `paperclip-create-agent` skill for new agent creation workflows (links to reusable `AGENTS.md` templates like `Coder` and `QA`).
 - **Commit Co-author**: if you make a git commit you MUST add EXACTLY `Co-Authored-By: Paperclip <noreply@paperclip.ing>` to the end of each commit message. Do not put in your agent name, put `Co-Authored-By: Paperclip <noreply@paperclip.ing>`.
+- **Never merge PRs without board approval.** Before running `gh pr merge`, `/land-and-deploy`, or any git command that merges into the default branch, you MUST first request board approval via the Paperclip approvals API. Never answer your own AskUserQuestion to approve a merge - that bypasses the human gate. The flow:
+  1. POST the approval request:
+     ```
+     POST /api/companies/{companyId}/approvals
+     {
+       "type": "merge_pr",
+       "requestedByAgentId": "{your-agent-id}",
+       "issueIds": ["{issue-id}"],
+       "payload": {
+         "prNumber": 123,
+         "prTitle": "feat: add feature X",
+         "prUrl": "https://github.com/org/repo/pull/123",
+         "baseBranch": "master",
+         "ciStatus": "passing",
+         "reviewStatus": "current"
+       }
+     }
+     ```
+  2. Set the issue status to `blocked` with a comment like: "Waiting for board approval to merge PR #123."
+  3. Exit the heartbeat. Do NOT proceed with the merge in this heartbeat.
+  4. On the next wake, check `PAPERCLIP_APPROVAL_STATUS` in your env or the approval record. Only execute `gh pr merge` if the approval status is `"approved"`. If `"rejected"` or `"revision_requested"`, update the issue and escalate.
 
 This is rule #1:
 
@@ -327,24 +348,24 @@ When posting issue comments or writing issue descriptions, use concise markdown 
 - bullets for what changed / what is blocked
 - links to related entities when available
 
-**Ticket references are links (required):** If you mention another issue identifier such as `PAP-224`, `ZED-24`, or any `{PREFIX}-{NUMBER}` ticket id inside a comment body or issue description, wrap it in a Markdown link:
+**Ticket references are links (required):** If you mention another issue identifier such as `NSS-224`, `ZED-24`, or any `{PREFIX}-{NUMBER}` ticket id inside a comment body or issue description, wrap it in a Markdown link. The prefix for this company is **NSS**:
 
-- `[PAP-224](/PAP/issues/PAP-224)`
+- `[NSS-224](/NSS/issues/NSS-224)`
 - `[ZED-24](/ZED/issues/ZED-24)`
 
 Never leave bare ticket ids in issue descriptions or comments when a clickable internal link can be provided.
 
 **Company-prefixed URLs (required):** All internal links MUST include the company prefix. Derive the prefix from any issue identifier you have (e.g., `PAP-315` → prefix is `PAP`). Use this prefix in all UI links:
 
-- Issues: `/<prefix>/issues/<issue-identifier>` (e.g., `/PAP/issues/PAP-224`)
+- Issues: `/<prefix>/issues/<issue-identifier>` (e.g., `/NSS/issues/NSS-224`)
 - Issue comments: `/<prefix>/issues/<issue-identifier>#comment-<comment-id>` (deep link to a specific comment)
 - Issue documents: `/<prefix>/issues/<issue-identifier>#document-<document-key>` (deep link to a specific document such as `plan`)
-- Agents: `/<prefix>/agents/<agent-url-key>` (e.g., `/PAP/agents/claudecoder`)
+- Agents: `/<prefix>/agents/<agent-url-key>` (e.g., `/NSS/agents/claudecoder`)
 - Projects: `/<prefix>/projects/<project-url-key>` (id fallback allowed)
 - Approvals: `/<prefix>/approvals/<approval-id>`
 - Runs: `/<prefix>/agents/<agent-url-key-or-id>/runs/<run-id>`
 
-Do NOT use unprefixed paths like `/issues/PAP-123` or `/agents/cto` — always include the company prefix.
+Do NOT use unprefixed paths like `/issues/NSS-123` or `/agents/cto` — always include the company prefix.
 
 **Preserve markdown line breaks (required):** build multiline JSON bodies from heredoc/file input (via the helper in Step 8 or `jq -n --arg comment "$comment"`). Never manually compress markdown into a one-line JSON `comment` string unless you intentionally want a single paragraph.
 
@@ -355,10 +376,10 @@ Example:
 
 Submitted CTO hire request and linked it for board review.
 
-- Approval: [ca6ba09d](/PAP/approvals/ca6ba09d-b558-4a53-a552-e7ef87e54a1b)
-- Pending agent: [CTO draft](/PAP/agents/cto)
-- Source issue: [PAP-142](/PAP/issues/PAP-142)
-- Depends on: [PAP-224](/PAP/issues/PAP-224)
+- Approval: [ca6ba09d](/NSS/approvals/ca6ba09d-b558-4a53-a552-e7ef87e54a1b)
+- Pending agent: [CTO draft](/NSS/agents/cto)
+- Source issue: [NSS-142](/NSS/issues/NSS-142)
+- Depends on: [NSS-224](/NSS/issues/NSS-224)
 ```
 
 ## Planning (Required when planning requested)

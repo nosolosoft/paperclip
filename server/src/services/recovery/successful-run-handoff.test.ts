@@ -137,6 +137,17 @@ describe("successful run handoff decision", () => {
     });
   });
 
+
+  it("does not treat HEARTBEAT_OK no-assigned-task comments as productive progress", () => {
+    expect(decide({
+      livenessState: "advanced",
+      detectedProgressSummary: "HEARTBEAT_OK no assigned research tasks",
+    })).toEqual({
+      kind: "skip",
+      reason: "successful run did not produce handoff-relevant progress",
+    });
+  });
+
   it("does not treat adapter or runtime failures as missing-disposition handoffs", () => {
     expect(decide({ run: { ...run, status: "failed", errorCode: "adapter_failed" } as any })).toEqual({
       kind: "skip",

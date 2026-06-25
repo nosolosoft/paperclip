@@ -67,6 +67,32 @@ describe("actorMiddleware authenticated session profile", () => {
     });
   });
 
+  it("ignores non-UUID x-paperclip-run-id values on session actors", async () => {
+    const app = express();
+    app.use(
+      actorMiddleware(createDb(), {
+        deploymentMode: "authenticated",
+        resolveSession: async () => ({
+          session: { id: "session-1", userId: "user-1" },
+          user: {
+            id: "user-1",
+            name: "User One",
+            email: "user@example.com",
+          },
+        }),
+      }),
+    );
+    app.get("/actor", (req, res) => {
+      res.json(req.actor);
+    });
+
+    const res = await request(app).get("/actor").set("x-paperclip-run-id", "manual-read");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ source: "session" });
+    expect(res.body.runId).toBeUndefined();
+  });
+
   it("trusts Cloud tenant identity headers and seeds board access", async () => {
     process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN = "tenant-token";
     const inserts: Array<{ values: Record<string, unknown> }> = [];

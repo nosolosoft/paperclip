@@ -23,6 +23,7 @@ const mockIssueService = vi.hoisted(() => ({
   list: vi.fn(),
   listAttachments: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
+  release: vi.fn(),
   remove: vi.fn(),
   removeAttachment: vi.fn(),
   update: vi.fn(),
@@ -52,6 +53,8 @@ const mockDocumentService = vi.hoisted(() => ({
 const mockWorkProductService = vi.hoisted(() => ({
   createForIssue: vi.fn(),
   getById: vi.fn(),
+  listByIssue: vi.fn(),
+  listForIssue: vi.fn(),
   remove: vi.fn(),
   update: vi.fn(),
 }));
@@ -221,6 +224,7 @@ function createRunContextDb(
     if (keys.includes("entityId")) return [];
     if (keys.includes("contextSnapshot")) return runRows;
     if (keys.includes("agentCompanyId")) return runRows;
+    if (keys.includes("status") && keys.includes("capabilities")) return [];
     return [{ id: runAgentId, companyId: runAgentCompanyId, permissions: {}, role: "engineer", reportsTo: null }];
   };
   const buildQuery = (selection: Record<string, unknown>) => {
@@ -395,6 +399,7 @@ describe("agent issue mutation checkout ownership", () => {
     mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
     mockHeartbeatService.cancelRun.mockReset();
     mockHeartbeatService.cancelRun.mockResolvedValue(null);
+    mockIssueService.release.mockReset();
     mockIssueService.remove.mockReset();
     mockIssueService.removeAttachment.mockReset();
     mockIssueService.update.mockReset();
@@ -463,6 +468,7 @@ describe("agent issue mutation checkout ownership", () => {
     });
     mockIssueService.listAttachments.mockResolvedValue([]);
     mockIssueService.remove.mockResolvedValue(makeIssue({ status: "cancelled" }));
+    mockIssueService.release.mockResolvedValue(makeIssue({ status: "todo", assigneeAgentId: null }));
     mockIssueService.getAttachmentById.mockResolvedValue({
       id: "attachment-1",
       issueId,
@@ -1146,5 +1152,77 @@ describe("agent issue mutation checkout ownership", () => {
       }),
     }));
     expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("allows a checked-out agent to hand off a no-PR issue to a human reviewer", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:mutate",
+      action: input.action,
+      reason: input.action === "issue:mutate" ? "allow_self" : "deny_missing_grant",
+      explanation:
+        input.action === "issue:mutate"
+          ? "Allowed because the actor owns the assigned issue."
+          : "Missing permission.",
+    }));
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({
+        status: "in_progress",
+        projectId: null,
+        assigneeAgentId: ownerAgentId,
+        assigneeUserId: null,
+      }),
+    );
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue({
+        status: "in_progress",
+        projectId: null,
+        assigneeAgentId: ownerAgentId,
+        assigneeUserId: null,
+      }),
+      ...patch,
+    }));
+    mockAgentService.getById.mockResolvedValueOnce(makeAgent(ownerAgentId, { role: "viewer" }));
+    mockWorkProductService.listForIssue.mockResolvedValueOnce([]);
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "in_review", assigneeAgentId: null, assigneeUserId: "local-board" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({
+        status: "in_review",
+        assigneeAgentId: null,
+        assigneeUserId: "local-board",
+      }),
+    );
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:mutate" }));
+    expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({ action: "tasks:assign" }));
+  });
+
+  it("rejects an agent releasing an issue that is in_review (no ownerless-todo strand)", async () => {
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ status: "in_review", assigneeAgentId: ownerAgentId }),
+    );
+
+    const res = await request(await createApp(ownerActor())).post(`/api/issues/${issueId}/release`).send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body).toMatchObject({
+      details: { code: "invalid_issue_disposition", missing: "review_path" },
+    });
+    expect(mockIssueService.release).not.toHaveBeenCalled();
+  });
+
+  it("allows an agent to release an in_progress issue it owns", async () => {
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId }),
+    );
+
+    const res = await request(await createApp(ownerActor())).post(`/api/issues/${issueId}/release`).send({});
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.release).toHaveBeenCalled();
   });
 });

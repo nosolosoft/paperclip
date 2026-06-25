@@ -46,11 +46,33 @@ const mockDb = vi.hoisted(() => ({
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
-  listForIssue: vi.fn(async () => []),
-  expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
+  listForIssue: vi.fn(async (): Promise<unknown[]> => []),
+  expireRequestConfirmationsSupersededByComment: vi.fn(async (): Promise<unknown[]> => []),
 }));
 const mockIssueApprovalService = vi.hoisted(() => ({
-  listApprovalsForIssue: vi.fn(async () => []),
+  listApprovalsForIssue: vi.fn(async (): Promise<unknown[]> => []),
+}));
+const mockAgentService = vi.hoisted(() => ({
+  getById: vi.fn(async (agentId: string) => ({
+    id: agentId,
+    companyId: "company-1",
+    role: agentId === "44444444-4444-4444-8444-444444444444" ? "qa" : "engineer",
+    status: "idle",
+    permissions: null,
+    orgChainHealth: { status: "healthy" },
+  })),
+  resolveByReference: vi.fn(async (_companyId: string, reference: string) => ({
+    ambiguous: false,
+    agent: {
+      id: reference,
+      companyId: "company-1",
+      status: "idle",
+      orgChainHealth: { status: "healthy" },
+    },
+  })),
+}));
+const mockWorkProductService = vi.hoisted(() => ({
+  listForIssue: vi.fn(async () => []),
 }));
 
 function registerModuleMocks() {
@@ -59,22 +81,7 @@ function registerModuleMocks() {
       getById: vi.fn(async () => ({ id: "company-1", attachmentMaxBytes: 10 * 1024 * 1024 })),
     }),
     accessService: () => mockAccessService,
-    agentService: () => ({
-      getById: vi.fn(async (agentId: string) => ({
-        id: agentId,
-        companyId: "company-1",
-        permissions: null,
-      })),
-      resolveByReference: vi.fn(async (_companyId: string, reference: string) => ({
-        ambiguous: false,
-        agent: {
-          id: reference,
-          companyId: "company-1",
-          status: "idle",
-          orgChainHealth: { status: "healthy" },
-        },
-      })),
-    }),
+    agentService: () => mockAgentService,
     documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
     documentService: () => ({}),
     executionWorkspaceService: () => ({}),
@@ -122,7 +129,7 @@ function registerModuleMocks() {
     routineService: () => ({
       syncRunStatusForIssue: vi.fn(async () => undefined),
     }),
-    workProductService: () => ({}),
+    workProductService: () => mockWorkProductService,
   }));
 }
 
@@ -179,6 +186,15 @@ describe("issue execution policy routes", () => {
     mockIssueThreadInteractionService.listForIssue.mockResolvedValue([]);
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockResolvedValue([]);
     mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([]);
+    mockWorkProductService.listForIssue.mockResolvedValue([]);
+    mockAgentService.getById.mockImplementation(async (agentId: string) => ({
+      id: agentId,
+      companyId: "company-1",
+      role: agentId === "44444444-4444-4444-8444-444444444444" ? "qa" : "engineer",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    }));
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
     mockDbSelectWhere.mockImplementation(() => ({
@@ -235,6 +251,16 @@ describe("issue execution policy routes", () => {
       executionState: null,
     };
     mockIssueService.getById.mockResolvedValue(issue);
+    // Source agent has a non-routable role (not engineer/qa/researcher/cmo), so default
+    // disposition routing finds no valid review path and rejects with `review_path`.
+    mockAgentService.getById.mockImplementation(async (agentId: string) => ({
+      id: agentId,
+      companyId: "company-1",
+      role: "viewer",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    }));
 
     const res = await request(await createApp({
       type: "agent",
@@ -253,6 +279,62 @@ describe("issue execution policy routes", () => {
       missing: "review_path",
     });
     expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+
+  it("routes an engineer-owned in_review transition to default QA", async () => {
+    const engineerId = "33333333-3333-4333-8333-333333333333";
+    const qaId = "44444444-4444-4444-8444-444444444444";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: engineerId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1010",
+      title: "Stripe webhook audit",
+      description: "Backend Stripe webhook validation should go to QA Code.",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch }));
+    mockAgentService.getById.mockImplementation(async (agentId: string) => ({
+      id: agentId,
+      companyId: "company-1",
+      role: agentId === qaId ? "qa" : "engineer",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    }));
+    mockDbSelectWhere.mockImplementation(() => ({
+      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve([
+          { id: qaId, companyId: "company-1", role: "qa", name: "QA (Code)", status: "idle" },
+        ]).then(onFulfilled, onRejected),
+    }));
+    // The engineer agent is allowed to assign so the system QA routing can complete.
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: engineerId,
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "in_review" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expect.objectContaining({
+        status: "in_review",
+        assigneeAgentId: qaId,
+        assigneeUserId: null,
+      }),
+    );
   });
 
   it("allows an agent-authored in_review transition with a pending confirmation interaction", async () => {

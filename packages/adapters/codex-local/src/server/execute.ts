@@ -44,7 +44,7 @@ import {
   isCodexTransientUpstreamError,
   isCodexUnknownSessionError,
 } from "./parse.js";
-import { pathExists, prepareManagedCodexHome, resolveManagedCodexHomeDir, resolveSharedCodexHomeDir } from "./codex-home.js";
+import { isUnderPaperclipInstanceRoot, pathExists, prepareManagedCodexHome, resolveManagedCodexHomeDir, resolveSharedCodexHomeDir, seedManagedCodexHome } from "./codex-home.js";
 import { prepareCodexRuntimeConfig } from "./runtime-config.js";
 import { resolveCodexDesiredSkillNames } from "./skills.js";
 import { buildCodexExecArgs } from "./codex-args.js";
@@ -340,12 +340,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     typeof envConfig.OPENAI_API_KEY === "string" && envConfig.OPENAI_API_KEY.trim().length > 0
       ? envConfig.OPENAI_API_KEY.trim()
       : null;
-  const preparedManagedCodexHome =
-    configuredCodexHome
-      ? null
-      : await prepareManagedCodexHome(process.env, onLog, agent.companyId, {
+  // An explicit env.CODEX_HOME that lives under the Paperclip instance root is
+  // still Paperclip-managed (e.g. the per-agent isolated home minted by
+  // applyCodexLocalIsolationGuard), so it must be seeded with auth.json. Only a
+  // genuinely external user-managed CODEX_HOME is left untouched.
+  const preparedManagedCodexHome = configuredCodexHome
+    ? isUnderPaperclipInstanceRoot(configuredCodexHome, process.env)
+      ? await seedManagedCodexHome(configuredCodexHome, process.env, onLog, {
           apiKey: configuredOpenAiApiKey,
-        });
+        })
+      : null
+    : await prepareManagedCodexHome(process.env, onLog, agent.companyId, {
+        apiKey: configuredOpenAiApiKey,
+      });
   const defaultCodexHome = resolveManagedCodexHomeDir(process.env, agent.companyId);
   const effectiveCodexHome = configuredCodexHome ?? preparedManagedCodexHome ?? defaultCodexHome;
   await fs.mkdir(effectiveCodexHome, { recursive: true });

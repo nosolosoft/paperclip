@@ -31,14 +31,33 @@ export function resolveManagedCodexHomeDir(
   env: NodeJS.ProcessEnv,
   companyId?: string,
 ): string {
-  const instanceRoot = resolvePaperclipInstanceRootForAdapter({
+  const instanceRoot = resolvePaperclipInstanceRoot(env);
+  return companyId
+    ? path.resolve(instanceRoot, "companies", companyId, "codex-home")
+    : path.resolve(instanceRoot, "codex-home");
+}
+
+function resolvePaperclipInstanceRoot(env: NodeJS.ProcessEnv): string {
+  return resolvePaperclipInstanceRootForAdapter({
     homeDir: nonEmpty(env.PAPERCLIP_HOME) ?? undefined,
     instanceId: nonEmpty(env.PAPERCLIP_INSTANCE_ID) ?? undefined,
     env,
   });
-  return companyId
-    ? path.resolve(instanceRoot, "companies", companyId, "codex-home")
-    : path.resolve(instanceRoot, "codex-home");
+}
+
+/**
+ * True when `home` resolves to a path inside the Paperclip instance root. Such
+ * homes are Paperclip-managed (e.g. the per-agent isolated codex-home minted by
+ * applyCodexLocalIsolationGuard) and must be seeded with auth.json, unlike a
+ * genuinely external user-managed CODEX_HOME which we leave untouched.
+ */
+export function isUnderPaperclipInstanceRoot(
+  home: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const root = resolvePaperclipInstanceRoot(env);
+  const rel = path.relative(root, path.resolve(home));
+  return rel.length > 0 && !rel.startsWith("..") && !path.isAbsolute(rel);
 }
 
 async function ensureParentDir(target: string): Promise<void> {
@@ -122,7 +141,23 @@ export async function prepareManagedCodexHome(
   companyId?: string,
   options: { apiKey?: string | null } = {},
 ): Promise<string> {
-  const targetHome = resolveManagedCodexHomeDir(env, companyId);
+  return seedManagedCodexHome(resolveManagedCodexHomeDir(env, companyId), env, onLog, options);
+}
+
+/**
+ * Seeds an arbitrary Paperclip-managed Codex home with credentials: symlinks
+ * `auth.json` (and copies the other shared files) from the shared host home, or
+ * writes an API-key `auth.json` when `options.apiKey` is set. Used both for the
+ * company-level managed home and for the per-agent isolated home that
+ * applyCodexLocalIsolationGuard mints (which sets an explicit CODEX_HOME but is
+ * still Paperclip-managed and needs seeding — see isUnderPaperclipInstanceRoot).
+ */
+export async function seedManagedCodexHome(
+  targetHome: string,
+  env: NodeJS.ProcessEnv,
+  onLog: AdapterExecutionContext["onLog"],
+  options: { apiKey?: string | null } = {},
+): Promise<string> {
   const apiKey = nonEmpty(options.apiKey ?? undefined);
 
   const sourceHome = resolveSharedCodexHomeDir(env);

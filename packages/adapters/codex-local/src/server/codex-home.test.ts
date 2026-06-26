@@ -2,7 +2,13 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ensureSymlink, prepareManagedCodexHome } from "./codex-home.js";
+import {
+  ensureSymlink,
+  isUnderPaperclipInstanceRoot,
+  prepareManagedCodexHome,
+  resolveManagedCodexHomeDir,
+  seedManagedCodexHome,
+} from "./codex-home.js";
 
 describe("codex managed home", () => {
   afterEach(() => {
@@ -191,6 +197,70 @@ describe("codex managed home", () => {
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
+  });
+
+  // Regression for the Codex Engineer 401 "Missing bearer or basic
+  // authentication": the per-agent isolated CODEX_HOME minted by
+  // applyCodexLocalIsolationGuard sets an explicit env.CODEX_HOME, which the
+  // execute path used to treat as user-managed and skip seeding entirely. The
+  // home then had no auth.json and every run failed with 401. seedManagedCodexHome
+  // must seed an arbitrary managed home (not just the company-level one).
+  it("seedManagedCodexHome symlinks auth.json into an arbitrary per-agent managed home", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-seed-"));
+    try {
+      const sharedCodexHome = path.join(root, "shared-codex-home");
+      const agentCodexHome = path.join(root, "agent-codex-home");
+      const sharedAuth = path.join(sharedCodexHome, "auth.json");
+      const agentAuth = path.join(agentCodexHome, "auth.json");
+
+      await fs.mkdir(sharedCodexHome, { recursive: true });
+      await fs.writeFile(sharedAuth, '{"token":"shared"}\n', "utf8");
+
+      await expect(
+        seedManagedCodexHome(agentCodexHome, { CODEX_HOME: sharedCodexHome }, async () => {}),
+      ).resolves.toBe(agentCodexHome);
+
+      expect((await fs.lstat(agentAuth)).isSymbolicLink()).toBe(true);
+      expect(await fs.realpath(agentAuth)).toBe(await fs.realpath(sharedAuth));
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  // API-key mode must keep precedence: even when a shared home exists, an
+  // explicit apiKey writes a regular-file auth.json (not the symlink) so the
+  // host OAuth token never leaks into an api-key agent.
+  it("seedManagedCodexHome writes an api-key auth.json when apiKey is provided", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-seed-apikey-"));
+    try {
+      const sharedCodexHome = path.join(root, "shared-codex-home");
+      const agentCodexHome = path.join(root, "agent-codex-home");
+      await fs.mkdir(sharedCodexHome, { recursive: true });
+      await fs.writeFile(path.join(sharedCodexHome, "auth.json"), '{"token":"shared"}\n', "utf8");
+
+      await seedManagedCodexHome(agentCodexHome, { CODEX_HOME: sharedCodexHome }, async () => {}, {
+        apiKey: "sk-test-123",
+      });
+
+      const agentAuth = path.join(agentCodexHome, "auth.json");
+      expect((await fs.lstat(agentAuth)).isSymbolicLink()).toBe(false);
+      expect(JSON.parse(await fs.readFile(agentAuth, "utf8"))).toEqual({
+        OPENAI_API_KEY: "sk-test-123",
+      });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("isUnderPaperclipInstanceRoot: true for a managed per-agent home, false for an external home", () => {
+    const env = { PAPERCLIP_HOME: "/srv/paperclip", PAPERCLIP_INSTANCE_ID: "default" };
+    const agentHome = resolveManagedCodexHomeDir(env, "company-1");
+    const perAgentHome = path.join(agentHome, "..", "agents", "agent-1", "codex-home");
+
+    expect(isUnderPaperclipInstanceRoot(agentHome, env)).toBe(true);
+    expect(isUnderPaperclipInstanceRoot(perAgentHome, env)).toBe(true);
+    expect(isUnderPaperclipInstanceRoot("/home/user/.codex", env)).toBe(false);
+    expect(isUnderPaperclipInstanceRoot("/tmp/some/external/codex-home", env)).toBe(false);
   });
 
 });

@@ -1833,6 +1833,28 @@ export function issueRoutes(
       : input.existing.status;
     if (input.actorType !== "agent" || input.existing.status === "in_review" || nextStatus !== "in_review") return;
 
+    // Universal review-path escapes are evaluated before role-based QA routing: a pending
+    // interaction / active approval / typed execution participant / scheduled monitor is a
+    // valid in_review disposition on its own (e.g. task-watchdog transitions), so it must not
+    // be pre-empted by the engineer->QA forced reassignment below.
+    const nextExecutionState = input.updateFields.executionState === undefined
+      ? input.existing.executionState
+      : input.updateFields.executionState;
+    if (hasExecutionParticipant(nextExecutionState)) return;
+
+    const nextExecutionPolicy = input.updateFields.executionPolicy;
+    if (hasScheduledMonitor({
+      existingMonitorNextCheckAt: input.existing.monitorNextCheckAt ?? null,
+      patchMonitorNextCheckAt: input.updateFields.monitorNextCheckAt,
+      executionPolicy: nextExecutionPolicy,
+    })) return;
+
+    const interactions = await issueThreadInteractionService(db).listForIssue(input.existing.id);
+    if (interactions.some((interaction) => interaction.status === "pending")) return;
+
+    const approvals = await issueApprovalsSvc.listApprovalsForIssue(input.existing.id);
+    if (approvals.some((approval) => ACTIVE_REVIEW_APPROVAL_STATUSES.has(String(approval.status)))) return;
+
     const nextAssigneeAgentId = input.updateFields.assigneeAgentId === undefined
       ? input.existing.assigneeAgentId
       : input.updateFields.assigneeAgentId;
@@ -1867,24 +1889,6 @@ export function issueRoutes(
       }
       return;
     }
-
-    const nextExecutionState = input.updateFields.executionState === undefined
-      ? input.existing.executionState
-      : input.updateFields.executionState;
-    if (hasExecutionParticipant(nextExecutionState)) return;
-
-    const nextExecutionPolicy = input.updateFields.executionPolicy;
-    if (hasScheduledMonitor({
-      existingMonitorNextCheckAt: input.existing.monitorNextCheckAt ?? null,
-      patchMonitorNextCheckAt: input.updateFields.monitorNextCheckAt,
-      executionPolicy: nextExecutionPolicy,
-    })) return;
-
-    const interactions = await issueThreadInteractionService(db).listForIssue(input.existing.id);
-    if (interactions.some((interaction) => interaction.status === "pending")) return;
-
-    const approvals = await issueApprovalsSvc.listApprovalsForIssue(input.existing.id);
-    if (approvals.some((approval) => ACTIVE_REVIEW_APPROVAL_STATUSES.has(String(approval.status)))) return;
 
     const sourceAgentId = input.existing.assigneeAgentId;
     const sourceAgent = sourceAgentId ? await agentsSvc.getById(sourceAgentId) : null;

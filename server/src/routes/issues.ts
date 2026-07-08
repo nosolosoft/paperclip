@@ -158,6 +158,7 @@ const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
   qaVerdict: z.enum(["pass", "fail"]).optional(),
+  qaBrowserScope: z.enum(["required", "not_applicable"]).optional(),
 });
 const refreshExternalObjectsSchema = z.object({
   objectIds: z.array(z.string().uuid()).max(50).optional(),
@@ -1783,6 +1784,16 @@ export function issueRoutes(
     return stages.find((agent) => Boolean(agent)) ?? null;
   }
 
+  async function resolveSpecQaAgent(companyId: string) {
+    const assignable = await listAssignableQaAgents(companyId);
+    return assignable.find(agentLooksLikeSpecQa) ?? null;
+  }
+
+  async function resolveBrowserQaAgent(companyId: string) {
+    const assignable = await listAssignableQaAgents(companyId);
+    return assignable.find(agentLooksLikeBrowserQa) ?? null;
+  }
+
   async function resolveDefaultEngineerAgent(companyId: string) {
     const candidates = await db
       .select({
@@ -1808,6 +1819,7 @@ export function issueRoutes(
     updateFields: Record<string, unknown>;
     actorAgentId?: string | null;
     qaVerdict?: "pass" | "fail";
+    qaBrowserScope?: "required" | "not_applicable";
   }) {
     if (!input.actorAgentId) return;
     const actorAgent = await agentsSvc.getById(input.actorAgentId);
@@ -1828,6 +1840,33 @@ export function issueRoutes(
 
     if (input.qaVerdict === "pass") {
       const currentStage = getQaStageKind(actorAgent);
+      if (currentStage === "code" && input.qaBrowserScope === "not_applicable") {
+        const specQaAgent = await resolveSpecQaAgent(input.existing.companyId);
+        if (!specQaAgent) {
+          throw unprocessable("Backend-only QA pass requires a Spec QA agent before completion", {
+            code: "invalid_qa_disposition",
+            missing: "spec_qa_agent",
+          });
+        }
+        input.updateFields.status = "in_review";
+        input.updateFields.assigneeAgentId = specQaAgent.id;
+        input.updateFields.assigneeUserId = null;
+        return;
+      }
+      if (currentStage === "code") {
+        const browserQaAgent = await resolveBrowserQaAgent(input.existing.companyId);
+        if (!browserQaAgent) {
+          throw unprocessable("Code QA pass requires a Browser QA agent unless browser QA is explicitly not applicable", {
+            code: "invalid_qa_disposition",
+            missing: "browser_qa_agent",
+            required: "qaBrowserScope:not_applicable",
+          });
+        }
+        input.updateFields.status = "in_review";
+        input.updateFields.assigneeAgentId = browserQaAgent.id;
+        input.updateFields.assigneeUserId = null;
+        return;
+      }
       const nextQaAgent = await resolveNextQaAgent(
         input.existing.companyId,
         currentStage === "unknown" ? "spec" : currentStage,
@@ -1837,6 +1876,12 @@ export function issueRoutes(
         input.updateFields.assigneeAgentId = nextQaAgent.id;
         input.updateFields.assigneeUserId = null;
         return;
+      }
+      if (currentStage !== "spec") {
+        throw unprocessable("Non-Spec QA pass requires a downstream QA stage before completion", {
+          code: "invalid_qa_disposition",
+          missing: currentStage === "browser" ? "spec_qa_agent" : "downstream_qa_agent",
+        });
       }
       input.updateFields.assigneeAgentId = null;
       input.updateFields.assigneeUserId = null;
@@ -1968,6 +2013,87 @@ export function issueRoutes(
         "scheduled_issue_monitor",
       ],
     });
+  }
+
+  async function routeEngineerReviewIssueToDefaultQa(input: {
+    issue: {
+      id: string;
+      companyId: string;
+      status: string;
+      identifier?: string | null;
+      assigneeAgentId?: string | null;
+      assigneeUserId?: string | null;
+      executionPolicy?: unknown;
+      executionState?: unknown;
+      monitorNextCheckAt?: Date | null;
+    };
+    actor: ReturnType<typeof getActorInfo>;
+    source: string;
+    interactionId?: string | null;
+  }) {
+    if (input.issue.status !== "in_review") return null;
+    const assigneeAgentId = input.issue.assigneeAgentId;
+    if (typeof assigneeAgentId !== "string" || assigneeAgentId.trim().length === 0) return null;
+
+    const assigneeAgent = await agentsSvc.getById(assigneeAgentId);
+    if (assigneeAgent?.role !== "engineer") return null;
+
+    if (hasExecutionParticipant(input.issue.executionState)) return null;
+    if (hasScheduledMonitor({
+      existingMonitorNextCheckAt: input.issue.monitorNextCheckAt ?? null,
+      executionPolicy: input.issue.executionPolicy,
+    })) return null;
+
+    const [interactions, approvals] = await Promise.all([
+      issueThreadInteractionService(db).listForIssue(input.issue.id),
+      issueApprovalsSvc.listApprovalsForIssue(input.issue.id),
+    ]);
+    if (interactions.some((interaction) =>
+      interaction.status === "pending" && (!input.interactionId || interaction.id !== input.interactionId)
+    )) return null;
+    if (approvals.some((approval) => ACTIVE_REVIEW_APPROVAL_STATUSES.has(String(approval.status)))) return null;
+
+    const qaAgent = await resolveDefaultQaAgentForIssue(input.issue);
+    if (!qaAgent) {
+      throw unprocessable(INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE, {
+        code: "invalid_issue_disposition",
+        missing: "qa_agent",
+      });
+    }
+
+    const updatedIssue = await svc.update(input.issue.id, {
+      assigneeAgentId: qaAgent.id,
+      assigneeUserId: null,
+      actorAgentId: input.actor.agentId ?? null,
+      actorUserId: input.actor.actorType === "user" ? input.actor.actorId : null,
+    });
+    if (!updatedIssue) throw notFound("Issue not found");
+
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: input.actor.actorType,
+      actorId: input.actor.actorId,
+      agentId: input.actor.agentId,
+      runId: input.actor.runId,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        status: updatedIssue.status,
+        assigneeAgentId: updatedIssue.assigneeAgentId ?? null,
+        assigneeUserId: updatedIssue.assigneeUserId ?? null,
+        source: input.source,
+        ...(input.interactionId ? { interactionId: input.interactionId } : {}),
+        _previous: {
+          status: input.issue.status,
+          assigneeAgentId: input.issue.assigneeAgentId ?? null,
+          assigneeUserId: input.issue.assigneeUserId ?? null,
+        },
+      },
+    });
+
+    return updatedIssue;
   }
 
   async function assertAgentProjectIssuePullRequestPreflight(input: {
@@ -6016,6 +6142,7 @@ export function issueRoutes(
     const {
       comment: commentBody,
       qaVerdict,
+      qaBrowserScope,
       reviewRequest,
       reopen: reopenRequested,
       resume: resumeRequested,
@@ -6262,6 +6389,7 @@ export function issueRoutes(
       updateFields,
       actorAgentId: actor.agentId ?? null,
       qaVerdict,
+      qaBrowserScope,
     });
     await applyDefaultAgentReviewRouting({
       existing,
@@ -7379,7 +7507,7 @@ export function issueRoutes(
         agentId: actor.agentId,
         userId: actor.actorType === "user" ? actor.actorId : null,
       });
-      const continuationWakeIssue = continuationIssue ?? issue;
+      let continuationWakeIssue = continuationIssue ?? issue;
 
       await logActivity(db, {
         companyId: issue.companyId,
@@ -7443,6 +7571,33 @@ export function issueRoutes(
           requestedByActorType: actor.actorType,
           requestedByActorId: actor.actorId,
         });
+      }
+
+      const routedReviewIssue = interaction.status === "accepted"
+        ? await routeEngineerReviewIssueToDefaultQa({
+            issue: {
+              ...issue,
+              ...continuationWakeIssue,
+              companyId: issue.companyId,
+            },
+            actor,
+            source: "request_confirmation_accept_review_routing",
+            interactionId: interaction.id,
+          })
+        : null;
+      if (routedReviewIssue) {
+        continuationWakeIssue = routedReviewIssue;
+        void queueIssueAssignmentWakeup({
+          heartbeat,
+          issue: routedReviewIssue,
+          reason: "issue_assigned",
+          mutation: "interaction_accept_review_routing",
+          contextSource: "issue.interaction.accept.review_routing",
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+        });
+        res.json(interaction);
+        return;
       }
 
       const acceptedPlanTarget = interaction.kind === "request_confirmation"

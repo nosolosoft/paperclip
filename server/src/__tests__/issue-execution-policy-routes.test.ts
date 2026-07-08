@@ -47,6 +47,7 @@ const mockDb = vi.hoisted(() => ({
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
   listForIssue: vi.fn(async (): Promise<unknown[]> => []),
+  acceptInteraction: vi.fn(),
   expireRequestConfirmationsSupersededByComment: vi.fn(async (): Promise<unknown[]> => []),
 }));
 const mockIssueApprovalService = vi.hoisted(() => ({
@@ -184,6 +185,26 @@ describe("issue execution policy routes", () => {
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
     mockIssueThreadInteractionService.listForIssue.mockResolvedValue([]);
+    mockIssueThreadInteractionService.acceptInteraction.mockResolvedValue({
+      interaction: {
+        id: "99999999-9999-4999-8999-999999999999",
+        companyId: "company-1",
+        issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        kind: "request_confirmation",
+        status: "accepted",
+        continuationPolicy: "wake_assignee_on_accept",
+        idempotencyKey: null,
+        sourceCommentId: null,
+        sourceRunId: "88888888-8888-4888-8888-888888888888",
+        payload: { version: 1, prompt: "Ready for review?" },
+        result: { version: 1, outcome: "accepted" },
+        createdAt: "2026-04-20T12:00:00.000Z",
+        updatedAt: "2026-04-20T12:05:00.000Z",
+        resolvedAt: "2026-04-20T12:05:00.000Z",
+      },
+      createdIssues: [],
+      continuationIssue: null,
+    });
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockResolvedValue([]);
     mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([]);
     mockWorkProductService.listForIssue.mockResolvedValue([]);
@@ -340,6 +361,128 @@ describe("issue execution policy routes", () => {
     );
   });
 
+  it("routes an engineer-owned in_review issue to Code QA after accepting its resolved confirmation", async () => {
+    const engineerId = "33333333-3333-4333-8333-333333333333";
+    const codeQaId = "44444444-4444-4444-8444-444444444444";
+    const interactionId = "99999999-9999-4999-8999-999999999999";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: engineerId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "NSS-481",
+      title: "Fix review handoff",
+      description: "Engineer already moved the issue to review while a confirmation was pending.",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    mockAgentService.getById.mockImplementation(async (agentId: string) => ({
+      id: agentId,
+      companyId: "company-1",
+      role: agentId === codeQaId ? "qa" : "engineer",
+      name: agentId === codeQaId ? "QA (Code)" : "Engineer",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    }));
+    mockDbSelectWhere.mockImplementation(() => ({
+      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve([
+          { id: codeQaId, companyId: "company-1", role: "qa", name: "QA (Code)", status: "idle" },
+        ]).then(onFulfilled, onRejected),
+    }));
+    mockIssueThreadInteractionService.listForIssue.mockResolvedValue([
+      { id: interactionId, status: "pending", kind: "request_confirmation" },
+    ] as never);
+
+    const res = await request(await createApp())
+      .post(`/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/${interactionId}/accept`)
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expect.objectContaining({
+        assigneeAgentId: codeQaId,
+        assigneeUserId: null,
+      }),
+    );
+    expect(mockIssueService.createChild).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      codeQaId,
+      expect.objectContaining({
+        reason: "issue_assigned",
+        payload: expect.objectContaining({
+          issueId: issue.id,
+          mutation: "interaction_accept_review_routing",
+        }),
+      }),
+    );
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      engineerId,
+      expect.anything(),
+    );
+  });
+
+  it("does not route an engineer-owned in_review issue to QA while another human interaction remains pending", async () => {
+    const engineerId = "33333333-3333-4333-8333-333333333333";
+    const codeQaId = "44444444-4444-4444-8444-444444444444";
+    const acceptedInteractionId = "99999999-9999-4999-8999-999999999999";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: engineerId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "NSS-481",
+      title: "Fix review handoff with remaining decision",
+      description: "A separate board decision still owns the next action.",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockAgentService.getById.mockImplementation(async (agentId: string) => ({
+      id: agentId,
+      companyId: "company-1",
+      role: agentId === codeQaId ? "qa" : "engineer",
+      name: agentId === codeQaId ? "QA (Code)" : "Engineer",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    }));
+    mockDbSelectWhere.mockImplementation(() => ({
+      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve([
+          { id: codeQaId, companyId: "company-1", role: "qa", name: "QA (Code)", status: "idle" },
+        ]).then(onFulfilled, onRejected),
+    }));
+    mockIssueThreadInteractionService.listForIssue.mockResolvedValue([
+      { id: acceptedInteractionId, status: "pending", kind: "request_confirmation" },
+      { id: "77777777-7777-4777-8777-777777777777", status: "pending", kind: "ask_user_questions" },
+    ] as never);
+
+    const res = await request(await createApp())
+      .post(`/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/${acceptedInteractionId}/accept`)
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      codeQaId,
+      expect.anything(),
+    );
+  });
+
   it("advances Code QA PASS to Browser QA", async () => {
     const codeQaId = "44444444-4444-4444-8444-444444444444";
     const browserQaId = "55555555-5555-4555-8555-555555555555";
@@ -392,6 +535,151 @@ describe("issue execution policy routes", () => {
     );
   });
 
+  it("advances backend-only Code QA PASS directly to Spec QA", async () => {
+    const codeQaId = "44444444-4444-4444-8444-444444444444";
+    const browserQaId = "55555555-5555-4555-8555-555555555555";
+    const specQaId = "66666666-6666-4666-8666-666666666666";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: codeQaId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "NSS-452",
+      title: "Backend-only billing cleanup",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch }));
+    mockAgentService.getById.mockImplementation(async (agentId: string) => ({
+      id: agentId,
+      companyId: "company-1",
+      role: "qa",
+      name: agentId === browserQaId ? "QA (Browser)" : agentId === specQaId ? "QA (Spec)" : "QA (Code)",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    }));
+    mockDbSelectWhere.mockImplementation(() => ({
+      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve([
+          { id: codeQaId, companyId: "company-1", role: "qa", name: "QA (Code)", status: "idle" },
+          { id: browserQaId, companyId: "company-1", role: "qa", name: "QA (Browser)", status: "idle" },
+          { id: specQaId, companyId: "company-1", role: "qa", name: "QA (Spec)", status: "idle" },
+        ]).then(onFulfilled, onRejected),
+    }));
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const res = await request(await createApp({ type: "agent", agentId: codeQaId, companyId: "company-1", runId: "run-1" }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ qaVerdict: "pass", qaBrowserScope: "not_applicable" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expect.objectContaining({
+        status: "in_review",
+        assigneeAgentId: specQaId,
+        assigneeUserId: null,
+      }),
+    );
+  });
+
+  it("rejects backend-only Code QA PASS when no Spec QA agent exists", async () => {
+    const codeQaId = "44444444-4444-4444-8444-444444444444";
+    const browserQaId = "55555555-5555-4555-8555-555555555555";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: codeQaId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "NSS-452",
+      title: "Backend-only billing cleanup",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockAgentService.getById.mockImplementation(async (agentId: string) => ({
+      id: agentId,
+      companyId: "company-1",
+      role: "qa",
+      name: agentId === browserQaId ? "QA (Browser)" : "QA (Code)",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    }));
+    mockDbSelectWhere.mockImplementation(() => ({
+      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve([
+          { id: codeQaId, companyId: "company-1", role: "qa", name: "QA (Code)", status: "idle" },
+          { id: browserQaId, companyId: "company-1", role: "qa", name: "QA (Browser)", status: "idle" },
+        ]).then(onFulfilled, onRejected),
+    }));
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const res = await request(await createApp({ type: "agent", agentId: codeQaId, companyId: "company-1", runId: "run-1" }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ qaVerdict: "pass", qaBrowserScope: "not_applicable" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({
+      code: "invalid_qa_disposition",
+      missing: "spec_qa_agent",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects default Code QA PASS when Browser QA is missing even if Spec QA exists", async () => {
+    const codeQaId = "44444444-4444-4444-8444-444444444444";
+    const specQaId = "66666666-6666-4666-8666-666666666666";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: codeQaId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "NSS-452",
+      title: "Mixed QA path",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockAgentService.getById.mockImplementation(async (agentId: string) => ({
+      id: agentId,
+      companyId: "company-1",
+      role: "qa",
+      name: agentId === specQaId ? "QA (Spec)" : "QA (Code)",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    }));
+    mockDbSelectWhere.mockImplementation(() => ({
+      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve([
+          { id: codeQaId, companyId: "company-1", role: "qa", name: "QA (Code)", status: "idle" },
+          { id: specQaId, companyId: "company-1", role: "qa", name: "QA (Spec)", status: "idle" },
+        ]).then(onFulfilled, onRejected),
+    }));
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const res = await request(await createApp({ type: "agent", agentId: codeQaId, companyId: "company-1", runId: "run-1" }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ qaVerdict: "pass" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({
+      code: "invalid_qa_disposition",
+      missing: "browser_qa_agent",
+      required: "qaBrowserScope:not_applicable",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   it("advances Browser QA PASS to Spec QA", async () => {
     const browserQaId = "55555555-5555-4555-8555-555555555555";
     const specQaId = "66666666-6666-4666-8666-666666666666";
@@ -440,6 +728,94 @@ describe("issue execution policy routes", () => {
         assigneeUserId: null,
       }),
     );
+  });
+
+  it("rejects Browser QA PASS when no Spec QA agent exists", async () => {
+    const browserQaId = "55555555-5555-4555-8555-555555555555";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: browserQaId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "NSS-452",
+      title: "Backend-only billing cleanup",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockAgentService.getById.mockResolvedValue({
+      id: browserQaId,
+      companyId: "company-1",
+      role: "qa",
+      name: "QA (Browser)",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    });
+    mockDbSelectWhere.mockImplementation(() => ({
+      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve([
+          { id: browserQaId, companyId: "company-1", role: "qa", name: "QA (Browser)", status: "idle" },
+        ]).then(onFulfilled, onRejected),
+    }));
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const res = await request(await createApp({ type: "agent", agentId: browserQaId, companyId: "company-1", runId: "run-1" }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ qaVerdict: "pass" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({
+      code: "invalid_qa_disposition",
+      missing: "spec_qa_agent",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects Code QA PASS when no Browser QA agent exists", async () => {
+    const codeQaId = "44444444-4444-4444-8444-444444444444";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: codeQaId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "NSS-452",
+      title: "Backend-only billing cleanup",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockAgentService.getById.mockResolvedValue({
+      id: codeQaId,
+      companyId: "company-1",
+      role: "qa",
+      name: "QA (Code)",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    });
+    mockDbSelectWhere.mockImplementation(() => ({
+      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve([
+          { id: codeQaId, companyId: "company-1", role: "qa", name: "QA (Code)", status: "idle" },
+        ]).then(onFulfilled, onRejected),
+    }));
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const res = await request(await createApp({ type: "agent", agentId: codeQaId, companyId: "company-1", runId: "run-1" }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ qaVerdict: "pass" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({
+      code: "invalid_qa_disposition",
+      missing: "browser_qa_agent",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   it("lets Spec QA PASS complete and clear assignment", async () => {
@@ -517,6 +893,80 @@ describe("issue execution policy routes", () => {
     const res = await request(await createApp({ type: "agent", agentId: codeQaId, companyId: "company-1", runId: "run-1" }))
       .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
       .send({ status: "done" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({
+      code: "invalid_qa_disposition",
+      required: "qaVerdict",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects Code QA direct done even when posting a PASS comment", async () => {
+    const codeQaId = "44444444-4444-4444-8444-444444444444";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: codeQaId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "NSS-452",
+      title: "Backend-only billing cleanup",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockAgentService.getById.mockResolvedValue({
+      id: codeQaId,
+      companyId: "company-1",
+      role: "qa",
+      name: "QA (Code)",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    });
+
+    const res = await request(await createApp({ type: "agent", agentId: codeQaId, companyId: "company-1", runId: "run-1" }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "done", comment: "## QA CODE PASS\n\nBackend-only change looks good." });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({
+      code: "invalid_qa_disposition",
+      required: "qaVerdict",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects Browser QA direct done even when posting a PASS comment", async () => {
+    const browserQaId = "55555555-5555-4555-8555-555555555555";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: browserQaId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "NSS-452",
+      title: "Browser QA direct completion",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockAgentService.getById.mockResolvedValue({
+      id: browserQaId,
+      companyId: "company-1",
+      role: "qa",
+      name: "QA (Browser)",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    });
+
+    const res = await request(await createApp({ type: "agent", agentId: browserQaId, companyId: "company-1", runId: "run-1" }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "done", comment: "## QA BROWSER PASS\n\nBrowser checks passed." });
 
     expect(res.status).toBe(422);
     expect(res.body.details).toMatchObject({

@@ -75,6 +75,7 @@ import { getTelemetryClient } from "../telemetry.js";
 import { accessService } from "./access.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { sanitizeRecord } from "../redaction.js";
+import { unprocessable } from "../errors.js";
 
 
 function normalizeAgentRoutingText(value: string | null | undefined) {
@@ -120,6 +121,22 @@ function selectNextQaRoutingAgent(
         ? []
         : [codeQa, browserQa, specQa];
   return stages.find((agent) => Boolean(agent)) ?? null;
+}
+
+function selectSpecQaRoutingAgent(
+  agents: Array<{ id: string; name?: string | null; role?: string | null; status?: string | null; capabilities?: string | null }>,
+) {
+  return agents
+    .filter((agent) => agent.role === "qa" && !["terminated", "pending_approval"].includes(agent.status ?? ""))
+    .find(agentLooksLikeSpecQaRouting) ?? null;
+}
+
+function selectBrowserQaRoutingAgent(
+  agents: Array<{ id: string; name?: string | null; role?: string | null; status?: string | null; capabilities?: string | null }>,
+) {
+  return agents
+    .filter((agent) => agent.role === "qa" && !["terminated", "pending_approval"].includes(agent.status ?? ""))
+    .find(agentLooksLikeBrowserQaRouting) ?? null;
 }
 
 function agentLooksLikeEngineerRouting(agent: { role?: string | null; status?: string | null }) {
@@ -1634,10 +1651,14 @@ export function buildHostServices(
         const actorUserId = typeof patch.actorUserId === "string" ? patch.actorUserId : null;
         const actorRunId = typeof patch.actorRunId === "string" ? patch.actorRunId : null;
         const qaVerdict = patch.qaVerdict === "pass" || patch.qaVerdict === "fail" ? patch.qaVerdict : undefined;
+        const qaBrowserScope = patch.qaBrowserScope === "required" || patch.qaBrowserScope === "not_applicable"
+          ? patch.qaBrowserScope
+          : undefined;
         delete patch.actorAgentId;
         delete patch.actorUserId;
         delete patch.actorRunId;
         delete patch.qaVerdict;
+        delete patch.qaBrowserScope;
         if (patch.originKind !== undefined) {
           patch.originKind = normalizePluginOriginKind(patch.originKind);
         }
@@ -1658,23 +1679,58 @@ export function buildHostServices(
           } else if (sourceAgent?.role === "qa" && qaVerdict === "pass") {
             const candidateAgents = await agents.list(companyId);
             const currentStage = getQaStageRoutingKind(sourceAgent);
-            const nextQaAgent = selectNextQaRoutingAgent(
-              candidateAgents,
-              currentStage === "unknown" ? "spec" : currentStage,
-            );
-            if (nextQaAgent) {
+            if (currentStage === "code" && qaBrowserScope === "not_applicable") {
+              const specQaAgent = selectSpecQaRoutingAgent(candidateAgents);
+              if (!specQaAgent) {
+                throw unprocessable("Backend-only QA pass requires a Spec QA agent before completion", {
+                  code: "invalid_qa_disposition",
+                  missing: "spec_qa_agent",
+                });
+              }
               patch.status = "in_review";
-              patch.assigneeAgentId = nextQaAgent.id;
+              patch.assigneeAgentId = specQaAgent.id;
+              patch.assigneeUserId = null;
+            } else if (currentStage === "code") {
+              const browserQaAgent = selectBrowserQaRoutingAgent(candidateAgents);
+              if (!browserQaAgent) {
+                throw unprocessable("Code QA pass requires a Browser QA agent unless browser QA is explicitly not applicable", {
+                  code: "invalid_qa_disposition",
+                  missing: "browser_qa_agent",
+                  required: "qaBrowserScope:not_applicable",
+                });
+              }
+              patch.status = "in_review";
+              patch.assigneeAgentId = browserQaAgent.id;
               patch.assigneeUserId = null;
             } else {
-              patch.status = "done";
-              patch.assigneeAgentId = null;
-              patch.assigneeUserId = null;
+              const nextQaAgent = selectNextQaRoutingAgent(
+                candidateAgents,
+                currentStage === "unknown" ? "spec" : currentStage,
+              );
+              if (nextQaAgent) {
+                patch.status = "in_review";
+                patch.assigneeAgentId = nextQaAgent.id;
+                patch.assigneeUserId = null;
+              } else {
+                if (currentStage !== "spec") {
+                  throw unprocessable("Non-Spec QA pass requires a downstream QA stage before completion", {
+                    code: "invalid_qa_disposition",
+                    missing: currentStage === "browser" ? "spec_qa_agent" : "downstream_qa_agent",
+                  });
+                }
+                patch.status = "done";
+                patch.assigneeAgentId = null;
+                patch.assigneeUserId = null;
+              }
             }
           } else if (sourceAgent?.role === "qa" && nextStatus === "done") {
             const currentStage = getQaStageRoutingKind(sourceAgent);
             if (currentStage !== "spec") {
-              throw new Error("Intermediate QA stages must submit qaVerdict=pass instead of moving the issue to done");
+              throw unprocessable("Intermediate QA stages must submit qaVerdict=pass instead of moving the issue to done", {
+                code: "invalid_qa_disposition",
+                required: "qaVerdict",
+                allowedStatus: "in_review",
+              });
             }
             patch.assigneeAgentId = null;
             patch.assigneeUserId = null;

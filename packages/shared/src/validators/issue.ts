@@ -454,6 +454,7 @@ export const updateIssueSchema = createIssueBaseSchema.omit({ watchdog: true }).
   assigneeAgentId: z.string().trim().min(1).optional().nullable(),
   comment: multilineTextSchema.pipe(z.string().min(1)).optional(),
   reviewRequest: issueReviewRequestSchema.optional().nullable(),
+  qaBrowserScope: z.enum(["required", "not_applicable"]).optional(),
   reopen: z.boolean().optional(),
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),

@@ -109,6 +109,36 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     return root;
   }
 
+  async function seedQaAgent(companyId: string, name: string) {
+    const id = randomUUID();
+    await db.insert(agents).values({
+      id,
+      companyId,
+      name,
+      role: "qa",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: { command: "true" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    return id;
+  }
+
+  async function seedQaIssue(companyId: string, assigneeAgentId: string, title = "QA path") {
+    const id = randomUUID();
+    await db.insert(issues).values({
+      id,
+      companyId,
+      title,
+      status: "in_review",
+      priority: "medium",
+      identifier: `${issuePrefix(companyId)}-${randomUUID().slice(0, 6)}`,
+      assigneeAgentId,
+    });
+    return id;
+  }
+
   it("returns plugin-safe execution workspace metadata scoped to the company", async () => {
     const { companyId } = await seedCompanyAndAgent();
     const otherCompanyId = randomUUID();
@@ -262,6 +292,304 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
         patch: { originKind: "plugin:other.plugin:feature" },
       }),
     ).rejects.toThrow("Plugin may only use originKind values under plugin:paperclip.missions");
+  });
+
+  it("routes plugin backend-only Code QA PASS to Spec QA", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const codeQaId = randomUUID();
+    const browserQaId = randomUUID();
+    const specQaId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(agents).values([
+      {
+        id: codeQaId,
+        companyId,
+        name: "QA (Code)",
+        role: "qa",
+        status: "idle",
+        adapterType: "process",
+        adapterConfig: { command: "true" },
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: browserQaId,
+        companyId,
+        name: "QA (Browser)",
+        role: "qa",
+        status: "idle",
+        adapterType: "process",
+        adapterConfig: { command: "true" },
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: specQaId,
+        companyId,
+        name: "QA (Spec)",
+        role: "qa",
+        status: "idle",
+        adapterType: "process",
+        adapterConfig: { command: "true" },
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Backend-only QA path",
+      status: "in_review",
+      priority: "medium",
+      identifier: `${issuePrefix(companyId)}-backend`,
+      assigneeAgentId: codeQaId,
+    });
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+
+    const updated = await services.issues.update({
+      issueId,
+      companyId,
+      patch: {
+        actorAgentId: codeQaId,
+        qaVerdict: "pass",
+        qaBrowserScope: "not_applicable",
+      },
+    });
+
+    expect(updated.status).toBe("in_review");
+    expect(updated.assigneeAgentId).toBe(specQaId);
+    expect(updated.assigneeUserId).toBeNull();
+  });
+
+  it("rejects plugin backend-only Code QA PASS when no Spec QA agent exists", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const codeQaId = randomUUID();
+    const browserQaId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(agents).values([
+      {
+        id: codeQaId,
+        companyId,
+        name: "QA (Code)",
+        role: "qa",
+        status: "idle",
+        adapterType: "process",
+        adapterConfig: { command: "true" },
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: browserQaId,
+        companyId,
+        name: "QA (Browser)",
+        role: "qa",
+        status: "idle",
+        adapterType: "process",
+        adapterConfig: { command: "true" },
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Backend-only QA path",
+      status: "in_review",
+      priority: "medium",
+      identifier: `${issuePrefix(companyId)}-backend`,
+      assigneeAgentId: codeQaId,
+    });
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+
+    await expect(
+      services.issues.update({
+        issueId,
+        companyId,
+        patch: {
+          actorAgentId: codeQaId,
+          qaVerdict: "pass",
+          qaBrowserScope: "not_applicable",
+        },
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: {
+        code: "invalid_qa_disposition",
+        missing: "spec_qa_agent",
+      },
+    });
+  });
+
+  it("rejects plugin default Code QA PASS when Browser QA is missing even if Spec QA exists", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const codeQaId = randomUUID();
+    const specQaId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(agents).values([
+      {
+        id: codeQaId,
+        companyId,
+        name: "QA (Code)",
+        role: "qa",
+        status: "idle",
+        adapterType: "process",
+        adapterConfig: { command: "true" },
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: specQaId,
+        companyId,
+        name: "QA (Spec)",
+        role: "qa",
+        status: "idle",
+        adapterType: "process",
+        adapterConfig: { command: "true" },
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Mixed QA path",
+      status: "in_review",
+      priority: "medium",
+      identifier: `${issuePrefix(companyId)}-mixed`,
+      assigneeAgentId: codeQaId,
+    });
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+
+    await expect(
+      services.issues.update({
+        issueId,
+        companyId,
+        patch: {
+          actorAgentId: codeQaId,
+          qaVerdict: "pass",
+        },
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: {
+        code: "invalid_qa_disposition",
+        missing: "browser_qa_agent",
+        required: "qaBrowserScope:not_applicable",
+      },
+    });
+  });
+
+  it("routes plugin Browser QA PASS to Spec QA", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const browserQaId = await seedQaAgent(companyId, "QA (Browser)");
+    const specQaId = await seedQaAgent(companyId, "QA (Spec)");
+    const issueId = await seedQaIssue(companyId, browserQaId, "Browser QA path");
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+
+    const updated = await services.issues.update({
+      issueId,
+      companyId,
+      patch: {
+        actorAgentId: browserQaId,
+        qaVerdict: "pass",
+      },
+    });
+
+    expect(updated.status).toBe("in_review");
+    expect(updated.assigneeAgentId).toBe(specQaId);
+    expect(updated.assigneeUserId).toBeNull();
+  });
+
+  it("rejects plugin Browser QA PASS when no Spec QA agent exists", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const browserQaId = await seedQaAgent(companyId, "QA (Browser)");
+    const issueId = await seedQaIssue(companyId, browserQaId, "Browser QA path");
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+
+    await expect(
+      services.issues.update({
+        issueId,
+        companyId,
+        patch: {
+          actorAgentId: browserQaId,
+          qaVerdict: "pass",
+        },
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: {
+        code: "invalid_qa_disposition",
+        missing: "spec_qa_agent",
+      },
+    });
+  });
+
+  it("lets plugin Spec QA PASS complete and clear assignment", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const specQaId = await seedQaAgent(companyId, "QA (Spec)");
+    const issueId = await seedQaIssue(companyId, specQaId, "Spec QA path");
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+
+    const updated = await services.issues.update({
+      issueId,
+      companyId,
+      patch: {
+        actorAgentId: specQaId,
+        qaVerdict: "pass",
+      },
+    });
+
+    expect(updated.status).toBe("done");
+    expect(updated.assigneeAgentId).toBeNull();
+    expect(updated.assigneeUserId).toBeNull();
+  });
+
+  it("rejects plugin Code QA direct done without an explicit PASS verdict", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const codeQaId = await seedQaAgent(companyId, "QA (Code)");
+    const issueId = await seedQaIssue(companyId, codeQaId, "Code QA direct done");
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+
+    await expect(
+      services.issues.update({
+        issueId,
+        companyId,
+        patch: {
+          actorAgentId: codeQaId,
+          status: "done",
+        },
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: {
+        code: "invalid_qa_disposition",
+        required: "qaVerdict",
+      },
+    });
+  });
+
+  it("rejects plugin Browser QA direct done without an explicit PASS verdict", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const browserQaId = await seedQaAgent(companyId, "QA (Browser)");
+    const issueId = await seedQaIssue(companyId, browserQaId, "Browser QA direct done");
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+
+    await expect(
+      services.issues.update({
+        issueId,
+        companyId,
+        patch: {
+          actorAgentId: browserQaId,
+          status: "done",
+        },
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: {
+        code: "invalid_qa_disposition",
+        required: "qaVerdict",
+      },
+    });
   });
 
   it("creates plugin operation issues with the generic operation origin", async () => {

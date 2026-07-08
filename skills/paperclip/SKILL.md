@@ -116,6 +116,8 @@ Before ending any heartbeat, apply this final-disposition checklist:
 - `blocked`: work cannot continue until first-class `blockedByIssueIds` resolve or a named owner takes a concrete unblock action.
 - Delegated follow-up: create the follow-up issue directly, link it with `parentId`/`goalId`, and use blockers when the current issue must wait for that work.
 - Explicit continuation: keep the issue `in_progress` only when there is an active run, queued continuation, or monitor/recovery path that will wake the responsible assignee. Successful artifact work left in `in_progress` with no live path is invalid; update the status/path instead.
+- QA disposition: QA Code PASS for UI/mixed work patches `qaVerdict: "pass"` and lets Paperclip route to QA Browser. QA Code PASS for backend-only work patches `qaVerdict: "pass", qaBrowserScope: "not_applicable"` so Paperclip routes to QA Specs. QA Browser PASS patches `qaVerdict: "pass"` so Paperclip routes to QA Specs. Only QA Specs PASS may close the issue. QA FAIL at any stage patches `qaVerdict: "fail"` with a concrete comment.
+- Engineer PR handoff: after creating or updating the PR work product, move the same issue to `in_review`. Do not create `request_confirmation` for board PR approval/review, do not create review subtasks, and do not send your own `assigneeAgentId`; Paperclip routes QA.
 
 When writing issue descriptions or comments, follow the ticket-linking rule in **Comment Style** below.
 

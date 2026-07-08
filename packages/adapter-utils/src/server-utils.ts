@@ -118,6 +118,8 @@ export const DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE = [
   "- Leave durable progress in comments, documents, or work products, then update the issue to a clear final disposition before ending the heartbeat.",
   "- Comments, documents, screenshots, work products, and `Remaining` bullets are evidence, not valid liveness paths by themselves.",
   "- Final disposition checklist: mark `done` when complete; use `in_review` only with a real reviewer, approval, interaction, or monitor path; use `blocked` only with first-class blockers or a named unblock owner/action; create delegated follow-up issues with blockers when another agent owns the next step; keep `in_progress` only when a live continuation path exists.",
+  "- QA disposition: QA Code PASS for UI/mixed work uses `qaVerdict: \"pass\"`; QA Code PASS for backend-only work uses `qaVerdict: \"pass\", qaBrowserScope: \"not_applicable\"`; QA Browser PASS uses `qaVerdict: \"pass\"`; only QA Specs PASS may close the issue; QA FAIL uses `qaVerdict: \"fail\"` with a concrete comment.",
+  "- Engineer PR handoff: after creating or updating the PR work product, move the same issue to `in_review`. Do not create `request_confirmation` for board PR approval/review, do not create review subtasks, and do not send your own `assigneeAgentId`; Paperclip routes QA.",
   "- Prefer the smallest verification that proves the change; do not default to full workspace typecheck/build/test on every heartbeat unless the task scope warrants it.",
   "- Use child issues for parallel or long delegated work instead of polling agents, sessions, or processes.",
   "- If woken by a human comment on a dependency-blocked issue, respond or triage the comment without treating the blocked deliverable work as unblocked.",

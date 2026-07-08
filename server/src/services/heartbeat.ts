@@ -265,6 +265,7 @@ const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
+const MISSING_ISSUE_COMMENT_STATUS_ONLY_TTL_SEC = 300;
 const WORKSPACE_VALIDATION_FAILURE_CODE = "workspace_validation_failed";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 const CONFIGURATION_INCOMPLETE_FAILURE_CODE = "configuration_incomplete";
@@ -6010,14 +6011,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const contextSnapshot = parseObject(run.contextSnapshot);
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
     const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
+    const now = new Date();
+    const statusOnlyExpiresAt = new Date(now.getTime() + MISSING_ISSUE_COMMENT_STATUS_ONLY_TTL_SEC * 1000);
     const retryContextSnapshot = withRecoveryModelProfileHint({
       ...contextSnapshot,
       retryOfRunId: run.id,
       wakeReason: "missing_issue_comment",
       retryReason: "missing_issue_comment",
       missingIssueCommentForRunId: run.id,
+      statusOnlyTtlSec: MISSING_ISSUE_COMMENT_STATUS_ONLY_TTL_SEC,
+      statusOnlyExpiresAt: statusOnlyExpiresAt.toISOString(),
     }, "status_only");
-    const now = new Date();
 
     const retryRun = await db.transaction(async (tx) => {
       await tx.execute(
@@ -6043,6 +6047,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             issueId,
             retryOfRunId: run.id,
             retryReason: "missing_issue_comment",
+            statusOnlyTtlSec: MISSING_ISSUE_COMMENT_STATUS_ONLY_TTL_SEC,
+            statusOnlyExpiresAt: statusOnlyExpiresAt.toISOString(),
           }, "status_only"),
           status: "queued",
           requestedByActorType: "system",
@@ -7820,9 +7826,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           | "issue_not_in_progress"
           | "issue_execution_lock_changed"
           | "issue_review_participant_changed"
-          | "issue_continuation_waiting_on_review";
+          | "issue_continuation_waiting_on_review"
+          | "status_only_timeout";
         details: Record<string, unknown>;
       };
+
+  function readStatusOnlyExpiry(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "createdAt">,
+    context: Record<string, unknown>,
+  ) {
+    const explicitExpiresAt = readNonEmptyString(context.statusOnlyExpiresAt);
+    if (explicitExpiresAt) {
+      const explicitDate = new Date(explicitExpiresAt);
+      if (!Number.isNaN(explicitDate.getTime())) return explicitDate;
+    }
+
+    const ttlSec = typeof context.statusOnlyTtlSec === "number" && Number.isFinite(context.statusOnlyTtlSec)
+      ? Math.max(0, Math.floor(context.statusOnlyTtlSec))
+      : MISSING_ISSUE_COMMENT_STATUS_ONLY_TTL_SEC;
+    const createdAt = run.createdAt ? new Date(run.createdAt) : null;
+    if (!createdAt || Number.isNaN(createdAt.getTime())) return null;
+    return new Date(createdAt.getTime() + ttlSec * 1000);
+  }
 
   async function evaluateQueuedRunStaleness(
     run: typeof heartbeatRuns.$inferSelect,
@@ -7855,6 +7880,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const resumeIntent = context.resumeIntent === true || context.followUpRequested === true;
     const wakeReason = readNonEmptyString(context.wakeReason);
     const retryReason = readNonEmptyString(context.retryReason) ?? run.scheduledRetryReason ?? null;
+
+    if (retryReason === "missing_issue_comment") {
+      const expiresAt = readStatusOnlyExpiry(run, context);
+      const now = new Date();
+      if (expiresAt && now.getTime() >= expiresAt.getTime()) {
+        return {
+          stale: true,
+          errorCode: "status_only_timeout",
+          reason:
+            "Cancelled because the missing-comment status-only retry exceeded its bounded recovery timeout",
+          details: {
+            issueId,
+            retryReason,
+            statusOnlyTtlSec: typeof context.statusOnlyTtlSec === "number"
+              ? context.statusOnlyTtlSec
+              : MISSING_ISSUE_COMMENT_STATUS_ONLY_TTL_SEC,
+            statusOnlyExpiresAt: expiresAt.toISOString(),
+          },
+        };
+      }
+    }
 
     if (
       issue.status === "in_progress" &&
@@ -7964,18 +8010,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     staleness: Extract<QueuedRunStaleness, { stale: true }>,
   ) {
     const now = new Date();
+    const resultJson = staleness.errorCode === "status_only_timeout"
+      ? {
+          ...parseObject(run.resultJson),
+          stopReason: staleness.errorCode,
+          effectiveTimeoutSec: MISSING_ISSUE_COMMENT_STATUS_ONLY_TTL_SEC,
+          timeoutConfigured: true,
+          timeoutSource: "status_only",
+          timeoutFired: true,
+        }
+      : {
+          ...parseObject(run.resultJson),
+          stopReason: staleness.errorCode,
+          effectiveTimeoutSec: 0,
+          timeoutConfigured: false,
+          timeoutSource: "stale_queued_run_gate",
+          timeoutFired: false,
+        };
     const cancelled = await setRunStatus(run.id, "cancelled", {
       finishedAt: now,
       error: staleness.reason,
       errorCode: staleness.errorCode,
-      resultJson: {
-        ...parseObject(run.resultJson),
-        stopReason: staleness.errorCode,
-        effectiveTimeoutSec: 0,
-        timeoutConfigured: false,
-        timeoutSource: "stale_queued_run_gate",
-        timeoutFired: false,
-      },
+      resultJson,
     });
     if (!cancelled) return null;
 
@@ -7984,21 +8040,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       error: staleness.reason,
     });
 
-    await db
-      .update(issues)
-      .set({
-        executionRunId: null,
-        executionAgentNameKey: null,
-        executionLockedAt: null,
-        updatedAt: now,
-      })
-      .where(
-        and(
-          eq(issues.companyId, run.companyId),
-          eq(issues.id, issueId),
-          eq(issues.executionRunId, run.id),
-        ),
-      );
+    await releaseIssueExecutionAndPromote(cancelled, { suppressImmediateRecovery: true });
 
     await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
       eventType: "lifecycle",

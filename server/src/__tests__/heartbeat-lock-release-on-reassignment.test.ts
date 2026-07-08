@@ -5,6 +5,7 @@ import {
   agents,
   agentRuntimeState,
   agentWakeupRequests,
+  activityLog,
   companies,
   createDb,
   heartbeatRunEvents,
@@ -16,6 +17,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { runningProcesses } from "../adapters/index.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -36,6 +38,8 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
   }, 60_000);
 
   afterEach(async () => {
+    runningProcesses.clear();
+    await db.delete(activityLog);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
@@ -81,7 +85,7 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
         id: reviewerAgentId,
         companyId,
         name: "Reviewer",
-        role: "engineer",
+        role: "qa",
         status: "idle",
         adapterType: "process",
         adapterConfig: {},
@@ -108,6 +112,13 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
       wakeupRequestId,
       contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
     });
+    if (opts.holderStatus === "running") {
+      runningProcesses.set(holderRunId, {
+        child: {} as never,
+        graceSec: 0,
+        processGroupId: null,
+      });
+    }
 
     await db.insert(issues).values({
       id: issueId,

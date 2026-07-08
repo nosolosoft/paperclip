@@ -1548,8 +1548,12 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
       expect(payloads).toHaveLength(2);
       expect(runs[1]?.contextSnapshot).toMatchObject({
         retryReason: "missing_issue_comment",
+        statusOnlyExpiresAt: expect.any(String),
+        statusOnlyTtlSec: 300,
         modelProfile: "cheap",
       });
+      expect(new Date((runs[1]?.contextSnapshot as Record<string, unknown>).statusOnlyExpiresAt as string).getTime())
+        .toBeGreaterThan(runs[1]?.createdAt?.getTime() ?? 0);
     } finally {
       gateway.releaseFirstWait();
       await gateway.close();

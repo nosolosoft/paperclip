@@ -1100,6 +1100,166 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(promotedRun?.agentId).toBe(peerAgentId);
   });
 
+  it("expires missing-comment status-only retries, releases the lock, and promotes deferred issue wakes", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Bookkeeper" });
+    const qaAgentId = randomUUID();
+    const issueId = randomUUID();
+    const wakeupRequestId = randomUUID();
+    const queuedRunId = randomUUID();
+    const deferredWakeupId = randomUUID();
+    const staleAt = new Date(Date.now() - 1_000);
+
+    await db.insert(agents).values({
+      id: qaAgentId,
+      companyId,
+      name: "QA Browser",
+      role: "qa",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+      },
+      permissions: {},
+    });
+
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "missing_issue_comment",
+      payload: {
+        issueId,
+        retryReason: "missing_issue_comment",
+        modelProfile: "cheap",
+      },
+      status: "queued",
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: qaAgentId,
+      invocationSource: "on_demand",
+      triggerDetail: "manual",
+      status: "running",
+      contextSnapshot: {},
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: queuedRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId,
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "missing_issue_comment",
+        retryReason: "missing_issue_comment",
+        statusOnlyTtlSec: 300,
+        statusOnlyExpiresAt: staleAt.toISOString(),
+        modelProfile: "cheap",
+      },
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Needs real QA after bookkeeping retry",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: qaAgentId,
+      executionRunId: queuedRunId,
+      executionAgentNameKey: "bookkeeper",
+      executionLockedAt: new Date(Date.now() - 301_000),
+    });
+
+    await db.insert(agentWakeupRequests).values({
+      id: deferredWakeupId,
+      companyId,
+      agentId: qaAgentId,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_execution_deferred",
+      payload: {
+        issueId,
+        _paperclipWakeContext: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "qa_browser_requested",
+        },
+      },
+      status: "deferred_issue_execution",
+    });
+
+    await db
+      .update(agentWakeupRequests)
+      .set({ runId: queuedRunId })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+
+    await heartbeat.resumeQueuedRuns();
+
+    await waitForCondition(async () => {
+      const [deferred] = await db
+        .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, deferredWakeupId));
+      return deferred?.status === "queued" && Boolean(deferred.runId);
+    });
+
+    const [run, issue, deferred] = await Promise.all([
+      db
+        .select({
+          status: heartbeatRuns.status,
+          errorCode: heartbeatRuns.errorCode,
+          resultJson: heartbeatRuns.resultJson,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, queuedRunId))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ executionRunId: issues.executionRunId, executionAgentNameKey: issues.executionAgentNameKey })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, deferredWakeupId))
+        .then((rows) => rows[0] ?? null),
+    ]);
+
+    const [promotedRun] = deferred?.runId
+      ? await db
+        .select({ agentId: heartbeatRuns.agentId })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, deferred.runId))
+      : [];
+
+    expect(run?.status).toBe("cancelled");
+    expect(run?.errorCode).toBe("status_only_timeout");
+    expect(run?.resultJson).toMatchObject({
+      stopReason: "status_only_timeout",
+      effectiveTimeoutSec: 300,
+      timeoutConfigured: true,
+      timeoutSource: "status_only",
+      timeoutFired: true,
+    });
+    expect(issue?.executionRunId).toBe(deferred?.runId);
+    expect(issue?.executionAgentNameKey).toBe("qa browser");
+    expect(deferred?.status).toBe("queued");
+    expect(promotedRun?.agentId).toBe(qaAgentId);
+    expect(countExecuteCallsForRun(queuedRunId)).toBe(0);
+  });
+
   it("cancels queued runs when the issue assignee changes before the run starts", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "OriginalCoder" });
     const replacementAgentId = randomUUID();

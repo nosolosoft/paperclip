@@ -13688,49 +13688,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return { kind: "skipped" as const };
         }
 
-        const eligibility = evaluateIssueWakeEligibility({
-          agent,
-          issue,
-          source,
-          triggerDetail,
-          reason,
-          contextSnapshot: enrichedContextSnapshot,
-        });
-        if (!eligibility.allowed) {
-          await tx.insert(agentWakeupRequests).values({
-            companyId: agent.companyId,
-            agentId,
-            source,
-            triggerDetail,
-            reason: eligibility.reason,
-            payload: { ...(payload ?? {}), issueId: issue.id },
-            status: "skipped",
-            requestedByActorType: opts.requestedByActorType ?? null,
-            requestedByActorId: opts.requestedByActorId ?? null,
-            idempotencyKey: opts.idempotencyKey ?? null,
-            finishedAt: new Date(),
-          });
-          await tx.insert(activityLog).values({
-            companyId: agent.companyId,
-            actorType: "system",
-            actorId: "heartbeat",
-            action: "heartbeat.wakeup_skipped",
-            entityType: "issue",
-            entityId: issue.id,
-            agentId,
-            details: {
-              reason: eligibility.reason,
-              requestedReason: reason,
-              source,
-              triggerDetail,
-              issueStatus: issue.status,
-              assigneeAgentId: issue.assigneeAgentId,
-            },
-          });
-          return { kind: "skipped" as const };
-        }
-
-        const cancelStaleScheduledRetry = async (scheduledRun: typeof heartbeatRuns.$inferSelect) => {
+      const cancelStaleScheduledRetry = async (scheduledRun: typeof heartbeatRuns.$inferSelect) => {
           const issueCancelled = issue.status === "cancelled";
           if (
             scheduledRun.status !== "scheduled_retry" ||
@@ -14111,11 +14069,53 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               idempotencyKey: opts.idempotencyKey ?? null,
             });
 
-            return { kind: "deferred" as const };
-          }
-        }
+      return { kind: "deferred" as const };
+    }
+  }
 
-        const dailyCapBlock = await getHeartbeatDailyCapBlock(agent, policy, {}, tx);
+      const eligibility = evaluateIssueWakeEligibility({
+        agent,
+        issue,
+        source,
+        triggerDetail,
+        reason,
+        contextSnapshot: enrichedContextSnapshot,
+      });
+      if (!eligibility.allowed) {
+        await tx.insert(agentWakeupRequests).values({
+          companyId: agent.companyId,
+          agentId,
+          source,
+          triggerDetail,
+          reason: eligibility.reason,
+          payload: { ...(payload ?? {}), issueId: issue.id },
+          status: "skipped",
+          requestedByActorType: opts.requestedByActorType ?? null,
+          requestedByActorId: opts.requestedByActorId ?? null,
+          idempotencyKey: opts.idempotencyKey ?? null,
+          finishedAt: new Date(),
+        });
+        await tx.insert(activityLog).values({
+          companyId: agent.companyId,
+          actorType: "system",
+          actorId: "heartbeat",
+          action: "heartbeat.wakeup_skipped",
+          entityType: "issue",
+          entityId: issue.id,
+          agentId,
+          details: {
+            reason: eligibility.reason,
+            requestedReason: reason,
+            source,
+            triggerDetail,
+            issueStatus: issue.status,
+            assigneeAgentId: issue.assigneeAgentId,
+          },
+        });
+        return { kind: "skipped" as const };
+      }
+
+      const dailyCapBlock = await getHeartbeatDailyCapBlock(agent, policy, {}, tx);
         if (dailyCapBlock) {
           const now = new Date();
           await tx.insert(agentWakeupRequests).values({

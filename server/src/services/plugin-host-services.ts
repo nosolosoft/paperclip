@@ -81,11 +81,6 @@ function normalizeAgentRoutingText(value: string | null | undefined) {
   return value?.trim().toLowerCase().replace(/\s+/g, " ") ?? "";
 }
 
-function issueLooksLikeBrowserQaRouting(input: { title?: string | null; description?: string | null }) {
-  const haystack = normalizeAgentRoutingText(`${input.title ?? ""} ${input.description ?? ""}`);
-  return /(browser|frontend|front-end|ui|visual|playwright|screenshot|e2e|css|layout|responsive|mobile|angular|react|next\.js|page|screen|web)/.test(haystack);
-}
-
 function agentLooksLikeCodeQaRouting(agent: { name?: string | null; role?: string | null; capabilities?: string | null }) {
   const haystack = normalizeAgentRoutingText([agent.name ?? "", agent.role ?? "", agent.capabilities ?? ""].join(" "));
   return haystack.includes("qa") && (haystack.includes("code") || haystack.includes("api") || haystack.includes("backend"));
@@ -94,6 +89,37 @@ function agentLooksLikeCodeQaRouting(agent: { name?: string | null; role?: strin
 function agentLooksLikeBrowserQaRouting(agent: { name?: string | null; role?: string | null; capabilities?: string | null }) {
   const haystack = normalizeAgentRoutingText([agent.name ?? "", agent.role ?? "", agent.capabilities ?? ""].join(" "));
   return haystack.includes("qa") && (haystack.includes("browser") || haystack.includes("frontend") || haystack.includes("visual") || haystack.includes("ui"));
+}
+
+function agentLooksLikeSpecQaRouting(agent: { name?: string | null; role?: string | null; capabilities?: string | null }) {
+  const haystack = normalizeAgentRoutingText([agent.name ?? "", agent.role ?? "", agent.capabilities ?? ""].join(" "));
+  return haystack.includes("qa") && (haystack.includes("spec") || haystack.includes("requirements") || haystack.includes("acceptance"));
+}
+
+function getQaStageRoutingKind(agent: { name?: string | null; role?: string | null; capabilities?: string | null }) {
+  if (agentLooksLikeCodeQaRouting(agent)) return "code";
+  if (agentLooksLikeBrowserQaRouting(agent)) return "browser";
+  if (agentLooksLikeSpecQaRouting(agent)) return "spec";
+  return "unknown";
+}
+
+function selectNextQaRoutingAgent(
+  agents: Array<{ id: string; name?: string | null; role?: string | null; status?: string | null; capabilities?: string | null }>,
+  currentStage: "code" | "browser" | "spec" | null,
+) {
+  const assignableQaAgents = agents.filter((agent) =>
+    agent.role === "qa" && !["terminated", "pending_approval"].includes(agent.status ?? ""));
+  const codeQa = assignableQaAgents.find(agentLooksLikeCodeQaRouting);
+  const browserQa = assignableQaAgents.find(agentLooksLikeBrowserQaRouting);
+  const specQa = assignableQaAgents.find(agentLooksLikeSpecQaRouting);
+  const stages = currentStage === "code"
+    ? [browserQa, specQa]
+    : currentStage === "browser"
+      ? [specQa]
+      : currentStage === "spec"
+        ? []
+        : [codeQa, browserQa, specQa];
+  return stages.find((agent) => Boolean(agent)) ?? null;
 }
 
 function agentLooksLikeEngineerRouting(agent: { role?: string | null; status?: string | null }) {
@@ -1607,9 +1633,11 @@ export function buildHostServices(
         const actorAgentId = typeof patch.actorAgentId === "string" ? patch.actorAgentId : null;
         const actorUserId = typeof patch.actorUserId === "string" ? patch.actorUserId : null;
         const actorRunId = typeof patch.actorRunId === "string" ? patch.actorRunId : null;
+        const qaVerdict = patch.qaVerdict === "pass" || patch.qaVerdict === "fail" ? patch.qaVerdict : undefined;
         delete patch.actorAgentId;
         delete patch.actorUserId;
         delete patch.actorRunId;
+        delete patch.qaVerdict;
         if (patch.originKind !== undefined) {
           patch.originKind = normalizePluginOriginKind(patch.originKind);
         }
@@ -1619,7 +1647,7 @@ export function buildHostServices(
         const nextAssigneeUserId = patch.assigneeUserId === undefined ? existing.assigneeUserId : patch.assigneeUserId;
         if (actorAgentId) {
           const sourceAgent = await agents.getById(actorAgentId);
-          if (sourceAgent?.role === "qa" && (nextStatus === "blocked" || nextStatus === "in_progress")) {
+          if (sourceAgent?.role === "qa" && (qaVerdict === "fail" || nextStatus === "blocked" || nextStatus === "in_progress")) {
             const candidateAgents = await agents.list(companyId);
             const engineer = candidateAgents.find(agentLooksLikeEngineerRouting);
             if (engineer) {
@@ -1627,18 +1655,33 @@ export function buildHostServices(
               patch.assigneeAgentId = engineer.id;
               patch.assigneeUserId = null;
             }
+          } else if (sourceAgent?.role === "qa" && qaVerdict === "pass") {
+            const candidateAgents = await agents.list(companyId);
+            const currentStage = getQaStageRoutingKind(sourceAgent);
+            const nextQaAgent = selectNextQaRoutingAgent(
+              candidateAgents,
+              currentStage === "unknown" ? "spec" : currentStage,
+            );
+            if (nextQaAgent) {
+              patch.status = "in_review";
+              patch.assigneeAgentId = nextQaAgent.id;
+              patch.assigneeUserId = null;
+            } else {
+              patch.status = "done";
+              patch.assigneeAgentId = null;
+              patch.assigneeUserId = null;
+            }
           } else if (sourceAgent?.role === "qa" && nextStatus === "done") {
+            const currentStage = getQaStageRoutingKind(sourceAgent);
+            if (currentStage !== "spec") {
+              throw new Error("Intermediate QA stages must submit qaVerdict=pass instead of moving the issue to done");
+            }
             patch.assigneeAgentId = null;
             patch.assigneeUserId = null;
           } else if (existing.status !== "in_review" && nextStatus === "in_review" && !nextAssigneeAgentId) {
             if (sourceAgent?.role === "engineer") {
               const candidateAgents = await agents.list(companyId);
-              const assignableQaAgents = candidateAgents.filter((agent) =>
-                agent.role === "qa" && !["terminated", "pending_approval"].includes(agent.status));
-              const wantsBrowser = issueLooksLikeBrowserQaRouting(existing);
-              const browserQa = assignableQaAgents.find(agentLooksLikeBrowserQaRouting);
-              const codeQa = assignableQaAgents.find(agentLooksLikeCodeQaRouting);
-              const qaAgent = (wantsBrowser ? browserQa ?? codeQa : codeQa ?? browserQa) ?? assignableQaAgents[0] ?? null;
+              const qaAgent = selectNextQaRoutingAgent(candidateAgents, null);
               if (qaAgent) {
                 patch.assigneeAgentId = qaAgent.id;
                 patch.assigneeUserId = null;

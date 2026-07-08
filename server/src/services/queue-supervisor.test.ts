@@ -18,6 +18,7 @@ const RECENT = "2026-06-21T11:45:00.000Z";
 const engineer: QueueSupervisorAgentRef = { id: "agent-engineer", name: "Claude Engineer", role: "engineer" };
 const qaCode: QueueSupervisorAgentRef = { id: "agent-qa-code", name: "QA (Code)", role: "qa" };
 const qaBrowser: QueueSupervisorAgentRef = { id: "agent-qa-browser", name: "QA (Browser)", role: "qa" };
+const qaSpec: QueueSupervisorAgentRef = { id: "agent-qa-spec", name: "QA (Spec)", role: "qa" };
 
 function issue(overrides: Partial<QueueSupervisorIssueSnapshot>): QueueSupervisorIssueSnapshot {
   return {
@@ -28,6 +29,7 @@ function issue(overrides: Partial<QueueSupervisorIssueSnapshot>): QueueSuperviso
     assigneeAgent: engineer,
     qaCodeAgent: qaCode,
     qaBrowserAgent: qaBrowser,
+    qaSpecAgent: qaSpec,
     updatedAt: OLD,
     comments: [],
     runs: [],
@@ -50,7 +52,7 @@ describe("queue supervisor policy", () => {
     expect(assertQueueSupervisorProposalInvariants(proposal, snapshot).ok).toBe(true);
   });
 
-  it("routes UI-flavoured in_review issues to QA Browser", () => {
+  it("routes UI-flavoured in_review issues to QA Code first", () => {
     const snapshot = issue({
       status: "in_review",
       title: "Fix browser render regression on exam page",
@@ -59,8 +61,8 @@ describe("queue supervisor policy", () => {
 
     const proposal = evaluateQueueSupervisorIssue(snapshot, defaultQueueSupervisorPolicyConfig, NOW);
 
-    expect(proposal.action).toBe("assign_qa_browser");
-    expect(proposal.targetAssigneeAgentId).toBe(qaBrowser.id);
+    expect(proposal.action).toBe("assign_qa_code");
+    expect(proposal.targetAssigneeAgentId).toBe(qaCode.id);
   });
 
   it("classifies QA and Engineer assignees through the heartbeat classifier", () => {
@@ -78,6 +80,15 @@ describe("queue supervisor policy", () => {
 
   it("does not touch in_review issues already owned by QA", () => {
     const snapshot = issue({ status: "in_review", assigneeAgent: qaCode });
+
+    const proposal = evaluateQueueSupervisorIssue(snapshot, defaultQueueSupervisorPolicyConfig, NOW);
+
+    expect(proposal.action).toBe("noop");
+    expect(proposal.classification).toBe("healthy");
+  });
+
+  it("treats in_review issues owned by Spec QA as healthy", () => {
+    const snapshot = issue({ status: "in_review", assigneeAgent: qaSpec });
 
     const proposal = evaluateQueueSupervisorIssue(snapshot, defaultQueueSupervisorPolicyConfig, NOW);
 
@@ -148,7 +159,7 @@ describe("queue supervisor policy", () => {
     expect(proposal.action).toBe("noop");
   });
 
-  it("human-gates QA PASS closeout", () => {
+  it("routes Code QA PASS to Browser QA", () => {
     const snapshot = issue({
       status: "in_review",
       assigneeAgent: qaCode,
@@ -157,9 +168,41 @@ describe("queue supervisor policy", () => {
 
     const proposal = evaluateQueueSupervisorIssue(snapshot, defaultQueueSupervisorPolicyConfig, NOW);
 
-    expect(proposal.classification).toBe("qa_pass_needs_human_closeout");
-    expect(proposal.action).toBe("needs_human");
-    expect(proposal.requiresHuman).toBe(true);
+    expect(proposal.classification).toBe("qa_pass_needs_next_stage");
+    expect(proposal.action).toBe("assign_qa_browser");
+    expect(proposal.targetAssigneeAgentId).toBe(qaBrowser.id);
+    expect(proposal.requiresHuman).toBe(false);
+  });
+
+  it("routes Browser QA PASS to Spec QA", () => {
+    const snapshot = issue({
+      status: "in_review",
+      assigneeAgent: qaBrowser,
+      comments: [{ id: "comment-pass", body: "QA BROWSER PASS", createdAt: OLD, authorKind: "agent", authorAgentKind: "qa_browser" }],
+    });
+
+    const proposal = evaluateQueueSupervisorIssue(snapshot, defaultQueueSupervisorPolicyConfig, NOW);
+
+    expect(proposal.classification).toBe("qa_pass_needs_next_stage");
+    expect(proposal.action).toBe("assign_qa_spec");
+    expect(proposal.targetAssigneeAgentId).toBe(qaSpec.id);
+  });
+
+  it("routes Spec QA PASS to done closeout", () => {
+    const snapshot = issue({
+      status: "in_review",
+      assigneeAgent: qaSpec,
+      comments: [{ id: "comment-pass", body: "QA PASS", createdAt: OLD, authorKind: "agent", authorAgentKind: "qa_spec" }],
+    });
+
+    const proposal = evaluateQueueSupervisorIssue(snapshot, defaultQueueSupervisorPolicyConfig, NOW);
+
+    expect(proposal.classification).toBe("qa_pass_needs_done_closeout");
+    expect(proposal.action).toBe("mark_done");
+    expect(proposal.targetStatus).toBe("done");
+    expect(proposal.targetAssigneeAgentId).toBeNull();
+    expect(proposal.requiresHuman).toBe(false);
+    expect(assertQueueSupervisorProposalInvariants(proposal, snapshot).ok).toBe(true);
   });
 
   it("routes blocked review-ready issues to in_review with QA Code", () => {

@@ -393,6 +393,119 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(countExecuteCallsForRun(run!.id)).toBe(1);
   });
 
+  it("skips QA generic timer wakes with no assigned review work before adapter execution", async () => {
+    const { agentId } = await seedCompanyAndAgent({
+      agentName: "QA (Browser)",
+      agentRole: "qa",
+      heartbeatConfig: {
+        enabled: true,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).toBeNull();
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+
+    const [wakeup] = await db
+      .select({
+        status: agentWakeupRequests.status,
+        reason: agentWakeupRequests.reason,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+
+    expect(wakeup).toMatchObject({
+      status: "skipped",
+      reason: "heartbeat.timer.no_actionable_work",
+    });
+    expect(wakeup?.payload).toMatchObject({
+      heartbeatSkip: {
+        reason: expect.stringContaining("No assigned in_review issue"),
+      },
+    });
+  });
+
+  it("allows QA generic timer wakes when the agent has assigned in_review work", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      agentName: "QA (Code)",
+      agentRole: "qa",
+      heartbeatConfig: {
+        enabled: true,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "Assigned review",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).not.toBeNull();
+    await waitForCondition(async () => countExecuteCallsForRun(run!.id) > 0);
+
+    expect(countExecuteCallsForRun(run!.id)).toBe(1);
+  });
+
+  it("skips QA generic timer wakes when assigned work is not in_review", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      agentName: "QA (Code)",
+      agentRole: "qa",
+      heartbeatConfig: {
+        enabled: true,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "Assigned implementation work",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).toBeNull();
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+
+    const [wakeup] = await db
+      .select({
+        status: agentWakeupRequests.status,
+        reason: agentWakeupRequests.reason,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+
+    expect(wakeup).toMatchObject({
+      status: "skipped",
+      reason: "heartbeat.timer.no_actionable_work",
+    });
+    expect(wakeup?.payload).toMatchObject({
+      heartbeatSkip: {
+        reason: expect.stringContaining("No assigned in_review issue"),
+      },
+    });
+  });
+
   it("runs generic timer wakes by default for proactive agents without assigned issue work", async () => {
     const { agentId } = await seedCompanyAndAgent({
       heartbeatConfig: {

@@ -1408,6 +1408,22 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         issueProjectWorkspaceId: projectWorkspaceId,
       },
     });
+    const retryRuns = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId));
+    expect(retryRuns).toHaveLength(0);
+    const continuationWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.agentId, agentId),
+          eq(agentWakeupRequests.reason, "issue_continuation_needed"),
+        ),
+      );
+    expect(continuationWakeups).toHaveLength(0);
 
     const issue = await waitForValue(async () =>
       db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => {

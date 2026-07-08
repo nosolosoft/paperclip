@@ -157,6 +157,7 @@ import { externalObjectService } from "../services/external-objects.js";
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
+  qaVerdict: z.enum(["pass", "fail"]).optional(),
 });
 const refreshExternalObjectsSchema = z.object({
   objectIds: z.array(z.string().uuid()).max(50).optional(),
@@ -1009,11 +1010,9 @@ function agentLooksLikeBrowserQa(agent: { name: string; role: string; capabiliti
   return haystack.includes("qa") && (haystack.includes("browser") || haystack.includes("frontend") || haystack.includes("visual") || haystack.includes("ui"));
 }
 
-function issueLooksLikeBrowserQaWork(input: { title?: string | null; description?: string | null }) {
-  const haystack = normalizeAgentNameKey(`${input.title ?? ""} ${input.description ?? ""}`);
-  const looksLikeCodeOrBackendWork = /\b(api|backend|django|python|pytest|command|cli|management command|stripe|webhook|webhooks|billing|database|migration|sql|server|worker|cron|test|tests|pr|pull request)\b/.test(haystack);
-  if (looksLikeCodeOrBackendWork) return false;
-  return /\b(browser|frontend|front-end|ui|visual|playwright|screenshot|e2e|css|layout|responsive|mobile|angular|react|next\.js|page|screen)\b/.test(haystack);
+function agentLooksLikeSpecQa(agent: { name: string; role: string; capabilities?: string | null }) {
+  const haystack = normalizeAgentNameKey([agent.name, agent.role, agent.capabilities ?? ""].join(" "));
+  return haystack.includes("qa") && (haystack.includes("spec") || haystack.includes("requirements") || haystack.includes("acceptance"));
 }
 
 function buildExecutionStageWakeup(input: {
@@ -1742,9 +1741,11 @@ export function issueRoutes(
 
   async function resolveDefaultQaAgentForIssue(input: {
     companyId: string;
-    title?: string | null;
-    description?: string | null;
   }) {
+    return resolveNextQaAgent(input.companyId, null);
+  }
+
+  async function listAssignableQaAgents(companyId: string) {
     const candidates = await db
       .select({
         id: agentsTable.id,
@@ -1754,15 +1755,32 @@ export function issueRoutes(
         capabilities: agentsTable.capabilities,
       })
       .from(agentsTable)
-      .where(and(eq(agentsTable.companyId, input.companyId), eq(agentsTable.role, "qa")));
+      .where(and(eq(agentsTable.companyId, companyId), eq(agentsTable.role, "qa")));
 
-    const assignable = candidates.filter((agent) => !["terminated", "pending_approval"].includes(agent.status));
+    return candidates.filter((agent) => !["terminated", "pending_approval"].includes(agent.status));
+  }
+
+  function getQaStageKind(agent: { name: string; role: string; capabilities?: string | null }) {
+    if (agentLooksLikeCodeQa(agent)) return "code";
+    if (agentLooksLikeBrowserQa(agent)) return "browser";
+    if (agentLooksLikeSpecQa(agent)) return "spec";
+    return "unknown";
+  }
+
+  async function resolveNextQaAgent(companyId: string, currentStage: "code" | "browser" | "spec" | null) {
+    const assignable = await listAssignableQaAgents(companyId);
     if (assignable.length === 0) return null;
-
-    const wantsBrowser = issueLooksLikeBrowserQaWork(input);
-    const browserQa = assignable.find(agentLooksLikeBrowserQa);
     const codeQa = assignable.find(agentLooksLikeCodeQa);
-    return (wantsBrowser ? browserQa ?? codeQa : codeQa ?? browserQa) ?? assignable[0] ?? null;
+    const browserQa = assignable.find(agentLooksLikeBrowserQa);
+    const specQa = assignable.find(agentLooksLikeSpecQa);
+    const stages = currentStage === "code"
+      ? [browserQa, specQa]
+      : currentStage === "browser"
+        ? [specQa]
+        : currentStage === "spec"
+          ? []
+          : [codeQa, browserQa, specQa];
+    return stages.find((agent) => Boolean(agent)) ?? null;
   }
 
   async function resolveDefaultEngineerAgent(companyId: string) {
@@ -1789,6 +1807,7 @@ export function issueRoutes(
     };
     updateFields: Record<string, unknown>;
     actorAgentId?: string | null;
+    qaVerdict?: "pass" | "fail";
   }) {
     if (!input.actorAgentId) return;
     const actorAgent = await agentsSvc.getById(input.actorAgentId);
@@ -1798,7 +1817,7 @@ export function issueRoutes(
       ? input.updateFields.status
       : input.existing.status;
 
-    if (nextStatus === "blocked" || nextStatus === "in_progress") {
+    if (input.qaVerdict === "fail" || nextStatus === "blocked" || nextStatus === "in_progress") {
       const engineer = await resolveDefaultEngineerAgent(input.existing.companyId);
       if (!engineer) return;
       input.updateFields.status = "in_progress";
@@ -1807,7 +1826,33 @@ export function issueRoutes(
       return;
     }
 
+    if (input.qaVerdict === "pass") {
+      const currentStage = getQaStageKind(actorAgent);
+      const nextQaAgent = await resolveNextQaAgent(
+        input.existing.companyId,
+        currentStage === "unknown" ? "spec" : currentStage,
+      );
+      if (nextQaAgent) {
+        input.updateFields.status = "in_review";
+        input.updateFields.assigneeAgentId = nextQaAgent.id;
+        input.updateFields.assigneeUserId = null;
+        return;
+      }
+      input.updateFields.assigneeAgentId = null;
+      input.updateFields.assigneeUserId = null;
+      input.updateFields.status = "done";
+      return;
+    }
+
     if (nextStatus === "done") {
+      const currentStage = getQaStageKind(actorAgent);
+      if (currentStage !== "spec") {
+        throw unprocessable("Intermediate QA stages must submit qaVerdict=pass instead of moving the issue to done", {
+          code: "invalid_qa_disposition",
+          required: "qaVerdict",
+          allowedStatus: "in_review",
+        });
+      }
       input.updateFields.assigneeAgentId = null;
       input.updateFields.assigneeUserId = null;
     }
@@ -5970,6 +6015,7 @@ export function issueRoutes(
         : null;
     const {
       comment: commentBody,
+      qaVerdict,
       reviewRequest,
       reopen: reopenRequested,
       resume: resumeRequested,
@@ -6215,6 +6261,7 @@ export function issueRoutes(
       existing,
       updateFields,
       actorAgentId: actor.agentId ?? null,
+      qaVerdict,
     });
     await applyDefaultAgentReviewRouting({
       existing,
@@ -6755,6 +6802,10 @@ export function issueRoutes(
       isClosedIssueStatus(existing.status) &&
       issue.status === "todo" &&
       req.body.status !== undefined;
+    const statusChangedToInReview =
+      existing.status !== "in_review" &&
+      issue.status === "in_review" &&
+      req.body.status !== undefined;
     const previousExecutionState = parseIssueExecutionState(existing.executionState);
     const nextExecutionState = parseIssueExecutionState(issue.executionState);
     const executionStageWakeup = buildExecutionStageWakeup({
@@ -6812,7 +6863,12 @@ export function issueRoutes(
 
       if (
         !assigneeChanged &&
-        (statusChangedFromBacklog || statusChangedFromBlockedToTodo || statusChangedFromClosedToTodo) &&
+        (
+          statusChangedFromBacklog ||
+          statusChangedFromBlockedToTodo ||
+          statusChangedFromClosedToTodo ||
+          statusChangedToInReview
+        ) &&
         issue.assigneeAgentId
       ) {
         addWakeup(issue.assigneeAgentId, {

@@ -247,7 +247,8 @@ const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_r
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "failed", "cancelled", "timed_out"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
-const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
+const ENGINEERING_TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
+const QA_TIMER_ACTIONABLE_ISSUE_STATUSES = ["in_review"] as const;
 export {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
@@ -294,6 +295,7 @@ const CLOSED_OR_TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const REVIEW_ONLY_AGENT_NAME_RE = /\b(qa|review|reviewer|approver)\b/i;
 const BROWSER_QA_AGENT_NAME_RE = /\b(browser|e2e|playwright|visual)\b/i;
 const CODE_QA_AGENT_NAME_RE = /\b(code|static|lint|unit)\b/i;
+const SPEC_QA_AGENT_NAME_RE = /\b(spec|requirements|acceptance)\b/i;
 const ENGINEERING_AGENT_ROLE_RE = /\b(engineer|developer|coder|builder)\b/i;
 const ISSUE_WORKSPACE_REQUIRED_REASONS = new Set([
   "issue_assigned",
@@ -1292,6 +1294,7 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
   const persistedCwd = readNonEmptyString(input.persistedExecutionWorkspace?.cwd);
   const agentFallbackCwd = resolveDefaultAgentWorkspaceDir(input.agentId);
   const workspaceExpectation =
+    Boolean(issue.projectId) ||
     Boolean(issue.projectWorkspaceId) ||
     Boolean(input.resolvedWorkspace.workspaceId) ||
     input.executionWorkspace.strategy === "git_worktree";
@@ -2402,9 +2405,10 @@ export function classifyIssueWakeAgent(agent: IssueWakeGuardAgent) {
   const isQaRole = role === "qa";
   const isBrowserQa = isQaRole && BROWSER_QA_AGENT_NAME_RE.test(label);
   const isCodeQa = isQaRole && CODE_QA_AGENT_NAME_RE.test(label);
+  const isSpecQa = isQaRole && SPEC_QA_AGENT_NAME_RE.test(label);
   const isReviewOnly = isQaRole || (REVIEW_ONLY_AGENT_NAME_RE.test(label) && !ENGINEERING_AGENT_ROLE_RE.test(role));
   const isEngineering = ENGINEERING_AGENT_ROLE_RE.test(role) || /\b(codex|claude|opencode|engineer)\b/i.test(label);
-  return { isEngineering, isReviewOnly, isCodeQa, isBrowserQa };
+  return { isEngineering, isReviewOnly, isCodeQa, isBrowserQa, isSpecQa };
 }
 
 // Roles whose runs are expected to drive an issue to a terminal disposition (code
@@ -2465,7 +2469,9 @@ function evaluateIssueWakeEligibility(input: {
       ? "browser_qa_requires_in_review"
       : classification.isCodeQa
         ? "code_qa_requires_in_review"
-        : "qa_requires_in_review";
+        : classification.isSpecQa
+          ? "spec_qa_requires_in_review"
+          : "qa_requires_in_review";
     return { allowed: false as const, reason };
   }
   if (classification.isEngineering && !classification.isReviewOnly && !["todo", "backlog", "in_progress"].includes(issue.status)) {
@@ -7499,7 +7505,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return cancelled;
   }
 
+  function getTimerActionableIssueStatuses(agent: typeof agents.$inferSelect) {
+    return (agent.role ?? "").toLowerCase() === "qa"
+      ? QA_TIMER_ACTIONABLE_ISSUE_STATUSES
+      : ENGINEERING_TIMER_ACTIONABLE_ISSUE_STATUSES;
+  }
+
+  function getNoActionableTimerWorkMessage(agent: typeof agents.$inferSelect) {
+    if ((agent.role ?? "").toLowerCase() === "qa") {
+      return "No assigned in_review issue requires this QA agent before timer adapter invocation.";
+    }
+    return "No assigned todo or in_progress issue requires this agent before timer adapter invocation.";
+  }
+
   async function hasActionableTimerWork(agent: typeof agents.$inferSelect) {
+    const actionableStatuses = getTimerActionableIssueStatuses(agent);
     const row = await db
       .select({ id: issues.id })
       .from(issues)
@@ -7509,7 +7529,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           eq(issues.assigneeAgentId, agent.id),
           isNull(issues.assigneeUserId),
           isNull(issues.hiddenAt),
-          inArray(issues.status, [...TIMER_ACTIONABLE_ISSUE_STATUSES]),
+          inArray(issues.status, [...actionableStatuses]),
         ),
       )
       .limit(1)
@@ -11255,7 +11275,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       !readNonEmptyString(enrichedContextSnapshot.taskKey);
     if (policy.skipTimerWhenNoActionableWork && genericTimerWake && !(await hasActionableTimerWork(agent))) {
       await writeSkippedHeartbeatRequest("heartbeat.timer.no_actionable_work", {
-        reason: "No assigned todo or in_progress issue requires this agent before timer adapter invocation.",
+        reason: getNoActionableTimerWorkMessage(agent),
       });
       await markTimerHeartbeatChecked(agentId, source);
       return null;

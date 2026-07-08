@@ -338,6 +338,85 @@ describe("assertGitSensitiveAdapterWorkspaceValid", () => {
     );
   });
 
+  it("rejects a project-linked issue that would launch from the agent fallback cwd without a project workspace", async () => {
+    const fallbackCwd = resolveDefaultAgentWorkspaceDir("agent-1");
+
+    await expectWorkspaceValidationFailure(
+      buildWorkspaceValidationInput({
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-1",
+          projectId: "project-1",
+          projectWorkspaceId: null,
+        },
+        resolvedWorkspace: buildResolvedWorkspace({
+          cwd: fallbackCwd,
+          source: "agent_default",
+          projectId: null,
+          workspaceId: null,
+        }),
+        executionWorkspace: {
+          baseCwd: fallbackCwd,
+          source: "agent_default",
+          projectId: null,
+          workspaceId: null,
+          repoUrl: null,
+          repoRef: null,
+          strategy: "agent_default",
+          cwd: fallbackCwd,
+          branchName: null,
+          worktreePath: null,
+          warnings: [],
+          created: false,
+          baseRefSha: null,
+        },
+        persistedExecutionWorkspace: null,
+      }),
+      "missing_persisted_execution_workspace",
+      "requires a project execution workspace",
+    );
+  });
+
+  it("does not apply the project-linked workspace guard to non-git-sensitive adapters", async () => {
+    const fallbackCwd = resolveDefaultAgentWorkspaceDir("agent-1");
+
+    await expect(
+      assertGitSensitiveAdapterWorkspaceValid(
+        buildWorkspaceValidationInput({
+          adapterType: "http",
+          issue: {
+            id: "issue-1",
+            identifier: "PAP-1",
+            projectId: "project-1",
+            projectWorkspaceId: null,
+          },
+          resolvedWorkspace: buildResolvedWorkspace({
+            cwd: fallbackCwd,
+            source: "agent_default",
+            projectId: null,
+            workspaceId: null,
+          }),
+          executionWorkspace: {
+            baseCwd: fallbackCwd,
+            source: "agent_default",
+            projectId: null,
+            workspaceId: null,
+            repoUrl: null,
+            repoRef: null,
+            strategy: "agent_default",
+            cwd: fallbackCwd,
+            branchName: null,
+            worktreePath: null,
+            warnings: [],
+            created: false,
+            baseRefSha: null,
+          },
+          persistedExecutionWorkspace: null,
+        }),
+      ),
+    ).resolves.toBeUndefined();
+  });
+
   it("rejects a git worktree persisted workspace when cwd differs from providerRef", async () => {
     const input = buildWorkspaceValidationInput();
 

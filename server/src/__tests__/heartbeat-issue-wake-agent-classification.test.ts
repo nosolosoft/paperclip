@@ -25,6 +25,12 @@ describe("classifyIssueWakeAgent", () => {
       name: "QA (Code)",
       role: "qa",
     })).toMatchObject({ isReviewOnly: true, isBrowserQa: false, isCodeQa: true });
+
+    expect(classifyIssueWakeAgent({
+      id: "qa-spec",
+      name: "QA (Spec)",
+      role: "qa",
+    })).toMatchObject({ isReviewOnly: true, isBrowserQa: false, isCodeQa: false, isSpecQa: true });
   });
 
   it("classifies engineer agents as engineering, not review-only", () => {

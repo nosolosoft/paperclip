@@ -99,6 +99,12 @@ importers:
       picocolors:
         specifier: ^1.1.1
         version: 1.1.1
+      postgres:
+        specifier: ^3.4.9
+        version: 3.4.9
+      zod:
+        specifier: ^3.24.2
+        version: 3.25.76
     devDependencies:
       '@types/node':
         specifier: ^22.19.21

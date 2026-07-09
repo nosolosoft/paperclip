@@ -1880,16 +1880,49 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   const provisionCommand = asString(input.workspace.config?.provisionCommand, "").trim();
 
   if (strategy !== "git_worktree") {
+    const shouldRepairProjectPrimarySharedWorkspace =
+      input.workspace.mode === "shared_workspace" &&
+      input.base.source === "project_primary" &&
+      input.base.baseCwd.trim().length > 0;
+    if (shouldRepairProjectPrimarySharedWorkspace) {
+      const [resolvedPersistedCwd, resolvedBaseCwd] = await Promise.all([
+        resolvePathForWorktreeComparison(cwd),
+        resolvePathForWorktreeComparison(input.base.baseCwd),
+      ]);
+      if (
+        resolvedPersistedCwd !== resolvedBaseCwd &&
+        await directoryExists(input.base.baseCwd) &&
+        await isGitCheckout(input.base.baseCwd)
+      ) {
+        return {
+          ...realized,
+          baseCwd: input.base.baseCwd,
+          cwd: input.base.baseCwd,
+          projectId: input.base.projectId ?? realized.projectId,
+          workspaceId: input.base.workspaceId ?? realized.workspaceId,
+          repoUrl: input.base.repoUrl ?? realized.repoUrl,
+          repoRef: input.base.repoRef ?? realized.repoRef,
+          warnings: [
+            ...realized.warnings,
+            `Persisted project workspace "${cwd}" no longer matches current project workspace "${input.base.baseCwd}". Reusing current project workspace instead.`,
+          ],
+        };
+      }
+    }
     if (!await directoryExists(cwd)) {
       return null;
     }
     return realized;
   }
-  const repoRoot = await runGit(["rev-parse", "--show-toplevel"], input.base.baseCwd);
+  const baseRepoRoot = await runGit(["rev-parse", "--show-toplevel"], input.base.baseCwd);
   const recordedBaseRefSha = readRecordedBaseRefSha(input.workspace.metadata);
+  let repoRoot = baseRepoRoot;
   if (await directoryExists(cwd)) {
     const reuseBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
     const reuseWorktreePath = realized.worktreePath ?? cwd;
+    const resolvedReuseWorktreePath = await resolvePathForWorktreeComparison(reuseWorktreePath);
+    const ownerRepoRoot = await resolveGitOwnerRepoRoot(reuseWorktreePath).catch(() => null);
+    repoRoot = ownerRepoRoot && ownerRepoRoot !== resolvedReuseWorktreePath ? ownerRepoRoot : baseRepoRoot;
     if (await isGitCheckout(reuseWorktreePath)) {
       await ensureGitWorktreeBranchCoherent({
         repoRoot,

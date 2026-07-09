@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { and, eq, or, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -117,6 +120,31 @@ function spawnAliveProcess() {
   return spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
     stdio: "ignore",
   });
+}
+
+async function runGitForTest(cwd: string, args: string[]) {
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn("git", args, { cwd, stdio: "ignore" });
+    child.on("error", reject);
+    child.on("exit", (code, signal) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(`git ${args.join(" ")} failed with ${signal ?? code}`));
+    });
+  });
+}
+
+async function createTempGitRepoForTest() {
+  const repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-recovery-repo-"));
+  await runGitForTest(repoRoot, ["init"]);
+  await runGitForTest(repoRoot, ["config", "user.email", "paperclip-test@example.com"]);
+  await runGitForTest(repoRoot, ["config", "user.name", "Paperclip Test"]);
+  await fs.writeFile(path.join(repoRoot, "README.md"), "test repo\n");
+  await runGitForTest(repoRoot, ["add", "README.md"]);
+  await runGitForTest(repoRoot, ["commit", "-m", "initial commit"]);
+  return repoRoot;
 }
 
 function isPidAlive(pid: number | null | undefined) {
@@ -873,9 +901,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     return { companyId, agentId, runId, wakeupRequestId, issueId, stageId };
   }
 
-  async function seedAssignedTodoNoRunFixture(input?: {
-    agentStatus?: "paused" | "idle" | "running";
-  }) {
+async function seedAssignedTodoNoRunFixture(input?: {
+  agentStatus?: "paused" | "idle" | "running";
+}) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -914,10 +942,126 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       identifier: `${issuePrefix}-1`,
     });
 
-    return { companyId, agentId, issueId };
-  }
+  return { companyId, agentId, issueId };
+}
 
-  async function seedIdleTimerAgentFixture() {
+async function seedBlockedSourceScopedRecoveryWakeFixture(input?: {
+  actionId?: string;
+  actionStatus?: string;
+  actionSourceIssueId?: string;
+  actionOwnerAgentId?: string;
+  attemptCount?: number;
+  maxAttempts?: number | null;
+  lastAttemptAt?: Date | null;
+}) {
+  const companyId = randomUUID();
+  const agentId = randomUUID();
+  const issueId = randomUUID();
+  const actionId = input?.actionId ?? randomUUID();
+  const actionSourceIssueId = input?.actionSourceIssueId ?? issueId;
+  const actionOwnerAgentId = input?.actionOwnerAgentId ?? agentId;
+  const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+  const now = new Date("2026-03-19T00:00:00.000Z");
+
+  await db.insert(companies).values({
+    id: companyId,
+    name: "Paperclip",
+    issuePrefix,
+    defaultResponsibleUserId: "responsible-user",
+    requireBoardApprovalForNewAgents: false,
+  });
+
+  await db.insert(agents).values([
+    {
+      id: agentId,
+      companyId,
+      name: "Chief Executive",
+      role: "ceo",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    },
+    ...(actionOwnerAgentId !== agentId
+      ? [
+          {
+            id: actionOwnerAgentId,
+            companyId,
+            name: "Other Recovery Owner",
+            role: "ceo",
+            status: "idle" as const,
+            adapterType: "codex_local",
+            adapterConfig: {},
+            runtimeConfig: {},
+            permissions: {},
+          },
+        ]
+      : []),
+  ]);
+
+  await db.insert(issues).values([
+    {
+      id: issueId,
+      companyId,
+      title: "Blocked source issue",
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      assigneeUserId: null,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    },
+    ...(actionSourceIssueId !== issueId
+      ? [
+          {
+            id: actionSourceIssueId,
+            companyId,
+            title: "Other blocked source issue",
+            status: "blocked" as const,
+            priority: "medium" as const,
+            assigneeAgentId: actionOwnerAgentId,
+            assigneeUserId: null,
+            responsibleUserId: "responsible-user",
+            issueNumber: 2,
+            identifier: `${issuePrefix}-2`,
+          },
+        ]
+      : []),
+  ]);
+
+  await db.insert(issueRecoveryActions).values({
+    id: actionId,
+    companyId,
+    sourceIssueId: actionSourceIssueId,
+    recoveryIssueId: null,
+    kind: "stranded_assigned_issue",
+    status: input?.actionStatus ?? "active",
+    ownerType: "agent",
+    ownerAgentId: actionOwnerAgentId,
+    ownerUserId: null,
+    previousOwnerAgentId: agentId,
+    returnOwnerAgentId: agentId,
+    cause: "stranded_assigned_issue",
+    fingerprint: `test:${actionId}`,
+    evidence: {
+      sourceIssueId: actionSourceIssueId,
+      previousStatus: "in_progress",
+      latestRunId: randomUUID(),
+    },
+    nextAction: "Restore a live execution path on the blocked source issue.",
+    attemptCount: input?.attemptCount ?? 1,
+    maxAttempts: input?.maxAttempts ?? null,
+    lastAttemptAt: input && "lastAttemptAt" in input ? input.lastAttemptAt : now,
+    updatedAt: now,
+    createdAt: now,
+  });
+
+  return { companyId, agentId, issueId, actionId, actionSourceIssueId, actionOwnerAgentId };
+}
+
+async function seedIdleTimerAgentFixture() {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
@@ -1066,8 +1210,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     return action;
   }
 
-  async function sourceBlockerIssueIds(companyId: string, sourceIssueId: string) {
-    return db
+async function sourceBlockerIssueIds(companyId: string, sourceIssueId: string) {
+  return db
       .select({ blockerIssueId: issueRelations.issueId })
       .from(issueRelations)
       .where(
@@ -1077,10 +1221,406 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           eq(issueRelations.type, "blocks"),
         ),
       )
-      .then((rows) => rows.map((row) => row.blockerIssueId));
+    .then((rows) => rows.map((row) => row.blockerIssueId));
+}
+
+it("allows a verified source-scoped recovery wake on a blocked source issue", async () => {
+const { companyId, agentId, issueId, actionId } = await seedBlockedSourceScopedRecoveryWakeFixture();
+const projectId = randomUUID();
+const projectWorkspaceId = randomUUID();
+const executionWorkspaceId = randomUUID();
+const missingWorkspacePath = `/tmp/paperclip-missing-status-only-recovery-${randomUUID()}`;
+await db.insert(projects).values({
+  id: projectId,
+  companyId,
+  name: "Recovery Project",
+  status: "in_progress",
+});
+await db.insert(projectWorkspaces).values({
+  id: projectWorkspaceId,
+  companyId,
+  projectId,
+  name: "Missing project workspace",
+  sourceType: "local_path",
+  cwd: missingWorkspacePath,
+  isPrimary: true,
+});
+await db.insert(executionWorkspaces).values({
+  id: executionWorkspaceId,
+  companyId,
+  projectId,
+  projectWorkspaceId,
+  sourceIssueId: issueId,
+  mode: "isolated_workspace",
+  strategyType: "git_worktree",
+  name: "missing-worktree",
+  status: "active",
+  cwd: missingWorkspacePath,
+  providerType: "git_worktree",
+  providerRef: missingWorkspacePath,
+  branchName: "fix/missing-worktree",
+});
+await db
+  .update(issues)
+  .set({
+    projectId,
+    projectWorkspaceId,
+    executionWorkspaceId,
+    executionWorkspacePreference: "reuse_existing",
+  })
+  .where(eq(issues.id, issueId));
+const heartbeat = heartbeatService(db);
+
+  const run = await heartbeat.wakeup(agentId, {
+    source: "assignment",
+    triggerDetail: "system",
+    reason: "source_scoped_recovery_action",
+    payload: {
+      issueId,
+      taskId: issueId,
+      sourceIssueId: issueId,
+      recoveryActionId: actionId,
+      wakeReason: "source_scoped_recovery_action",
+      source: "issue_recovery_action",
+      modelProfile: "cheap",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: false,
+      resumeRequiresNormalModel: true,
+    },
+    contextSnapshot: {
+      issueId,
+      taskId: issueId,
+      sourceIssueId: issueId,
+      recoveryActionId: actionId,
+      wakeReason: "source_scoped_recovery_action",
+      source: "issue_recovery_action",
+      modelProfile: "cheap",
+      allowDeliverableWork: false,
+      allowDocumentUpdates: false,
+      resumeRequiresNormalModel: true,
+    },
+  });
+
+expect(run?.contextSnapshot).toMatchObject({
+issueId,
+sourceIssueId: issueId,
+recoveryActionId: actionId,
+allowDeliverableWork: false,
+allowDocumentUpdates: false,
+resumeRequiresNormalModel: true,
+});
+await waitForHeartbeatIdle(db);
+const finishedRun = await db
+  .select()
+  .from(heartbeatRuns)
+  .where(eq(heartbeatRuns.id, run!.id))
+  .then((rows) => rows[0] ?? null);
+expect(finishedRun?.status).toBe("succeeded");
+    const adapterInput = mockAdapterExecute.mock.calls[0]?.[0] as
+      | { context?: { paperclipWorkspace?: { cwd?: string; source?: string } } }
+      | undefined;
+    expect(adapterInput?.context?.paperclipWorkspace).toEqual(
+      expect.objectContaining({
+        cwd: expect.stringContaining(agentId),
+        source: "agent_home",
+      }),
+    );
+  });
+
+it("keeps ordinary blocked issue wakes blocked without an active recovery action", async () => {
+  const { agentId, issueId, actionId } = await seedBlockedSourceScopedRecoveryWakeFixture({
+    actionStatus: "resolved",
+  });
+  const heartbeat = heartbeatService(db);
+
+  const run = await heartbeat.wakeup(agentId, {
+    source: "assignment",
+    triggerDetail: "system",
+    reason: "source_scoped_recovery_action",
+    payload: {
+      issueId,
+      sourceIssueId: issueId,
+      recoveryActionId: actionId,
+      wakeReason: "source_scoped_recovery_action",
+    },
+    contextSnapshot: {
+      issueId,
+      sourceIssueId: issueId,
+      recoveryActionId: actionId,
+      wakeReason: "source_scoped_recovery_action",
+    },
+  });
+
+  expect(run).toBeNull();
+  const skipped = await db
+    .select()
+    .from(agentWakeupRequests)
+    .where(eq(agentWakeupRequests.agentId, agentId))
+    .then((rows) => rows.at(-1) ?? null);
+  expect(skipped).toMatchObject({
+    status: "skipped",
+    reason: "issue_status_blocked",
+  });
+});
+
+it("does not bypass blocked status for mismatched source-scoped recovery context", async () => {
+  const wrongOwnerAgentId = randomUUID();
+  const wrongSourceIssueId = randomUUID();
+  const fixtures = await seedBlockedSourceScopedRecoveryWakeFixture({
+    actionOwnerAgentId: wrongOwnerAgentId,
+    actionSourceIssueId: wrongSourceIssueId,
+  });
+  const heartbeat = heartbeatService(db);
+
+  for (const contextPatch of [
+    { recoveryActionId: randomUUID(), sourceIssueId: fixtures.issueId },
+    { recoveryActionId: fixtures.actionId, sourceIssueId: wrongSourceIssueId },
+    { recoveryActionId: fixtures.actionId, sourceIssueId: fixtures.issueId },
+  ]) {
+    const run = await heartbeat.wakeup(fixtures.agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "source_scoped_recovery_action",
+      payload: {
+        issueId: fixtures.issueId,
+        wakeReason: "source_scoped_recovery_action",
+        ...contextPatch,
+      },
+      contextSnapshot: {
+        issueId: fixtures.issueId,
+        wakeReason: "source_scoped_recovery_action",
+        ...contextPatch,
+      },
+      idempotencyKey: `test-mismatched-recovery:${contextPatch.recoveryActionId}:${contextPatch.sourceIssueId}`,
+    });
+    expect(run).toBeNull();
   }
 
-  async function seedQueuedIssueRunFixture() {
+  const skipped = await db
+    .select()
+    .from(agentWakeupRequests)
+    .where(eq(agentWakeupRequests.agentId, fixtures.agentId));
+  expect(skipped).toHaveLength(3);
+  expect(skipped.every((wakeup) => wakeup.status === "skipped" && wakeup.reason === "issue_status_blocked")).toBe(true);
+});
+
+it("requeues one stale source-scoped recovery action wake", async () => {
+  const staleAt = new Date("2026-03-19T00:00:00.000Z");
+  const now = new Date("2026-03-19T00:20:00.000Z");
+  const { agentId, issueId, actionId } = await seedBlockedSourceScopedRecoveryWakeFixture({
+    attemptCount: 1,
+    maxAttempts: 3,
+    lastAttemptAt: staleAt,
+  });
+  const heartbeat = heartbeatService(db);
+
+  const result = await heartbeat.reconcileSourceScopedRecoveryActions({
+    now,
+    staleAfterMs: 60_000,
+  });
+
+  expect(result).toMatchObject({ checked: 1, enqueued: 1, skipped: 0 });
+  const wakeup = await db
+    .select()
+    .from(agentWakeupRequests)
+    .where(eq(agentWakeupRequests.agentId, agentId))
+    .then((rows) => rows.find((row) => row.reason === "source_scoped_recovery_action") ?? null);
+  expect(wakeup?.idempotencyKey).toBe(`source-scoped-recovery-action:${actionId}:attempt:2`);
+  expect(wakeup?.payload).toMatchObject({
+    issueId,
+    sourceIssueId: issueId,
+    recoveryActionId: actionId,
+    allowDeliverableWork: false,
+    allowDocumentUpdates: false,
+    resumeRequiresNormalModel: true,
+  });
+  const action = await db
+    .select()
+    .from(issueRecoveryActions)
+    .where(eq(issueRecoveryActions.id, actionId))
+    .then((rows) => rows[0] ?? null);
+  expect(action?.attemptCount).toBe(2);
+  expect(action?.lastAttemptAt?.toISOString()).toBe(now.toISOString());
+  await waitForHeartbeatIdle(db);
+});
+
+it("does not duplicate a fresh source-scoped recovery re-wake", async () => {
+  const staleAt = new Date("2026-03-19T00:00:00.000Z");
+  const now = new Date("2026-03-19T00:20:00.000Z");
+  const { agentId } = await seedBlockedSourceScopedRecoveryWakeFixture({
+    attemptCount: 1,
+    maxAttempts: 3,
+    lastAttemptAt: staleAt,
+  });
+  const heartbeat = heartbeatService(db);
+
+  await heartbeat.reconcileSourceScopedRecoveryActions({ now, staleAfterMs: 60_000 });
+  await waitForHeartbeatIdle(db);
+  const second = await heartbeat.reconcileSourceScopedRecoveryActions({ now, staleAfterMs: 60_000 });
+
+  expect(second.enqueued).toBe(0);
+  const wakeups = await db
+    .select()
+    .from(agentWakeupRequests)
+    .where(eq(agentWakeupRequests.agentId, agentId));
+  expect(wakeups.filter((row) => row.reason === "source_scoped_recovery_action")).toHaveLength(1);
+});
+
+it("does not duplicate a stale source-scoped recovery action when a deferred wake already exists", async () => {
+  const staleAt = new Date("2026-03-19T00:00:00.000Z");
+  const now = new Date("2026-03-19T00:20:00.000Z");
+  const { companyId, agentId, issueId, actionId } = await seedBlockedSourceScopedRecoveryWakeFixture({
+    attemptCount: 1,
+    maxAttempts: 3,
+    lastAttemptAt: staleAt,
+  });
+  await db.insert(agentWakeupRequests).values({
+    companyId,
+    agentId,
+    source: "assignment",
+    triggerDetail: "system",
+    reason: "issue_execution_deferred",
+    status: "deferred_issue_execution",
+    payload: {
+      issueId,
+      sourceIssueId: issueId,
+      recoveryActionId: actionId,
+      wakeReason: "source_scoped_recovery_action",
+    },
+  });
+  const heartbeat = heartbeatService(db);
+
+  const result = await heartbeat.reconcileSourceScopedRecoveryActions({
+    now,
+    staleAfterMs: 60_000,
+  });
+
+  expect(result).toMatchObject({ checked: 1, enqueued: 0, skipped: 1 });
+  const wakeups = await db
+    .select()
+    .from(agentWakeupRequests)
+    .where(eq(agentWakeupRequests.agentId, agentId));
+  expect(wakeups).toHaveLength(1);
+  const action = await db
+    .select()
+    .from(issueRecoveryActions)
+    .where(eq(issueRecoveryActions.id, actionId))
+    .then((rows) => rows[0] ?? null);
+  expect(action?.attemptCount).toBe(1);
+  expect(action?.lastAttemptAt?.toISOString()).toBe(staleAt.toISOString());
+});
+
+it("claims a stale source-scoped recovery attempt before enqueueing so concurrent reconciliation does not duplicate it", async () => {
+  const staleAt = new Date("2026-03-19T00:00:00.000Z");
+  const now = new Date("2026-03-19T00:20:00.000Z");
+  const { agentId, actionId } = await seedBlockedSourceScopedRecoveryWakeFixture({
+    attemptCount: 1,
+    maxAttempts: 3,
+    lastAttemptAt: staleAt,
+  });
+  const heartbeatA = heartbeatService(db);
+  const heartbeatB = heartbeatService(db);
+
+  const results = await Promise.all([
+    heartbeatA.reconcileSourceScopedRecoveryActions({ now, staleAfterMs: 60_000 }),
+    heartbeatB.reconcileSourceScopedRecoveryActions({ now, staleAfterMs: 60_000 }),
+  ]);
+
+  expect(results.reduce((sum, result) => sum + result.enqueued, 0)).toBe(1);
+  const wakeups = await db
+    .select()
+    .from(agentWakeupRequests)
+    .where(eq(agentWakeupRequests.agentId, agentId));
+  expect(wakeups.filter((row) => row.reason === "source_scoped_recovery_action")).toHaveLength(1);
+  expect(wakeups[0]?.idempotencyKey).toBe(`source-scoped-recovery-action:${actionId}:attempt:2`);
+  const action = await db
+    .select()
+    .from(issueRecoveryActions)
+    .where(eq(issueRecoveryActions.id, actionId))
+    .then((rows) => rows[0] ?? null);
+  expect(action?.attemptCount).toBe(2);
+  await waitForHeartbeatIdle(db);
+});
+
+it("stamps skipped source-scoped recovery re-wake attempts so stale actions do not churn every tick", async () => {
+  const staleAt = new Date("2026-03-19T00:00:00.000Z");
+  const now = new Date("2026-03-19T00:20:00.000Z");
+  const wrongOwnerAgentId = randomUUID();
+  const { actionId } = await seedBlockedSourceScopedRecoveryWakeFixture({
+    actionOwnerAgentId: wrongOwnerAgentId,
+    attemptCount: 1,
+    maxAttempts: 3,
+    lastAttemptAt: staleAt,
+  });
+  const heartbeat = heartbeatService(db);
+
+  const result = await heartbeat.reconcileSourceScopedRecoveryActions({
+    now,
+    staleAfterMs: 60_000,
+  });
+
+  expect(result).toMatchObject({ checked: 1, enqueued: 0, skipped: 1 });
+  const action = await db
+    .select()
+    .from(issueRecoveryActions)
+    .where(eq(issueRecoveryActions.id, actionId))
+    .then((rows) => rows[0] ?? null);
+  expect(action?.attemptCount).toBe(2);
+  expect(action?.lastAttemptAt?.toISOString()).toBe(now.toISOString());
+  const skippedWake = await db
+    .select()
+    .from(agentWakeupRequests)
+    .where(eq(agentWakeupRequests.agentId, wrongOwnerAgentId))
+    .then((rows) => rows[0] ?? null);
+  expect(skippedWake).toMatchObject({
+    status: "skipped",
+    reason: "issue_assignee_changed",
+  });
+});
+
+it("does not requeue source-scoped recovery when max attempts are reached", async () => {
+  const { agentId } = await seedBlockedSourceScopedRecoveryWakeFixture({
+    attemptCount: 3,
+    maxAttempts: 3,
+    lastAttemptAt: new Date("2026-03-19T00:00:00.000Z"),
+  });
+  const heartbeat = heartbeatService(db);
+
+  const result = await heartbeat.reconcileSourceScopedRecoveryActions({
+    now: new Date("2026-03-19T00:20:00.000Z"),
+    staleAfterMs: 60_000,
+  });
+
+  expect(result).toMatchObject({ checked: 1, enqueued: 0, skipped: 1 });
+  const wakeups = await db
+    .select()
+    .from(agentWakeupRequests)
+    .where(eq(agentWakeupRequests.agentId, agentId));
+  expect(wakeups).toHaveLength(0);
+});
+
+it("uses the default max attempts for source-scoped recovery actions without an explicit cap", async () => {
+  const { agentId } = await seedBlockedSourceScopedRecoveryWakeFixture({
+    attemptCount: 3,
+    maxAttempts: null,
+    lastAttemptAt: new Date("2026-03-19T00:00:00.000Z"),
+  });
+  const heartbeat = heartbeatService(db);
+
+  const result = await heartbeat.reconcileSourceScopedRecoveryActions({
+    now: new Date("2026-03-19T00:20:00.000Z"),
+    staleAfterMs: 60_000,
+  });
+
+  expect(result).toMatchObject({ checked: 1, enqueued: 0, skipped: 1 });
+  const wakeups = await db
+    .select()
+    .from(agentWakeupRequests)
+    .where(eq(agentWakeupRequests.agentId, agentId));
+  expect(wakeups).toHaveLength(0);
+});
+
+async function seedQueuedIssueRunFixture() {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runId = randomUUID();
@@ -1711,11 +2251,90 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       const rows = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
       return rows.find((comment) => comment.body.includes("workspace failed validation")) ?? null;
     });
-    expect(validationComment).toBeTruthy();
+  expect(validationComment).toBeTruthy();
+});
+
+it("repairs a stale project-primary execution workspace before continuation dispatch", async () => {
+  const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+  const projectId = randomUUID();
+  const projectWorkspaceId = randomUUID();
+  const executionWorkspaceId = randomUUID();
+  const projectRepoRoot = await createTempGitRepoForTest();
+  const staleRepoRoot = await createTempGitRepoForTest();
+
+  await db.insert(projects).values({
+    id: projectId,
+    companyId,
+    name: "Paperclip App",
+    status: "in_progress",
+  });
+  await db.insert(projectWorkspaces).values({
+    id: projectWorkspaceId,
+    companyId,
+    projectId,
+    name: "Primary workspace",
+    sourceType: "local_path",
+    cwd: projectRepoRoot,
+    isPrimary: true,
+  });
+  await db.insert(executionWorkspaces).values({
+    id: executionWorkspaceId,
+    companyId,
+    projectId,
+    projectWorkspaceId,
+    sourceIssueId: issueId,
+    mode: "shared_workspace",
+    strategyType: "project_primary",
+    name: "Stale shared workspace",
+    status: "active",
+    cwd: staleRepoRoot,
+    providerType: "local_fs",
+    providerRef: staleRepoRoot,
+  });
+  await db
+    .update(issues)
+    .set({
+      title: "Resume from repaired project workspace",
+      projectId,
+      projectWorkspaceId,
+      executionWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+    })
+    .where(eq(issues.id, issueId));
+
+  const heartbeat = heartbeatService(db);
+  await heartbeat.resumeQueuedRuns();
+  await waitForRunToSettle(heartbeat, runId, 8_000);
+
+  expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+  const adapterInput = mockAdapterExecute.mock.calls[0]?.[0] as
+    | { context?: { paperclipWorkspace?: { cwd?: string; source?: string; workspaceId?: string } } }
+    | undefined;
+  expect(adapterInput?.context?.paperclipWorkspace).toMatchObject({
+    cwd: projectRepoRoot,
+    source: "project_primary",
+    workspaceId: projectWorkspaceId,
   });
 
-  it("blocks before dispatch when a declared secret ref has no binding instead of emitting an opaque setup failure", async () => {
-    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+  const run = await db
+    .select()
+    .from(heartbeatRuns)
+    .where(eq(heartbeatRuns.id, runId))
+    .then((rows) => rows[0] ?? null);
+  expect(run?.status).toBe("succeeded");
+  expect(run?.errorCode).toBeNull();
+
+  const recoveryActions = await db
+    .select()
+    .from(issueRecoveryActions)
+    .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+  expect(recoveryActions).toHaveLength(0);
+  mockAdapterExecute.mockClear();
+});
+
+it("blocks before dispatch when a declared secret ref has no binding instead of emitting an opaque setup failure", async () => {
+  mockAdapterExecute.mockClear();
+  const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
     const svc = secretService(db);
     const secretName = `unbound-runtime-${randomUUID()}`;
     const secret = await svc.create(companyId, {

@@ -976,7 +976,71 @@ describe("issue execution policy routes", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
-  it("routes any QA FAIL back to the engineer in progress", async () => {
+  it("routes QA FAIL back to execution return assignee in progress", async () => {
+    const firstEngineerId = "33333333-3333-4333-8333-333333333333";
+    const returnEngineerId = "66666666-6666-4666-8666-666666666666";
+    const browserQaId = "55555555-5555-4555-8555-555555555555";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: browserQaId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1015",
+      title: "Browser failed",
+      executionPolicy: null,
+      executionState: {
+        status: "pending",
+        currentStageId: "11111111-1111-4111-8111-111111111111",
+        currentStageIndex: 1,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: browserQaId, userId: null },
+        returnAssignee: { type: "agent", agentId: returnEngineerId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch }));
+    mockAgentService.getById.mockImplementation(async (agentId: string) => ({
+      id: agentId,
+      companyId: "company-1",
+      role: agentId === browserQaId ? "qa" : "engineer",
+      name: agentId === browserQaId ? "QA (Browser)" : agentId === returnEngineerId ? "Codex Engineer" : "First Engineer",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    }));
+    mockDbSelectWhere.mockImplementation(() => ({
+      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve([
+          { id: firstEngineerId, companyId: "company-1", role: "engineer", name: "First Engineer", status: "idle" },
+          { id: returnEngineerId, companyId: "company-1", role: "engineer", name: "Codex Engineer", status: "idle" },
+        ])
+          .then(onFulfilled, onRejected),
+    }));
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const res = await request(await createApp({ type: "agent", agentId: browserQaId, companyId: "company-1", runId: "run-1" }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ qaVerdict: "fail" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expect.objectContaining({
+        status: "in_progress",
+        assigneeAgentId: returnEngineerId,
+        assigneeUserId: null,
+      }),
+    );
+  });
+
+  it("routes QA FAIL to a fallback engineer when execution state has no return assignee", async () => {
     const engineerId = "33333333-3333-4333-8333-333333333333";
     const browserQaId = "55555555-5555-4555-8555-555555555555";
     const issue = {

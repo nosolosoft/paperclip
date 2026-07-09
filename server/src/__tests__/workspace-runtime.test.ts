@@ -2388,7 +2388,126 @@ describe("realizeExecutionWorkspace", () => {
     });
   }, 15_000);
 
-  it("rejects an existing persisted git worktree when the checked-out branch changed to a different commit", async () => {
+  it("reuses a persisted git worktree using its owner repo when the current base cwd points elsewhere", async () => {
+    const unrelatedRepoRoot = await createTempRepo();
+    const ownerRepoRoot = await createTempRepo();
+    const initial = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: ownerRepoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-owner",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: {
+        id: "issue-owner",
+        identifier: "PAP-456",
+        title: "Reuse persisted worktree",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    const restored = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: unrelatedRepoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-unrelated",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      workspace: {
+        id: "execution-workspace-owner",
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: initial.cwd,
+        providerRef: initial.cwd,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-owner",
+        repoUrl: null,
+        baseRef: "HEAD",
+        branchName: initial.branchName,
+      },
+      issue: {
+        id: "issue-owner",
+        identifier: "PAP-456",
+        title: "Reuse persisted worktree",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+  expect(restored).toMatchObject({
+    cwd: initial.cwd,
+    created: false,
+    source: "task_session",
+    workspaceId: "workspace-owner",
+  });
+});
+
+it("repairs a stale project-primary shared workspace by returning to the current project cwd", async () => {
+  const staleRepoRoot = await createTempRepo();
+  const currentProjectRepoRoot = await createTempRepo();
+
+  const restored = await ensurePersistedExecutionWorkspaceAvailable({
+    base: {
+      baseCwd: currentProjectRepoRoot,
+      source: "project_primary",
+      projectId: "project-1",
+      workspaceId: "workspace-current",
+      repoUrl: null,
+      repoRef: "HEAD",
+    },
+    workspace: {
+      id: "execution-workspace-stale-project-primary",
+      mode: "shared_workspace",
+      strategyType: "project_primary",
+      cwd: staleRepoRoot,
+      providerRef: staleRepoRoot,
+      projectId: "project-1",
+      projectWorkspaceId: "workspace-stale",
+      repoUrl: null,
+      baseRef: "HEAD",
+      branchName: null,
+    },
+    issue: {
+      id: "issue-project-primary",
+      identifier: "PAP-457",
+      title: "Resume from current project workspace",
+    },
+    agent: {
+      id: "agent-1",
+      name: "Codex Coder",
+      companyId: "company-1",
+    },
+  });
+
+  expect(restored).toMatchObject({
+    cwd: currentProjectRepoRoot,
+    created: false,
+    source: "project_primary",
+    workspaceId: "workspace-current",
+  });
+  expect(restored?.warnings).toEqual([
+    expect.stringContaining("Persisted project workspace"),
+  ]);
+});
+
+it("rejects an existing persisted git worktree when the checked-out branch changed to a different commit", async () => {
     const repoRoot = await createTempRepo();
 
     const initial = await realizeExecutionWorkspace({

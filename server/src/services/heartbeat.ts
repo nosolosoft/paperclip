@@ -45,6 +45,7 @@ import {
   issueApprovals,
   issueComments,
   issuePlanDecompositions,
+  issueRecoveryActions,
   issueRelations,
   issueThreadInteractions,
   issues,
@@ -1998,6 +1999,12 @@ export type ResolvedWorkspaceForRun = {
   workspaceId: string | null;
   repoUrl: string | null;
   repoRef: string | null;
+  workspaceSelection?: {
+    source: PrimaryWorkProductWorkspacePreferenceSource;
+    expectedRepository: string | null;
+    actualRepository: string | null;
+    error: PrimaryWorkProductWorkspacePreferenceError | null;
+  } | null;
   workspaceHints: Array<{
     workspaceId: string;
     cwd: string | null;
@@ -2009,7 +2016,142 @@ export type ResolvedWorkspaceForRun = {
 
 type ProjectWorkspaceCandidate = {
   id: string;
+  repoUrl?: string | null;
 };
+
+type PrimaryWorkProductWorkspacePreferenceSource =
+  | "project_primary"
+  | "issue_workspace"
+  | "wake_context"
+  | "pr_matched_workspace";
+
+type PrimaryWorkProductWorkspacePreferenceError = {
+  code: "primary_work_product_repository_mismatch";
+  message: string;
+};
+
+export function normalizeRepositoryIdentityForWorkspaceSelection(value: string | null | undefined) {
+  const raw = readNonEmptyString(value);
+  if (!raw) return null;
+
+  let normalized = raw.trim();
+  const sshMatch = normalized.match(/^git@([^:]+):(.+)$/i);
+  if (sshMatch) {
+    normalized = `https://${sshMatch[1]}/${sshMatch[2]}`;
+  }
+
+  try {
+    const parsed = new URL(normalized);
+    const host = parsed.hostname.toLowerCase();
+    const pathParts = parsed.pathname
+      .replace(/^\/+|\/+$/g, "")
+      .replace(/\.git$/i, "")
+      .split("/")
+      .filter(Boolean);
+
+    if (host === "github.com" && pathParts.length >= 2) {
+      return `${host}/${pathParts[0]!.toLowerCase()}/${pathParts[1]!.toLowerCase()}`;
+    }
+
+    const repoPath = pathParts.join("/").toLowerCase();
+    return repoPath ? `${host}/${repoPath}` : host;
+  } catch {
+    const slashParts = normalized
+      .replace(/^\/+|\/+$/g, "")
+      .replace(/\.git$/i, "")
+      .split("/")
+      .filter(Boolean);
+    if (slashParts.length === 2 && !normalized.includes("://")) {
+      return `github.com/${slashParts[0]!.toLowerCase()}/${slashParts[1]!.toLowerCase()}`;
+    }
+    return normalized.toLowerCase();
+  }
+}
+
+function readPrimaryWorkProductRepository(metadata: Record<string, unknown> | null | undefined) {
+  const repository = metadata?.repository;
+  if (typeof repository === "string") {
+    return normalizeRepositoryIdentityForWorkspaceSelection(repository);
+  }
+  if (repository && typeof repository === "object") {
+    const repoRecord = repository as Record<string, unknown>;
+    return (
+      normalizeRepositoryIdentityForWorkspaceSelection(readNonEmptyString(repoRecord.url)) ??
+      normalizeRepositoryIdentityForWorkspaceSelection(readNonEmptyString(repoRecord.htmlUrl)) ??
+      normalizeRepositoryIdentityForWorkspaceSelection(readNonEmptyString(repoRecord.cloneUrl)) ??
+      normalizeRepositoryIdentityForWorkspaceSelection(readNonEmptyString(repoRecord.fullName)) ??
+      normalizeRepositoryIdentityForWorkspaceSelection(readNonEmptyString(repoRecord.nameWithOwner))
+    );
+  }
+  return (
+    normalizeRepositoryIdentityForWorkspaceSelection(readNonEmptyString(metadata?.repoUrl)) ??
+    normalizeRepositoryIdentityForWorkspaceSelection(readNonEmptyString(metadata?.repositoryUrl))
+  );
+}
+
+export function resolveProjectWorkspacePreferenceForPrimaryWorkProductRepo(input: {
+  primaryWorkProductMetadata: Record<string, unknown> | null | undefined;
+  projectWorkspaces: Array<ProjectWorkspaceCandidate>;
+  preferredWorkspaceId: string | null | undefined;
+  preferredWorkspaceSource: PrimaryWorkProductWorkspacePreferenceSource;
+}): {
+  preferredWorkspaceId: string | null;
+  source: PrimaryWorkProductWorkspacePreferenceSource;
+  expectedRepository: string | null;
+  actualRepository: string | null;
+  error: PrimaryWorkProductWorkspacePreferenceError | null;
+} {
+  const expectedRepository = readPrimaryWorkProductRepository(input.primaryWorkProductMetadata);
+  const preferredWorkspaceId = readNonEmptyString(input.preferredWorkspaceId);
+  const preferredWorkspace = preferredWorkspaceId
+    ? input.projectWorkspaces.find((workspace) => workspace.id === preferredWorkspaceId) ?? null
+    : null;
+  const preferredRepository = normalizeRepositoryIdentityForWorkspaceSelection(preferredWorkspace?.repoUrl);
+
+  if (!expectedRepository) {
+    return {
+      preferredWorkspaceId,
+      source: input.preferredWorkspaceSource,
+      expectedRepository: null,
+      actualRepository: preferredRepository,
+      error: null,
+    };
+  }
+
+  if (preferredWorkspace && preferredRepository === expectedRepository) {
+    return {
+      preferredWorkspaceId: preferredWorkspace.id,
+      source: input.preferredWorkspaceSource,
+      expectedRepository,
+      actualRepository: preferredRepository,
+      error: null,
+    };
+  }
+
+  const matchingWorkspaces = input.projectWorkspaces.filter(
+    (workspace) => normalizeRepositoryIdentityForWorkspaceSelection(workspace.repoUrl) === expectedRepository,
+  );
+  if (matchingWorkspaces.length === 1) {
+    return {
+      preferredWorkspaceId: matchingWorkspaces[0]!.id,
+      source: "pr_matched_workspace",
+      expectedRepository,
+      actualRepository: normalizeRepositoryIdentityForWorkspaceSelection(matchingWorkspaces[0]!.repoUrl),
+      error: null,
+    };
+  }
+
+  return {
+    preferredWorkspaceId,
+    source: input.preferredWorkspaceSource,
+    expectedRepository,
+    actualRepository: preferredRepository,
+    error: {
+      code: "primary_work_product_repository_mismatch",
+      message: "PR repo does not match issue workspace",
+    },
+  };
+}
 
 export function prioritizeProjectWorkspaceCandidatesForRun<T extends ProjectWorkspaceCandidate>(
   rows: T[],
@@ -2703,6 +2845,9 @@ export function classifyIssueWakeAgent(agent: IssueWakeGuardAgent) {
 // adapter-derived name) so a research agent named e.g. "Claude Researcher" is not
 // pulled into the engineering disposition contract by its adapter label.
 const ISSUE_DISPOSITION_CONTRACT_ROLES = new Set(["engineer", "qa"]);
+const ACTIVE_SOURCE_SCOPED_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const;
+const DEFAULT_SOURCE_SCOPED_RECOVERY_MAX_ATTEMPTS = 3;
+const STALE_SOURCE_SCOPED_RECOVERY_WAKE_MS = 15 * 60 * 1000;
 
 export function agentOwnsIssueDispositionContract(agent: Pick<typeof agents.$inferSelect, "role">) {
   return ISSUE_DISPOSITION_CONTRACT_ROLES.has(lowerText(agent.role));
@@ -2719,8 +2864,16 @@ function issueWakeRequiresWorkspace(input: {
   if (allowsIssueInteractionWake(input.contextSnapshot)) return false;
 
   const wakeReason = readNonEmptyString(input.contextSnapshot?.wakeReason) ?? input.reason;
+  if (wakeReason === "source_scoped_recovery_action") return false;
   if (wakeReason && ISSUE_WORKSPACE_REQUIRED_REASONS.has(wakeReason)) return true;
   return input.source === "assignment" || input.source === "automation";
+}
+
+function isStatusOnlySourceScopedRecoveryWake(contextSnapshot: Record<string, unknown> | null | undefined) {
+  const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
+  if (wakeReason !== "source_scoped_recovery_action") return false;
+  const recoveryIntent = readNonEmptyString(contextSnapshot?.recoveryIntent);
+  return recoveryIntent === "status_only" || contextSnapshot?.allowDeliverableWork === false;
 }
 
 function evaluateIssueWakeEligibility(input: {
@@ -2730,6 +2883,7 @@ function evaluateIssueWakeEligibility(input: {
   triggerDetail: string | null;
   reason: string | null;
   contextSnapshot: Record<string, unknown> | null | undefined;
+  allowBlockedSourceScopedRecoveryWake?: boolean;
 }) {
   const { agent, issue } = input;
   const interactionWake = allowsIssueInteractionWake(input.contextSnapshot);
@@ -2739,7 +2893,13 @@ function evaluateIssueWakeEligibility(input: {
     return { allowed: false as const, reason: `issue_status_${issue.status}` };
   }
 
-  if (issue.status === "blocked") {
+  const blockedSourceScopedRecoveryWake =
+    issue.status === "blocked" && input.allowBlockedSourceScopedRecoveryWake === true;
+  const wakeReason = readNonEmptyString(input.contextSnapshot?.wakeReason) ?? input.reason;
+  const executionReviewParticipantRecoveryWake =
+    issue.status === "in_review" &&
+    wakeReason === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON;
+  if (issue.status === "blocked" && !blockedSourceScopedRecoveryWake) {
     return { allowed: false as const, reason: "issue_status_blocked" };
   }
 
@@ -2748,17 +2908,23 @@ function evaluateIssueWakeEligibility(input: {
   }
 
   const classification = classifyIssueWakeAgent(agent);
-  if (classification.isReviewOnly && issue.status !== "in_review") {
+  if (classification.isReviewOnly && issue.status !== "in_review" && !blockedSourceScopedRecoveryWake) {
     const reason = classification.isBrowserQa
       ? "browser_qa_requires_in_review"
       : classification.isCodeQa
-        ? "code_qa_requires_in_review"
-        : classification.isSpecQa
-          ? "spec_qa_requires_in_review"
-          : "qa_requires_in_review";
+      ? "code_qa_requires_in_review"
+      : classification.isSpecQa
+      ? "spec_qa_requires_in_review"
+      : "qa_requires_in_review";
     return { allowed: false as const, reason };
   }
-  if (classification.isEngineering && !classification.isReviewOnly && !["todo", "backlog", "in_progress"].includes(issue.status)) {
+  if (
+    classification.isEngineering &&
+    !classification.isReviewOnly &&
+    !["todo", "backlog", "in_progress"].includes(issue.status) &&
+    !blockedSourceScopedRecoveryWake &&
+    !executionReviewParticipantRecoveryWake
+  ) {
     return { allowed: false as const, reason: "engineering_requires_todo_or_in_progress" };
   }
 
@@ -5016,6 +5182,8 @@ export interface HeartbeatServiceOptions {
   runtimeEnv?: Record<string, string | undefined>;
 }
 
+type HeartbeatDbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
+
 function isTruthyRuntimeEnvValue(value: string | undefined) {
   return value === "true" || value === "1" || value === "yes" || value === "on";
 }
@@ -5071,6 +5239,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const productivityReviews = productivityReviewService(db, { enqueueWakeup });
   const taskWatchdogs = taskWatchdogService(db, { enqueueWakeup });
   let unsafeTextProjectionPromise: Promise<boolean> | null = null;
+
+  async function isVerifiedBlockedSourceScopedRecoveryWake(input: {
+    issue: Pick<typeof issues.$inferSelect, "id" | "companyId" | "status">;
+    agentId: string;
+    reason: string | null;
+    contextSnapshot: Record<string, unknown> | null | undefined;
+    tx: HeartbeatDbTransaction;
+  }) {
+    if (input.issue.status !== "blocked") return false;
+    const wakeReason = readNonEmptyString(input.contextSnapshot?.wakeReason) ?? input.reason;
+    if (wakeReason !== "source_scoped_recovery_action") return false;
+
+    const recoveryActionId = readNonEmptyString(input.contextSnapshot?.recoveryActionId);
+    const sourceIssueId = readNonEmptyString(input.contextSnapshot?.sourceIssueId);
+    if (!recoveryActionId || sourceIssueId !== input.issue.id) return false;
+
+    const matchingAction = await input.tx
+      .select({ id: issueRecoveryActions.id })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.id, recoveryActionId),
+          eq(issueRecoveryActions.companyId, input.issue.companyId),
+          eq(issueRecoveryActions.sourceIssueId, input.issue.id),
+          eq(issueRecoveryActions.ownerAgentId, input.agentId),
+          inArray(issueRecoveryActions.status, [...ACTIVE_SOURCE_SCOPED_RECOVERY_ACTION_STATUSES]),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+
+    return Boolean(matchingAction);
+  }
 
   async function releaseEnvironmentLeasesForRun(input: {
     runId: string;
@@ -6491,7 +6692,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .then((rows) => rows[0] ?? null)
       : null;
     const issueProjectId = issueProjectRef?.projectId ?? null;
-    const preferredProjectWorkspaceId =
+    let preferredProjectWorkspaceId =
       issueProjectRef?.projectWorkspaceId ?? contextProjectWorkspaceId ?? null;
     const resolvedProjectId = issueProjectId ?? contextProjectId;
     const useProjectWorkspace = opts?.useProjectWorkspace !== false;
@@ -6509,6 +6710,59 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           )
           .orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id))
       : [];
+    let workspaceSelection: ResolvedWorkspaceForRun["workspaceSelection"] = null;
+    if (workspaceProjectId && issueId && classifyIssueWakeAgent(agent).isReviewOnly) {
+      const primaryWorkProduct = await db
+        .select({ metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(
+          and(
+            eq(issueWorkProducts.companyId, agent.companyId),
+            eq(issueWorkProducts.issueId, issueId),
+            eq(issueWorkProducts.isPrimary, true),
+            eq(issueWorkProducts.type, "pull_request"),
+          ),
+        )
+        .orderBy(desc(issueWorkProducts.createdAt), desc(issueWorkProducts.id))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      const preferredWorkspaceSource: PrimaryWorkProductWorkspacePreferenceSource =
+        issueProjectRef?.projectWorkspaceId
+          ? "issue_workspace"
+          : contextProjectWorkspaceId
+            ? "wake_context"
+            : "project_primary";
+      const selection = resolveProjectWorkspacePreferenceForPrimaryWorkProductRepo({
+        primaryWorkProductMetadata: primaryWorkProduct?.metadata ?? null,
+        projectWorkspaces: unorderedProjectWorkspaceRows,
+        preferredWorkspaceId: preferredProjectWorkspaceId,
+        preferredWorkspaceSource,
+      });
+      workspaceSelection = {
+        source: selection.source,
+        expectedRepository: selection.expectedRepository,
+        actualRepository: selection.actualRepository,
+        error: selection.error,
+      };
+      if (selection.error) {
+        throw new WorkspaceValidationFailure(selection.error.message, {
+          workspaceValidation: {
+            reason: selection.error.code,
+            message: selection.error.message,
+            issueId,
+            issueProjectId,
+            issueProjectWorkspaceId: issueProjectRef?.projectWorkspaceId ?? null,
+            contextProjectWorkspaceId,
+            resolvedProjectId,
+            selectedProjectWorkspaceId: preferredProjectWorkspaceId,
+            expectedRepository: selection.expectedRepository,
+            actualRepository: selection.actualRepository,
+            source: selection.source,
+          },
+        });
+      }
+      preferredProjectWorkspaceId = selection.preferredWorkspaceId;
+    }
     const projectWorkspaceRows = prioritizeProjectWorkspaceCandidatesForRun(
       unorderedProjectWorkspaceRows,
       preferredProjectWorkspaceId,
@@ -6561,12 +6815,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             cwd: projectCwd,
             source: "project_primary" as const,
             projectId: resolvedProjectId,
-            workspaceId: workspace.id,
-            repoUrl: workspace.repoUrl,
-            repoRef: workspace.repoRef,
-            workspaceHints,
-            warnings: [preferredWorkspaceWarning, managedWorkspaceWarning].filter(
-              (value): value is string => Boolean(value),
+          workspaceId: workspace.id,
+          repoUrl: workspace.repoUrl,
+          repoRef: workspace.repoRef,
+          workspaceSelection,
+          workspaceHints,
+          warnings: [preferredWorkspaceWarning, managedWorkspaceWarning].filter(
+            (value): value is string => Boolean(value),
             ),
           };
         }
@@ -6603,6 +6858,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         workspaceId: projectWorkspaceRows[0]?.id ?? null,
         repoUrl: projectWorkspaceRows[0]?.repoUrl ?? null,
         repoRef: projectWorkspaceRows[0]?.repoRef ?? null,
+        workspaceSelection,
         workspaceHints,
         warnings,
       };
@@ -6621,6 +6877,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         workspaceId: null,
         repoUrl: null,
         repoRef: null,
+        workspaceSelection,
         workspaceHints,
         warnings: managedWorkspace.warning ? [managedWorkspace.warning] : [],
       };
@@ -6641,6 +6898,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           workspaceId: readNonEmptyString(previousSessionParams?.workspaceId),
           repoUrl: readNonEmptyString(previousSessionParams?.repoUrl),
           repoRef: readNonEmptyString(previousSessionParams?.repoRef),
+          workspaceSelection,
           workspaceHints,
           warnings: [],
         };
@@ -6674,6 +6932,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       workspaceId: null,
       repoUrl: null,
       repoRef: null,
+      workspaceSelection,
       workspaceHints,
       warnings,
     };
@@ -7057,6 +7316,167 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         })
         .where(eq(heartbeatRuns.id, run.id));
     }
+  }
+
+  async function hasActiveSourceScopedRecoveryWake(input: {
+    companyId: string;
+    agentId: string;
+    recoveryActionId: string;
+  }) {
+    const activeWake = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, input.companyId),
+          eq(agentWakeupRequests.agentId, input.agentId),
+          inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
+          sql`${agentWakeupRequests.payload} ->> 'recoveryActionId' = ${input.recoveryActionId}`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (activeWake) return true;
+
+    const activeRun = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.agentId, input.agentId),
+          inArray(heartbeatRuns.status, ["queued", "running"]),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId' = ${input.recoveryActionId}`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+
+    return Boolean(activeRun);
+  }
+
+  async function reconcileSourceScopedRecoveryActions(opts?: {
+    now?: Date;
+    staleAfterMs?: number;
+  }) {
+    const now = opts?.now ?? new Date();
+    const staleAfterMs = opts?.staleAfterMs ?? STALE_SOURCE_SCOPED_RECOVERY_WAKE_MS;
+    const staleBefore = new Date(now.getTime() - staleAfterMs);
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          inArray(issueRecoveryActions.status, [...ACTIVE_SOURCE_SCOPED_RECOVERY_ACTION_STATUSES]),
+          sql`${issueRecoveryActions.ownerAgentId} is not null`,
+          or(isNull(issueRecoveryActions.lastAttemptAt), lte(issueRecoveryActions.lastAttemptAt, staleBefore)),
+        ),
+      )
+      .orderBy(asc(issueRecoveryActions.lastAttemptAt), asc(issueRecoveryActions.createdAt))
+      .limit(100);
+
+    let enqueued = 0;
+    let skipped = 0;
+    for (const action of actions) {
+      const ownerAgentId = action.ownerAgentId;
+      if (!ownerAgentId) {
+        skipped += 1;
+        continue;
+      }
+
+      const maxAttempts = action.maxAttempts ?? DEFAULT_SOURCE_SCOPED_RECOVERY_MAX_ATTEMPTS;
+      if (action.attemptCount >= maxAttempts) {
+        skipped += 1;
+        continue;
+      }
+
+      const sourceIssue = await db
+        .select({
+          id: issues.id,
+          companyId: issues.companyId,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+        })
+        .from(issues)
+        .where(and(eq(issues.id, action.sourceIssueId), eq(issues.companyId, action.companyId)))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (!sourceIssue || sourceIssue.status !== "blocked") {
+        skipped += 1;
+        continue;
+      }
+
+      if (
+        await hasActiveSourceScopedRecoveryWake({
+          companyId: action.companyId,
+          agentId: ownerAgentId,
+          recoveryActionId: action.id,
+        })
+      ) {
+        skipped += 1;
+        continue;
+      }
+
+      const nextAttempt = action.attemptCount + 1;
+      const evidence = parseObject(action.evidence);
+      const strandedRunId = readNonEmptyString(evidence.latestRunId);
+      const claimedAction = await db
+        .update(issueRecoveryActions)
+        .set({
+          attemptCount: nextAttempt,
+          lastAttemptAt: now,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(issueRecoveryActions.id, action.id),
+            eq(issueRecoveryActions.attemptCount, action.attemptCount),
+            inArray(issueRecoveryActions.status, [...ACTIVE_SOURCE_SCOPED_RECOVERY_ACTION_STATUSES]),
+            or(isNull(issueRecoveryActions.lastAttemptAt), lte(issueRecoveryActions.lastAttemptAt, staleBefore)),
+          ),
+        )
+        .returning({ id: issueRecoveryActions.id })
+        .then((rows) => rows[0] ?? null);
+
+      if (!claimedAction) {
+        skipped += 1;
+        continue;
+      }
+
+      const recoveryContextSnapshot = withRecoveryModelProfileHint(
+        {
+          issueId: action.sourceIssueId,
+          taskId: action.sourceIssueId,
+          wakeReason: "source_scoped_recovery_action",
+          source: "issue_recovery_action",
+          sourceIssueId: action.sourceIssueId,
+          recoveryActionId: action.id,
+          recoveryAttempt: nextAttempt,
+          ...(strandedRunId ? { strandedRunId, retryOfRunId: strandedRunId } : {}),
+        },
+        "status_only",
+      );
+
+      const run = await enqueueWakeup(ownerAgentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "source_scoped_recovery_action",
+        payload: recoveryContextSnapshot,
+        contextSnapshot: recoveryContextSnapshot,
+        idempotencyKey: `source-scoped-recovery-action:${action.id}:attempt:${nextAttempt}`,
+        requestedByActorType: "system",
+        requestedByActorId: "heartbeat",
+      });
+
+      if (!run) {
+        skipped += 1;
+        continue;
+      }
+
+      enqueued += 1;
+    }
+
+    return { checked: actions.length, enqueued, skipped };
   }
 
   function issueUiLink(issue: Pick<typeof issues.$inferSelect, "id" | "identifier">) {
@@ -10609,8 +11029,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueExecutionWorkspacePreference: issueRef?.executionWorkspacePreference ?? null,
       existingExecutionWorkspaceStatus: existingExecutionWorkspace?.status ?? null,
     });
-    const requestedShouldReuseExisting = workspaceReuseRequest.requestedShouldReuseExisting;
-    const reusableExistingExecutionWorkspace = workspaceReuseRequest.existingExecutionWorkspaceAvailable
+  const statusOnlySourceScopedRecoveryWake = isStatusOnlySourceScopedRecoveryWake(context);
+  const requestedShouldReuseExisting =
+    !statusOnlySourceScopedRecoveryWake && workspaceReuseRequest.requestedShouldReuseExisting;
+  const reusableExistingExecutionWorkspace =
+    !statusOnlySourceScopedRecoveryWake && workspaceReuseRequest.existingExecutionWorkspaceAvailable
       ? existingExecutionWorkspace
       : null;
     const requestedReusableExecutionWorkspaceConfig = reusableExistingExecutionWorkspace?.config ?? null;
@@ -10621,8 +11044,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       instanceDefaultEnvironmentId: resolvedInstanceSettings.defaultEnvironmentId ?? null,
       localDefaultEnvironmentId: localEnvironment.id,
     });
-    const effectiveExecutionWorkspaceMode: ReturnType<typeof resolveExecutionWorkspaceMode> =
-      requestedExecutionWorkspaceMode;
+  const effectiveExecutionWorkspaceMode: ReturnType<typeof resolveExecutionWorkspaceMode> =
+    statusOnlySourceScopedRecoveryWake ? "agent_default" : requestedExecutionWorkspaceMode;
     const executionPolicy = { executionMode: (await instanceSettings.getGeneral()).executionMode };
     let selectedEnvironmentId = environmentResolution.environmentId;
     if (isExecutionForcedToKubernetes(executionPolicy)) {
@@ -10693,7 +11116,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       agentConfig: config,
       projectPolicy: projectExecutionWorkspacePolicy,
       issueSettings: issueExecutionWorkspaceSettings,
-      mode: requestedExecutionWorkspaceMode,
+    mode: effectiveExecutionWorkspaceMode,
       legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
     });
     let adapterModelProfiles: AdapterModelProfileDefinition[] = [];
@@ -10906,7 +11329,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agent,
           context,
           previousSessionParams,
-          { useProjectWorkspace: requestedExecutionWorkspaceMode !== "agent_default" },
+          { useProjectWorkspace: effectiveExecutionWorkspaceMode !== "agent_default" },
         ),
     });
     const hostExecutionWorkspaceConfig = stripHostWorkspaceProvisionForLowTrustSandbox({
@@ -11357,6 +11780,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       })(),
     };
     context.paperclipWorkspaces = resolvedWorkspace.workspaceHints;
+    context.paperclipWorkspaceSelection = {
+      workspaceId: executionWorkspace.workspaceId,
+      projectId: executionWorkspace.projectId,
+      source: resolvedWorkspace.workspaceSelection?.source ?? "project_primary",
+      expectedRepository: resolvedWorkspace.workspaceSelection?.expectedRepository ?? null,
+      actualRepository:
+        resolvedWorkspace.workspaceSelection?.actualRepository ??
+        normalizeRepositoryIdentityForWorkspaceSelection(executionWorkspace.repoUrl),
+      repoUrl: executionWorkspace.repoUrl,
+    };
     const runtimeServiceIntents = (() => {
       const runtimeConfig = parseObject(hostExecutionWorkspaceConfig.workspaceRuntime);
       return Array.isArray(runtimeConfig.services)
@@ -11561,14 +11994,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
 
       const currentRun = run;
-      await appendRunEvent(currentRun, seq++, {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "info",
-        message: "run started",
-      });
+    await appendRunEvent(currentRun, seq++, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message: "run started",
+    });
+    await appendRunEvent(currentRun, seq++, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message: "workspace selected",
+      payload: parseObject(context.paperclipWorkspaceSelection),
+    });
 
-      handle = await runLogStore.begin({
+    handle = await runLogStore.begin({
         companyId: run.companyId,
         agentId: run.agentId,
         runId,
@@ -11661,24 +12101,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const logEntry = formatRuntimeWorkspaceWarningLog(warning);
         await onLog(logEntry.stream, logEntry.chunk);
       }
-      await assertGitSensitiveAdapterWorkspaceValid({
-        adapterType: agent.adapterType,
-        agentId: agent.id,
-        issue: issueRef
-          ? {
-              id: issueRef.id,
-              identifier: issueRef.identifier,
-              projectId: issueRef.projectId,
-              projectWorkspaceId: issueRef.projectWorkspaceId,
-            }
-          : null,
-        resolvedWorkspace,
-        executionWorkspace,
-        persistedExecutionWorkspace,
-        executionTarget,
-        environmentDriver: selectedEnvironment.driver,
-        leaseMetadata: activeEnvironmentLease.lease.metadata,
-      });
+      if (!statusOnlySourceScopedRecoveryWake) {
+        await assertGitSensitiveAdapterWorkspaceValid({
+          adapterType: agent.adapterType,
+          agentId: agent.id,
+          issue: issueRef
+            ? {
+                id: issueRef.id,
+                identifier: issueRef.identifier,
+                projectId: issueRef.projectId,
+                projectWorkspaceId: issueRef.projectWorkspaceId,
+              }
+            : null,
+          resolvedWorkspace,
+          executionWorkspace,
+          persistedExecutionWorkspace,
+          executionTarget,
+          environmentDriver: selectedEnvironment.driver,
+          leaseMetadata: activeEnvironmentLease.lease.metadata,
+        });
+      }
       await assertPushCapabilityCheckoutValid({
         enabled: pushCapabilityPreflightRequired && executionTarget?.kind === "local",
         issue: issueRef
@@ -14073,6 +14515,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
+      const allowBlockedSourceScopedRecoveryWake = await isVerifiedBlockedSourceScopedRecoveryWake({
+        issue,
+        agentId,
+        reason,
+        contextSnapshot: enrichedContextSnapshot,
+        tx,
+      });
       const eligibility = evaluateIssueWakeEligibility({
         agent,
         issue,
@@ -14080,6 +14529,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         triggerDetail,
         reason,
         contextSnapshot: enrichedContextSnapshot,
+        allowBlockedSourceScopedRecoveryWake,
       });
       if (!eligibility.allowed) {
         await tx.insert(agentWakeupRequests).values({
@@ -15037,9 +15487,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return scheduleBoundedRetryForRun(run, agent, opts);
     },
 
-    reconcileStrandedAssignedIssues,
+      reconcileStrandedAssignedIssues,
+      reconcileSourceScopedRecoveryActions,
 
-    sweepStaleIssueLocks,
+      sweepStaleIssueLocks,
 
     buildIssueGraphLivenessAutoRecoveryPreview,
 
@@ -15101,15 +15552,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         else skipped += 1;
       }
 
-      const issueMonitors = await tickDueIssueMonitors(now);
+        const sourceScopedRecovery = await reconcileSourceScopedRecoveryActions({ now });
+        const issueMonitors = await tickDueIssueMonitors(now);
 
-      return {
-        checked: checked + issueMonitors.checked,
-        enqueued: enqueued + issueMonitors.triggered,
-        skipped: skipped + issueMonitors.skipped,
-        staleIssueWakeupsCancelled,
-      };
-    },
+        return {
+          checked: checked + issueMonitors.checked,
+          enqueued: enqueued + sourceScopedRecovery.enqueued + issueMonitors.triggered,
+          skipped: skipped + sourceScopedRecovery.skipped + issueMonitors.skipped,
+          staleIssueWakeupsCancelled,
+        };
+      },
 
     cancelRun: (runId: string, reason?: string, options?: CancelRunOptions) => cancelRunInternal(runId, reason, options),
 

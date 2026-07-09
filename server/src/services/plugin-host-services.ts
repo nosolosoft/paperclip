@@ -76,6 +76,7 @@ import { accessService } from "./access.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { sanitizeRecord } from "../redaction.js";
 import { unprocessable } from "../errors.js";
+import { parseIssueExecutionState } from "./issue-execution-policy.js";
 
 
 function normalizeAgentRoutingText(value: string | null | undefined) {
@@ -141,6 +142,17 @@ function selectBrowserQaRoutingAgent(
 
 function agentLooksLikeEngineerRouting(agent: { role?: string | null; status?: string | null }) {
   return agent.role === "engineer" && !["terminated", "pending_approval"].includes(agent.status ?? "");
+}
+
+function selectQaFailureReturnEngineerRoutingAgent(
+  agents: Array<{ id: string; role?: string | null; status?: string | null }>,
+  executionState: unknown,
+  fallbackExecutionState?: unknown,
+) {
+  const state = parseIssueExecutionState(executionState) ?? parseIssueExecutionState(fallbackExecutionState);
+  const returnAgentId = state?.returnAssignee?.type === "agent" ? state.returnAssignee.agentId : null;
+  if (!returnAgentId) return null;
+  return agents.find((agent) => agent.id === returnAgentId && agentLooksLikeEngineerRouting(agent)) ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1668,14 +1680,19 @@ export function buildHostServices(
         const nextStatus = typeof patch.status === "string" ? patch.status : existing.status;
         const nextAssigneeAgentId = patch.assigneeAgentId === undefined ? existing.assigneeAgentId : patch.assigneeAgentId;
         const nextAssigneeUserId = patch.assigneeUserId === undefined ? existing.assigneeUserId : patch.assigneeUserId;
-        if (actorAgentId) {
-          const sourceAgent = await agents.getById(actorAgentId);
-          if (sourceAgent?.role === "qa" && (qaVerdict === "fail" || nextStatus === "blocked" || nextStatus === "in_progress")) {
-            const candidateAgents = await agents.list(companyId);
-            const engineer = candidateAgents.find(agentLooksLikeEngineerRouting);
-            if (engineer) {
-              patch.status = "in_progress";
-              patch.assigneeAgentId = engineer.id;
+      if (actorAgentId) {
+        const sourceAgent = await agents.getById(actorAgentId);
+        if (sourceAgent?.role === "qa" && (qaVerdict === "fail" || nextStatus === "blocked" || nextStatus === "in_progress")) {
+          const candidateAgents = await agents.list(companyId);
+          const engineer =
+            selectQaFailureReturnEngineerRoutingAgent(
+              candidateAgents,
+              patch.executionState === undefined ? existing.executionState : patch.executionState,
+              existing.executionState,
+            ) ?? candidateAgents.find(agentLooksLikeEngineerRouting);
+          if (engineer) {
+            patch.status = "in_progress";
+            patch.assigneeAgentId = engineer.id;
               patch.assigneeUserId = null;
             }
           } else if (sourceAgent?.role === "qa" && qaVerdict === "pass") {

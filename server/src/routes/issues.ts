@@ -2706,8 +2706,8 @@ export function issueRoutes(
     return assignable.find(agentLooksLikeBrowserQa) ?? null;
   }
 
-  async function resolveDefaultEngineerAgent(companyId: string) {
-    const candidates = await db
+async function resolveDefaultEngineerAgent(companyId: string) {
+  const candidates = await db
       .select({
         id: agentsTable.id,
         name: agentsTable.name,
@@ -2717,20 +2717,37 @@ export function issueRoutes(
       .from(agentsTable)
       .where(and(eq(agentsTable.companyId, companyId), eq(agentsTable.role, "engineer")));
 
-    return candidates.find((agent) => !["terminated", "pending_approval"].includes(agent.status)) ?? null;
-  }
+  return candidates.find((agent) => !["terminated", "pending_approval"].includes(agent.status)) ?? null;
+}
 
-  async function applyDefaultQaDispositionRouting(input: {
-    existing: {
-      id: string;
-      companyId: string;
-      status: string;
-      assigneeAgentId?: string | null;
-      assigneeUserId?: string | null;
-    };
-    updateFields: Record<string, unknown>;
-    actorAgentId?: string | null;
-    qaVerdict?: "pass" | "fail";
+async function resolveQaFailureReturnEngineerAgent(input: {
+  companyId: string;
+  executionState?: unknown;
+  fallbackExecutionState?: unknown;
+}) {
+  const state = parseIssueExecutionState(input.executionState) ?? parseIssueExecutionState(input.fallbackExecutionState);
+  const returnAgentId = state?.returnAssignee?.type === "agent" ? state.returnAssignee.agentId : null;
+  if (!returnAgentId) return null;
+
+  const agent = await agentsSvc.getById(returnAgentId);
+  if (agent?.companyId !== input.companyId) return null;
+  if (agent.role !== "engineer") return null;
+  if (["terminated", "pending_approval"].includes(agent.status)) return null;
+  return agent;
+}
+
+async function applyDefaultQaDispositionRouting(input: {
+  existing: {
+    id: string;
+    companyId: string;
+    status: string;
+    assigneeAgentId?: string | null;
+    assigneeUserId?: string | null;
+    executionState?: unknown;
+  };
+  updateFields: Record<string, unknown>;
+  actorAgentId?: string | null;
+  qaVerdict?: "pass" | "fail";
     qaBrowserScope?: "required" | "not_applicable";
   }) {
     if (!input.actorAgentId) return;
@@ -2741,11 +2758,18 @@ export function issueRoutes(
       ? input.updateFields.status
       : input.existing.status;
 
-    if (input.qaVerdict === "fail" || nextStatus === "blocked" || nextStatus === "in_progress") {
-      const engineer = await resolveDefaultEngineerAgent(input.existing.companyId);
-      if (!engineer) return;
-      input.updateFields.status = "in_progress";
-      input.updateFields.assigneeAgentId = engineer.id;
+  if (input.qaVerdict === "fail" || nextStatus === "blocked" || nextStatus === "in_progress") {
+    const engineer =
+      await resolveQaFailureReturnEngineerAgent({
+        companyId: input.existing.companyId,
+        executionState: input.updateFields.executionState === undefined
+          ? input.existing.executionState
+          : input.updateFields.executionState,
+        fallbackExecutionState: input.existing.executionState,
+      }) ?? await resolveDefaultEngineerAgent(input.existing.companyId);
+    if (!engineer) return;
+    input.updateFields.status = "in_progress";
+    input.updateFields.assigneeAgentId = engineer.id;
       input.updateFields.assigneeUserId = null;
       return;
     }

@@ -113,6 +113,10 @@ async function runPnpm(cwd: string, args: string[]) {
 async function createTempRepo(defaultBranch = "main") {
   const repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-repo-"));
   await runGit(repoRoot, ["init"]);
+  // Disable any locally-configured hooks (e.g. a developer's global pre-commit scanner).
+  // Linked worktrees created from this repo share its git-dir, so a hook that mishandles
+  // per-worktree indexes can silently drop staged files from commits made inside them.
+  await runGit(repoRoot, ["config", "core.hooksPath", "/dev/null"]);
   await runGit(repoRoot, ["config", "user.email", "paperclip@example.com"]);
   await runGit(repoRoot, ["config", "user.name", "Paperclip Test"]);
   await fs.writeFile(path.join(repoRoot, "README.md"), "hello\n", "utf8");
@@ -705,11 +709,56 @@ describe("realizeExecutionWorkspace", () => {
     ]);
   });
 
-  it("rejects reusing an empty directory that only looks like a worktree because it sits inside the repo", async () => {
+  it("self-heals a broken directory at the managed worktree path instead of dead-ending", async () => {
     const repoRoot = await createTempRepo();
     const branchName = "PAP-447-add-worktree-support";
+    // A directory that occupies the managed worktree path but is not a real git worktree
+    // (here it even carries leftover files, as a partial checkout would). This is the recurring
+    // blocked -> retry -> blocked trap: every retry re-enters this dead path.
     const poisonedPath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
     await fs.mkdir(poisonedPath, { recursive: true });
+    await fs.writeFile(path.join(poisonedPath, "leftover.txt"), "orphaned partial checkout\n", "utf8");
+
+    const realized = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-447",
+        title: "Add Worktree Support",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    // The broken directory was removed and a clean worktree recreated in its place.
+    expect(realized.created).toBe(true);
+    expect(path.resolve(realized.cwd)).toBe(path.resolve(poisonedPath));
+    expect(await readGit(realized.cwd, ["rev-parse", "--is-inside-work-tree"])).toBe("true");
+  });
+
+  it("does not remove a broken worktree directory that sits outside the repo subtree", async () => {
+    const repoRoot = await createTempRepo();
+    const outsideParent = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-outside-"));
+    const branchName = "PAP-448-external-worktree";
+    const outsidePath = path.join(outsideParent, branchName);
+    await fs.mkdir(outsidePath, { recursive: true });
+    await fs.writeFile(path.join(outsidePath, "keep.txt"), "must not be deleted\n", "utf8");
 
     await expect(
       realizeExecutionWorkspace({
@@ -725,12 +774,13 @@ describe("realizeExecutionWorkspace", () => {
           workspaceStrategy: {
             type: "git_worktree",
             branchTemplate: "{{issue.identifier}}-{{slug}}",
+            worktreeParentDir: outsideParent,
           },
         },
         issue: {
-          id: "issue-1",
-          identifier: "PAP-447",
-          title: "Add Worktree Support",
+          id: "issue-2",
+          identifier: "PAP-448",
+          title: "External Worktree",
         },
         agent: {
           id: "agent-1",
@@ -738,7 +788,12 @@ describe("realizeExecutionWorkspace", () => {
           companyId: "company-1",
         },
       }),
-    ).rejects.toThrow(/not a reusable git worktree \(path is not registered in `git worktree list`\)\./);
+    ).rejects.toThrow(/not a reusable git worktree/);
+
+    // The safety boundary held: the out-of-repo directory and its contents are untouched.
+    await expect(fs.readFile(path.join(outsidePath, "keep.txt"), "utf8")).resolves.toBe(
+      "must not be deleted\n",
+    );
   });
 
   it("reuses the current linked worktree instead of nesting another worktree inside it", async () => {
@@ -861,6 +916,156 @@ describe("realizeExecutionWorkspace", () => {
         }),
       ]),
     );
+  });
+
+  it("self-heals a linked worktree that is incoherent and not safe-repairable (dirty on a diverged branch)", async () => {
+    const repoRoot = await createTempRepo();
+
+    const initial = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-447",
+        title: "Add Worktree Support",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    // Make the worktree incoherent AND not safe-repairable: move it off the expected branch and
+    // leave uncommitted work (dirty). This mirrors the mid-rebase trap where safeRepair is
+    // ineligible ("worktree is not clean") and ensureGitWorktreeBranchCoherent throws.
+    await runGit(initial.cwd, ["checkout", "-b", "unexpected-branch"]);
+    await fs.writeFile(path.join(initial.cwd, "wip.txt"), "uncommitted work-in-progress\n", "utf8");
+
+    const healed = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-447",
+        title: "Add Worktree Support",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    // The broken worktree was removed and recreated clean on the expected branch, breaking the loop.
+    expect(healed.created).toBe(true);
+    expect(path.resolve(healed.cwd)).toBe(path.resolve(initial.cwd));
+    await expect(readGit(healed.cwd, ["branch", "--show-current"])).resolves.toBe(
+      "PAP-447-add-worktree-support",
+    );
+    // The uncommitted work is intentionally gone (accepted trade-off to break the loop).
+    await expect(fs.readFile(path.join(healed.cwd, "wip.txt"), "utf8")).rejects.toThrow();
+  });
+
+  it("rethrows a transient checkout failure instead of destroying a clean, coherent worktree", async () => {
+    const repoRoot = await createTempRepo();
+
+    const initial = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-447",
+        title: "Add Worktree Support",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    // Drift onto a sibling branch pointing at the same commit: clean, same HEAD, registered
+    // branch matches HEAD, so safeRepair.eligible would be true. Then jam the worktree's own
+    // index with a planted index.lock so the safe checkout itself fails transiently.
+    await runGit(initial.cwd, ["checkout", "-b", "unexpected-branch"]);
+    const lockPath = await readGit(initial.cwd, ["rev-parse", "--git-path", "index.lock"]);
+    const resolvedLockPath = path.resolve(initial.cwd, lockPath);
+    await fs.writeFile(resolvedLockPath, "", "utf8");
+
+    try {
+      await expect(
+        realizeExecutionWorkspace({
+          base: {
+            baseCwd: repoRoot,
+            source: "project_primary",
+            projectId: "project-1",
+            workspaceId: "workspace-1",
+            repoUrl: null,
+            repoRef: "HEAD",
+          },
+          config: {
+            workspaceStrategy: {
+              type: "git_worktree",
+              branchTemplate: "{{issue.identifier}}-{{slug}}",
+            },
+          },
+          issue: {
+            id: "issue-1",
+            identifier: "PAP-447",
+            title: "Add Worktree Support",
+          },
+          agent: {
+            id: "agent-1",
+            name: "Codex Coder",
+            companyId: "company-1",
+          },
+        }),
+      ).rejects.toThrow(/safe checkout failed/);
+
+      // The worktree was NOT destroyed: it is still present, still on the drifted branch, still
+      // holding the same HEAD. A transient checkout blip on an eligible/coherent worktree must not
+      // discard a perfectly good worktree.
+      await expect(readGit(initial.cwd, ["branch", "--show-current"])).resolves.toBe("unexpected-branch");
+    } finally {
+      await fs.rm(resolvedLockPath, { force: true });
+    }
   });
 
   it("reuses an already checked out branch from git worktree metadata even when the target path differs", async () => {

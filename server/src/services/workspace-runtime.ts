@@ -1602,6 +1602,47 @@ async function resolveGitRepoRootForWorkspaceCleanup(
   return path.dirname(resolvedGitDir);
 }
 
+// Remove a directory that occupies a managed worktree path but is not a reusable git worktree
+// (missing .git, orphaned from the parent repo). Such a directory traps every retry in the
+// blocked -> retry -> blocked loop and holds no git-recoverable work. Returns true once the path
+// is clear so the caller can recreate. Refuses to touch anything outside the repo subtree, so a
+// bad/DB-sourced path can never escalate into a destructive removal.
+async function removeBrokenManagedWorktree(input: {
+  repoRoot: string;
+  worktreePath: string;
+  recorder?: WorkspaceOperationRecorder | null;
+}): Promise<boolean> {
+  const resolvedRepoRoot = path.resolve(input.repoRoot);
+  const resolvedWorktreePath = path.resolve(input.worktreePath);
+  if (
+    resolvedWorktreePath === resolvedRepoRoot ||
+    !resolvedWorktreePath.startsWith(`${resolvedRepoRoot}${path.sep}`)
+  ) {
+    return false;
+  }
+  try {
+    await recordGitOperation(input.recorder, {
+      phase: "worktree_cleanup",
+      args: ["worktree", "remove", "--force", resolvedWorktreePath],
+      cwd: resolvedRepoRoot,
+      metadata: {
+        repoRoot: resolvedRepoRoot,
+        worktreePath: resolvedWorktreePath,
+        cleanupAction: "worktree_remove_broken",
+      },
+      successMessage: `Removed broken git worktree ${resolvedWorktreePath}\n`,
+      failureLabel: `git worktree remove ${resolvedWorktreePath}`,
+    });
+  } catch {
+    // Not a registered worktree (or git refused): prune stale admin refs and drop the directory
+    // directly so recreate can proceed.
+    await runGit(["worktree", "prune"], resolvedRepoRoot).catch(() => {});
+    await fs.rm(resolvedWorktreePath, { recursive: true, force: true }).catch(() => {});
+  }
+  await runGit(["worktree", "prune"], resolvedRepoRoot).catch(() => {});
+  return !(await directoryExists(resolvedWorktreePath));
+}
+
 export async function realizeExecutionWorkspace(input: {
   base: ExecutionWorkspaceInput;
   config: Record<string, unknown>;
@@ -1725,15 +1766,41 @@ export async function realizeExecutionWorkspace(input: {
       expectedBranchName: branchName,
     }).catch(() => null);
     if (validation && !validation.valid && validation.reasonCode === "branch_mismatch") {
-      await ensureGitWorktreeBranchCoherent({
-        repoRoot,
-        worktreePath: reusablePath,
-        expectedBranchName: branchName,
-        actualBranchName: validation.actualBranchName ?? null,
-        sourceIssue: input.issue,
-        executionWorkspaceId: null,
-        recorder: input.recorder ?? null,
-      });
+      try {
+        await ensureGitWorktreeBranchCoherent({
+          repoRoot,
+          worktreePath: reusablePath,
+          expectedBranchName: branchName,
+          actualBranchName: validation.actualBranchName ?? null,
+          sourceIssue: input.issue,
+          executionWorkspaceId: null,
+          recorder: input.recorder ?? null,
+        });
+      } catch (error) {
+        // A managed worktree that is diverged / mid-rebase / dirty on the wrong branch is not
+        // safe-repairable, so ensureGitWorktreeBranchCoherent throws instead of returning. Surface
+        // the original invalid validation so the caller removes + recreates it rather than
+        // dead-ending the run in a blocked -> retry -> blocked loop. Uncommitted / in-progress
+        // state in the worktree is intentionally discarded; the branch itself survives and is
+        // re-attached on recreate.
+        //
+        // Only do this when the repair was genuinely ineligible (diverged/dirty). If eligible was
+        // true, the throw came from a transient failure during the safe checkout itself (e.g. a
+        // git index.lock or a one-off I/O error) on an otherwise clean, coherent worktree — treating
+        // that as "invalid" would remove+recreate a perfectly good worktree on a blip. Rethrow so the
+        // caller's existing transient-vs-permanent handling applies instead.
+        if (error instanceof WorkspaceRuntimeValidationFailure) {
+          const workspaceValidation = (error as WorkspaceRuntimeValidationFailure).resultJson?.workspaceValidation;
+          const eligible =
+            workspaceValidation && typeof workspaceValidation === "object" && !Array.isArray(workspaceValidation)
+              ? (workspaceValidation as { safeRepair?: { eligible?: unknown } }).safeRepair?.eligible
+              : undefined;
+          if (eligible !== true) {
+            return validation;
+          }
+        }
+        throw error;
+      }
       return await validateLinkedGitWorktree({
         repoRoot,
         worktreePath: reusablePath,
@@ -1750,7 +1817,13 @@ export async function realizeExecutionWorkspace(input: {
       return await reuseExistingWorktree(worktreePath);
     }
     const reason = validation && !validation.valid ? ` (${validation.reason})` : "";
-    throw new Error(`Configured worktree path "${worktreePath}" already exists and is not a reusable git worktree${reason}.`);
+    const healed = repoRoot
+      ? await removeBrokenManagedWorktree({ repoRoot, worktreePath, recorder: input.recorder ?? null })
+      : false;
+    if (!healed) {
+      throw new Error(`Configured worktree path "${worktreePath}" already exists and is not a reusable git worktree${reason}.`);
+    }
+    // Broken worktree removed; fall through to recreate a clean one below.
   }
 
   const registeredBranchWorktree = await findRegisteredGitWorktreeByBranch(repoRoot, branchName);
@@ -1760,7 +1833,13 @@ export async function realizeExecutionWorkspace(input: {
       return await reuseExistingWorktree(registeredBranchWorktree);
     }
     const reason = validation && !validation.valid ? ` (${validation.reason})` : "";
-    throw new Error(`Registered worktree for branch "${branchName}" at "${registeredBranchWorktree}" is not reusable${reason}.`);
+    const healed = repoRoot
+      ? await removeBrokenManagedWorktree({ repoRoot, worktreePath: registeredBranchWorktree, recorder: input.recorder ?? null })
+      : false;
+    if (!healed) {
+      throw new Error(`Registered worktree for branch "${branchName}" at "${registeredBranchWorktree}" is not reusable${reason}.`);
+    }
+    // Broken registered worktree removed; fall through to recreate below.
   }
 
   try {

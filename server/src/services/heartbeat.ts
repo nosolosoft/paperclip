@@ -1307,6 +1307,27 @@ function isWorkspaceValidationFailedRun(
   return run?.errorCode === WORKSPACE_VALIDATION_FAILURE_CODE;
 }
 
+// A reuse failure is *permanently* unusable (safe to rematerialize) only when the persisted
+// git worktree itself is not reusable. Transient errors (locks, IO, missing branch metadata)
+// are deliberately excluded so they keep propagating and the run retries the same workspace.
+function isPermanentlyUnusableWorkspaceReuseFailure(error: unknown): boolean {
+  if (!isWorkspaceValidationFailure(error)) return false;
+  const validation = (error as WorkspaceValidationFailureLike).resultJson?.workspaceValidation;
+  if (!validation || typeof validation !== "object" || Array.isArray(validation)) return false;
+  const reason = (validation as { reason?: unknown }).reason;
+  if (reason === "git_worktree_not_reusable") return true;
+  // A diverged / mid-rebase managed worktree throws git_worktree_branch_incoherence. Rematerialize
+  // only when the safe repair was ineligible (structurally unrecoverable): a transient failure
+  // (e.g. an index.lock) reports safeRepair.eligible === true, and blowing it away over a momentary
+  // lock would needlessly discard in-progress work.
+  if (reason === "git_worktree_branch_incoherence") {
+    const safeRepair = (validation as { safeRepair?: unknown }).safeRepair;
+    if (!safeRepair || typeof safeRepair !== "object" || Array.isArray(safeRepair)) return false;
+    return (safeRepair as { eligible?: unknown }).eligible === false;
+  }
+  return false;
+}
+
 function stableStringifyForFingerprint(value: unknown): string {
   if (Array.isArray(value)) {
     return `[${value.map((entry) => stableStringifyForFingerprint(entry)).join(",")}]`;
@@ -3263,6 +3284,19 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<T>(input: 
   try {
     restored = (await input.restoreExistingWorkspace?.()) ?? null;
   } catch (error) {
+    // A persisted workspace that is *structurally* unusable (a broken git worktree that can no
+    // longer be restored) never recovers on retry — the run just re-enters the same dead path,
+    // producing the blocked -> retry -> blocked loop. Rematerialize a fresh workspace instead of
+    // dead-ending. Transient failures still propagate so we never discard a workspace that only
+    // needs another attempt.
+    if (isPermanentlyUnusableWorkspaceReuseFailure(error)) {
+      const executionWorkspace = await input.realizeWorkspace();
+      return {
+        executionWorkspace,
+        reusedExecutionWorkspace: null,
+        policy,
+      };
+    }
     if (isWorkspaceValidationFailure(error)) {
       throw error;
     }

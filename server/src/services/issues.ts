@@ -2354,6 +2354,7 @@ const issueListSelect = {
   priority: issues.priority,
   assigneeAgentId: issues.assigneeAgentId,
   assigneeUserId: issues.assigneeUserId,
+  originalEngineerAssigneeAgentId: issues.originalEngineerAssigneeAgentId,
   checkoutRunId: issues.checkoutRunId,
   executionRunId: issues.executionRunId,
   executionAgentNameKey: issues.executionAgentNameKey,
@@ -3550,6 +3551,16 @@ async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?:
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
+
+  async function isEngineerRoleAgent(dbOrTx: any, agentId: string | null | undefined): Promise<boolean> {
+    if (!agentId) return false;
+    const row = await dbOrTx
+      .select({ role: agents.role })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows: Array<{ role: string | null }>) => rows[0] ?? null);
+    return row?.role === "engineer";
+  }
 
   async function getIssueByUuid(id: string) {
     const row = await db
@@ -6074,6 +6085,13 @@ export function issueService(db: Db) {
             assigneeUserId: values.assigneeUserId ?? null,
           }),
         );
+        if (
+          !values.originalEngineerAssigneeAgentId &&
+          values.assigneeAgentId &&
+          (await isEngineerRoleAgent(tx, values.assigneeAgentId))
+        ) {
+          values.originalEngineerAssigneeAgentId = values.assigneeAgentId;
+        }
 
         const [issue] = await tx.insert(issues).values(values).returning();
         if (watchdog) {
@@ -6245,6 +6263,15 @@ export function issueService(db: Db) {
         patch.executionRunId = null;
         patch.executionAgentNameKey = null;
         patch.executionLockedAt = null;
+      }
+      if (
+        !existing.originalEngineerAssigneeAgentId &&
+        issueData.assigneeAgentId !== undefined &&
+        issueData.assigneeAgentId !== existing.assigneeAgentId &&
+        issueData.assigneeAgentId &&
+        (await isEngineerRoleAgent(dbOrTx, issueData.assigneeAgentId))
+      ) {
+        patch.originalEngineerAssigneeAgentId = issueData.assigneeAgentId;
       }
 
       const runUpdate = async (tx: any) => {

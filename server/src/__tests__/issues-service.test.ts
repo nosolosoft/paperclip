@@ -5885,3 +5885,129 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
   });
 
 });
+
+describeEmbeddedPostgres("issueService original engineer assignee persistence", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-original-engineer-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedCompanyAndAgent(role: "engineer" | "qa") {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: role === "engineer" ? "Engineer" : "QA",
+      role,
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: { command: "true" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    return { companyId, agentId };
+  }
+
+  it("sets originalEngineerAssigneeAgentId the first time assigneeAgentId is set to an engineer", async () => {
+    const { companyId, agentId: engineerId } = await seedCompanyAndAgent("engineer");
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "No assignee yet",
+      status: "backlog",
+      priority: "medium",
+    });
+
+    await svc.update(issueId, { assigneeAgentId: engineerId, status: "in_progress" });
+
+    const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(row?.originalEngineerAssigneeAgentId).toBe(engineerId);
+  });
+
+  it("does not overwrite originalEngineerAssigneeAgentId on a later reassignment to a different engineer", async () => {
+    const { companyId, agentId: engineerA } = await seedCompanyAndAgent("engineer");
+    const engineerB = randomUUID();
+    await db.insert(agents).values({
+      id: engineerB,
+      companyId,
+      name: "Engineer B",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: { command: "true" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Reassigned to a different engineer",
+      status: "backlog",
+      priority: "medium",
+    });
+
+    await svc.update(issueId, { assigneeAgentId: engineerA, status: "in_progress" });
+    await svc.update(issueId, { assigneeAgentId: engineerB });
+
+    const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(row?.originalEngineerAssigneeAgentId).toBe(engineerA);
+    expect(row?.assigneeAgentId).toBe(engineerB);
+  });
+
+  it("does not set originalEngineerAssigneeAgentId when assigned to a non-engineer role", async () => {
+    const { companyId, agentId: qaAgentId } = await seedCompanyAndAgent("qa");
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Assigned to QA",
+      status: "backlog",
+      priority: "medium",
+    });
+
+    await svc.update(issueId, { assigneeAgentId: qaAgentId, status: "in_review" });
+
+    const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(row?.originalEngineerAssigneeAgentId).toBeNull();
+  });
+
+  it("sets originalEngineerAssigneeAgentId at create() time when the issue is created with an engineer assignee", async () => {
+    const { companyId, agentId: engineerId } = await seedCompanyAndAgent("engineer");
+
+    const created = await svc.create(companyId, {
+      title: "Created pre-assigned",
+      status: "in_progress",
+      assigneeAgentId: engineerId,
+    });
+
+    expect(created.originalEngineerAssigneeAgentId).toBe(engineerId);
+
+    const [row] = await db.select().from(issues).where(eq(issues.id, created.id));
+    expect(row?.originalEngineerAssigneeAgentId).toBe(engineerId);
+  });
+});

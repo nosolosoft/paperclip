@@ -409,6 +409,55 @@ export function parseIssueExecutionState(input: unknown): IssueExecutionState | 
   return parsed.data;
 }
 
+export interface QaFailureReturnEngineerCandidate {
+  id: string;
+  role?: string | null;
+  status?: string | null;
+  createdAt?: Date | string | null;
+}
+
+export function isAssignableEngineerCandidate(agent: { role?: string | null; status?: string | null }): boolean {
+  return agent.role === "engineer" && !["terminated", "pending_approval"].includes(agent.status ?? "");
+}
+
+/**
+ * Resolves which engineer a QA FAIL / blocked / in_progress disposition should route
+ * back to, in priority order:
+ *   1. native execution-policy mode's resolvable executionState.returnAssignee
+ *   2. the persisted "first engineer ever assigned" pointer (originalEngineerAssigneeAgentId)
+ *   3. degenerate fallback: deterministic ordering (earliest createdAt, then id) -- only
+ *      reached for issues that somehow never had an engineer assignee.
+ */
+export function resolveQaFailureReturnEngineer(input: {
+  candidateAgents: QaFailureReturnEngineerCandidate[];
+  executionState?: unknown;
+  fallbackExecutionState?: unknown;
+  originalEngineerAssigneeAgentId?: string | null;
+}): QaFailureReturnEngineerCandidate | null {
+  const state = parseIssueExecutionState(input.executionState) ?? parseIssueExecutionState(input.fallbackExecutionState);
+  const returnAgentId = state?.returnAssignee?.type === "agent" ? state.returnAssignee.agentId : null;
+  if (returnAgentId) {
+    const native = input.candidateAgents.find((a) => a.id === returnAgentId && isAssignableEngineerCandidate(a));
+    if (native) return native;
+  }
+
+  if (input.originalEngineerAssigneeAgentId) {
+    const original = input.candidateAgents.find(
+      (a) => a.id === input.originalEngineerAssigneeAgentId && isAssignableEngineerCandidate(a),
+    );
+    if (original) return original;
+  }
+
+  const assignable = input.candidateAgents.filter(isAssignableEngineerCandidate);
+  if (assignable.length === 0) return null;
+  return [...assignable].sort((x, y) => {
+    const xt = x.createdAt ? new Date(x.createdAt).getTime() : 0;
+    const yt = y.createdAt ? new Date(y.createdAt).getTime() : 0;
+    if (xt !== yt) return xt - yt;
+    return x.id < y.id ? -1 : x.id > y.id ? 1 : 0;
+  })[0];
+}
+
 export function assigneePrincipal(input: AssigneeLike): IssueExecutionStagePrincipal | null {
   if (input.assigneeAgentId) {
     return { type: "agent", agentId: input.assigneeAgentId, userId: null };

@@ -76,7 +76,7 @@ import { accessService } from "./access.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { sanitizeRecord } from "../redaction.js";
 import { unprocessable } from "../errors.js";
-import { parseIssueExecutionState } from "./issue-execution-policy.js";
+import { resolveQaFailureReturnEngineer } from "./issue-execution-policy.js";
 
 
 function normalizeAgentRoutingText(value: string | null | undefined) {
@@ -138,21 +138,6 @@ function selectBrowserQaRoutingAgent(
   return agents
     .filter((agent) => agent.role === "qa" && !["terminated", "pending_approval"].includes(agent.status ?? ""))
     .find(agentLooksLikeBrowserQaRouting) ?? null;
-}
-
-function agentLooksLikeEngineerRouting(agent: { role?: string | null; status?: string | null }) {
-  return agent.role === "engineer" && !["terminated", "pending_approval"].includes(agent.status ?? "");
-}
-
-function selectQaFailureReturnEngineerRoutingAgent(
-  agents: Array<{ id: string; role?: string | null; status?: string | null }>,
-  executionState: unknown,
-  fallbackExecutionState?: unknown,
-) {
-  const state = parseIssueExecutionState(executionState) ?? parseIssueExecutionState(fallbackExecutionState);
-  const returnAgentId = state?.returnAssignee?.type === "agent" ? state.returnAssignee.agentId : null;
-  if (!returnAgentId) return null;
-  return agents.find((agent) => agent.id === returnAgentId && agentLooksLikeEngineerRouting(agent)) ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1684,12 +1669,12 @@ export function buildHostServices(
         const sourceAgent = await agents.getById(actorAgentId);
         if (sourceAgent?.role === "qa" && (qaVerdict === "fail" || nextStatus === "blocked" || nextStatus === "in_progress")) {
           const candidateAgents = await agents.list(companyId);
-          const engineer =
-            selectQaFailureReturnEngineerRoutingAgent(
-              candidateAgents,
-              patch.executionState === undefined ? existing.executionState : patch.executionState,
-              existing.executionState,
-            ) ?? candidateAgents.find(agentLooksLikeEngineerRouting);
+          const engineer = resolveQaFailureReturnEngineer({
+            candidateAgents,
+            executionState: patch.executionState === undefined ? existing.executionState : patch.executionState,
+            fallbackExecutionState: existing.executionState,
+            originalEngineerAssigneeAgentId: existing.originalEngineerAssigneeAgentId ?? null,
+          });
           if (engineer) {
             patch.status = "in_progress";
             patch.assigneeAgentId = engineer.id;

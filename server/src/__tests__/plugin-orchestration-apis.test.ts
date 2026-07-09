@@ -592,6 +592,146 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     });
   });
 
+  it("routes QA FAIL to the original engineer, not an arbitrary engineer, in legacy mode", async () => {
+    const { companyId, agentId: engineerA } = await seedCompanyAndAgent();
+    const engineerB = randomUUID();
+    await db.insert(agents).values({
+      id: engineerB,
+      companyId,
+      name: "Engineer B",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: { command: "true" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const qaAgentId = await seedQaAgent(companyId, "QA (Code)");
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+
+    const created = await services.issues.create({
+      companyId,
+      title: "Legacy FAIL routing",
+      status: "in_progress",
+      assigneeAgentId: engineerA,
+      actorAgentId: engineerA,
+    });
+    expect(created.originalEngineerAssigneeAgentId).toBe(engineerA);
+
+    await services.issues.update({
+      issueId: created.id,
+      companyId,
+      patch: { assigneeAgentId: engineerB },
+    });
+    const [afterReassign] = await db.select().from(issues).where(eq(issues.id, created.id));
+    expect(afterReassign?.originalEngineerAssigneeAgentId).toBe(engineerA);
+
+    await services.issues.update({
+      issueId: created.id,
+      companyId,
+      patch: { assigneeAgentId: qaAgentId, status: "in_review" },
+    });
+
+    const updated = await services.issues.update({
+      issueId: created.id,
+      companyId,
+      patch: { actorAgentId: qaAgentId, qaVerdict: "fail" },
+    });
+
+    expect(updated.status).toBe("in_progress");
+    expect(updated.assigneeAgentId).toBe(engineerA);
+  });
+
+  it("prefers native returnAssignee over the original engineer when execution state resolves", async () => {
+    const { companyId, agentId: engineerA } = await seedCompanyAndAgent();
+    const engineerB = randomUUID();
+    await db.insert(agents).values({
+      id: engineerB,
+      companyId,
+      name: "Engineer B",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: { command: "true" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const qaAgentId = await seedQaAgent(companyId, "QA (Code)");
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Native FAIL routing",
+      status: "in_review",
+      priority: "medium",
+      identifier: `${issuePrefix(companyId)}-native`,
+      assigneeAgentId: qaAgentId,
+      originalEngineerAssigneeAgentId: engineerA,
+      executionState: {
+        status: "pending",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: { type: "agent", agentId: engineerB },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    });
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+
+    const updated = await services.issues.update({
+      issueId,
+      companyId,
+      patch: { actorAgentId: qaAgentId, qaVerdict: "fail" },
+    });
+
+    expect(updated.status).toBe("in_progress");
+    expect(updated.assigneeAgentId).toBe(engineerB);
+  });
+
+  it("keeps routing QA FAIL to the first engineer across repeated QA bounces", async () => {
+    const { companyId, agentId: engineerA } = await seedCompanyAndAgent();
+    const qaAgentId = await seedQaAgent(companyId, "QA (Code)");
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+
+    const created = await services.issues.create({
+      companyId,
+      title: "Repeated bounce",
+      status: "in_progress",
+      assigneeAgentId: engineerA,
+      actorAgentId: engineerA,
+    });
+
+    await services.issues.update({
+      issueId: created.id,
+      companyId,
+      patch: { assigneeAgentId: qaAgentId, status: "in_review" },
+    });
+    const firstFail = await services.issues.update({
+      issueId: created.id,
+      companyId,
+      patch: { actorAgentId: qaAgentId, qaVerdict: "fail" },
+    });
+    expect(firstFail.status).toBe("in_progress");
+    expect(firstFail.assigneeAgentId).toBe(engineerA);
+
+    await services.issues.update({
+      issueId: created.id,
+      companyId,
+      patch: { assigneeAgentId: qaAgentId, status: "in_review" },
+    });
+    const secondFail = await services.issues.update({
+      issueId: created.id,
+      companyId,
+      patch: { actorAgentId: qaAgentId, qaVerdict: "fail" },
+    });
+
+    expect(secondFail.status).toBe("in_progress");
+    expect(secondFail.assigneeAgentId).toBe(engineerA);
+  });
+
   it("creates plugin operation issues with the generic operation origin", async () => {
     const { companyId } = await seedCompanyAndAgent();
     const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());

@@ -164,6 +164,7 @@ import {
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
+  resolveQaFailureReturnEngineer,
   setIssueExecutionPolicyMonitorScheduledBy,
 } from "../services/issue-execution-policy.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
@@ -2706,36 +2707,6 @@ export function issueRoutes(
     return assignable.find(agentLooksLikeBrowserQa) ?? null;
   }
 
-async function resolveDefaultEngineerAgent(companyId: string) {
-  const candidates = await db
-      .select({
-        id: agentsTable.id,
-        name: agentsTable.name,
-        role: agentsTable.role,
-        status: agentsTable.status,
-      })
-      .from(agentsTable)
-      .where(and(eq(agentsTable.companyId, companyId), eq(agentsTable.role, "engineer")));
-
-  return candidates.find((agent) => !["terminated", "pending_approval"].includes(agent.status)) ?? null;
-}
-
-async function resolveQaFailureReturnEngineerAgent(input: {
-  companyId: string;
-  executionState?: unknown;
-  fallbackExecutionState?: unknown;
-}) {
-  const state = parseIssueExecutionState(input.executionState) ?? parseIssueExecutionState(input.fallbackExecutionState);
-  const returnAgentId = state?.returnAssignee?.type === "agent" ? state.returnAssignee.agentId : null;
-  if (!returnAgentId) return null;
-
-  const agent = await agentsSvc.getById(returnAgentId);
-  if (agent?.companyId !== input.companyId) return null;
-  if (agent.role !== "engineer") return null;
-  if (["terminated", "pending_approval"].includes(agent.status)) return null;
-  return agent;
-}
-
 async function applyDefaultQaDispositionRouting(input: {
   existing: {
     id: string;
@@ -2744,6 +2715,7 @@ async function applyDefaultQaDispositionRouting(input: {
     assigneeAgentId?: string | null;
     assigneeUserId?: string | null;
     executionState?: unknown;
+    originalEngineerAssigneeAgentId?: string | null;
   };
   updateFields: Record<string, unknown>;
   actorAgentId?: string | null;
@@ -2759,14 +2731,15 @@ async function applyDefaultQaDispositionRouting(input: {
       : input.existing.status;
 
   if (input.qaVerdict === "fail" || nextStatus === "blocked" || nextStatus === "in_progress") {
-    const engineer =
-      await resolveQaFailureReturnEngineerAgent({
-        companyId: input.existing.companyId,
-        executionState: input.updateFields.executionState === undefined
-          ? input.existing.executionState
-          : input.updateFields.executionState,
-        fallbackExecutionState: input.existing.executionState,
-      }) ?? await resolveDefaultEngineerAgent(input.existing.companyId);
+    const candidateAgents = await agentsSvc.list(input.existing.companyId);
+    const engineer = resolveQaFailureReturnEngineer({
+      candidateAgents,
+      executionState: input.updateFields.executionState === undefined
+        ? input.existing.executionState
+        : input.updateFields.executionState,
+      fallbackExecutionState: input.existing.executionState,
+      originalEngineerAssigneeAgentId: input.existing.originalEngineerAssigneeAgentId ?? null,
+    });
     if (!engineer) return;
     input.updateFields.status = "in_progress";
     input.updateFields.assigneeAgentId = engineer.id;

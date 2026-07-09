@@ -531,6 +531,10 @@ async function runGit(args: string[], cwd: string): Promise<string> {
     command: "git",
     args,
     cwd,
+    // Force a stable C locale so git speaks English. Downstream logic matches on message
+    // substrings (e.g. gitErrorIncludes(..., "already exists")); a localized host would otherwise
+    // silently break those branches.
+    env: { ...process.env, LC_ALL: "C", LANG: "C" },
   });
   if (proc.code !== 0) {
     throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);

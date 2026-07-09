@@ -2254,6 +2254,60 @@ async function seedQueuedIssueRunFixture() {
   expect(validationComment).toBeTruthy();
 });
 
+  // Regression for the CEO-agent workspace-poisoning bug: a status-only source-scoped
+  // recovery wake forces "agent_default" execution-workspace mode (no project checkout),
+  // which resolves straight to the ambient per-agent "agent_home" fallback dir. That
+  // fallback must never be persisted as issues.executionWorkspaceId when the issue is
+  // still linked to a real project -- doing so silently overwrites a good workspace
+  // pointer instead of failing loudly.
+  it("never persists an agent_home workspace over a project-linked issue's workspace pointer", async () => {
+    const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    const projectId = randomUUID();
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Paperclip App",
+      status: "in_progress",
+    });
+    // Deliberately no project_workspaces row: resolveWorkspaceForRun would otherwise
+    // reach the ensureManagedProjectWorkspace path. useProjectWorkspace is forced off by
+    // the status-only wake below, so it never even looks for one.
+    await db.update(issues).set({ projectId }).where(eq(issues.id, issueId));
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "source_scoped_recovery_action",
+          recoveryIntent: "status_only",
+          sourceIssueId: issueId,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId, 5_000);
+
+    // Status-only recovery wakes intentionally skip the pre-launch git-sensitive
+    // workspace guard (they do no deliverable work), so the adapter still runs from
+    // the ambient agent_home dir for *this* run. What must never happen is that dir
+    // getting written back as the issue's durable workspace pointer.
+    expect(mockAdapterExecute).toHaveBeenCalled();
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.executionWorkspaceId).toBeNull();
+
+    const agentHomeWorkspaces = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(and(eq(executionWorkspaces.companyId, companyId), eq(executionWorkspaces.projectId, projectId)));
+    expect(agentHomeWorkspaces).toHaveLength(0);
+  });
+
 it("repairs a stale project-primary execution workspace before continuation dispatch", async () => {
   const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();
   const projectId = randomUUID();

@@ -1645,7 +1645,11 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     );
   }
 
-  if (workspaceExpectation && effectiveCwd && sameResolvedPath(effectiveCwd, agentFallbackCwd)) {
+  if (
+    workspaceExpectation &&
+    effectiveCwd &&
+    (sameResolvedPath(effectiveCwd, agentFallbackCwd) || isUnsafeSessionWorkspaceCwd(effectiveCwd))
+  ) {
     fail(
       "fallback_agent_home_cwd",
       `Issue ${issue.identifier ?? issue.id} expected a project workspace, but ${input.adapterType} would launch from agent fallback cwd "${effectiveCwd}".`,
@@ -11521,6 +11525,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const resolvedProjectId = executionWorkspace.projectId ?? issueRef?.projectId ?? executionProjectId ?? null;
     const resolvedProjectWorkspaceId = issueRef?.projectWorkspaceId ?? resolvedWorkspace.workspaceId ?? null;
     let persistedExecutionWorkspace = null;
+    // An "agent_home" workspace is an ambient per-agent scratch dir with no git
+    // checkout — never a legitimate resolution for an issue tied to a real project.
+    // Persisting it as issues.executionWorkspaceId here would silently overwrite a
+    // good pointer; let the downstream fallback_agent_home_cwd guard fail the run instead.
+    const isAgentHomeWorkspaceForProjectIssue =
+      executionWorkspace.source === "agent_home" && Boolean(issueRef?.projectId);
     const nextExecutionWorkspaceMetadata = mergeExecutionWorkspaceMetadataForPersistence({
       existingMetadata: resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace
         ? reusableExistingExecutionWorkspace?.metadata ?? null
@@ -11537,7 +11547,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       baseRefSha: executionWorkspace.baseRefSha ?? null,
     });
     try {
-      persistedExecutionWorkspace = resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace && reusableExistingExecutionWorkspace
+      persistedExecutionWorkspace = isAgentHomeWorkspaceForProjectIssue
+        ? null
+        : resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace && reusableExistingExecutionWorkspace
         ? await executionWorkspacesSvc.update(reusableExistingExecutionWorkspace.id, {
             cwd: executionWorkspace.cwd,
             repoUrl: executionWorkspace.repoUrl,
@@ -13432,6 +13444,53 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           triggerDetail: promotedTriggerDetail,
           payload: promotedPayload,
         });
+
+        const promotedAllowBlockedSourceScopedRecoveryWake = await isVerifiedBlockedSourceScopedRecoveryWake({
+          issue,
+          agentId: deferredAgent.id,
+          reason: promotedReason,
+          contextSnapshot: promotedContextSnapshot,
+          tx,
+        });
+        const promotedEligibility = evaluateIssueWakeEligibility({
+          agent: deferredAgent,
+          issue,
+          source: promotedSource,
+          triggerDetail: promotedTriggerDetail,
+          reason: promotedReason,
+          contextSnapshot: promotedContextSnapshot,
+          allowBlockedSourceScopedRecoveryWake: promotedAllowBlockedSourceScopedRecoveryWake,
+        });
+        if (!promotedEligibility.allowed) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "cancelled",
+              finishedAt: new Date(),
+              error: `Deferred wake promotion rejected: ${promotedEligibility.reason}`,
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+          await tx.insert(activityLog).values({
+            companyId: issue.companyId,
+            actorType: "system",
+            actorId: "heartbeat",
+            action: "heartbeat.wakeup_cancelled_stale",
+            entityType: "issue",
+            entityId: issue.id,
+            agentId: deferred.agentId,
+            details: {
+              reason: promotedEligibility.reason,
+              wakeupRequestId: deferred.id,
+              source: promotedSource,
+              triggerDetail: promotedTriggerDetail,
+              requestedReason: promotedReason,
+              issueStatus: issue.status,
+              assigneeAgentId: issue.assigneeAgentId,
+            },
+          });
+          continue;
+        }
 
         const sessionBefore =
           readNonEmptyString(promotedContextSnapshot.resumeSessionDisplayId) ??

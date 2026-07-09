@@ -281,4 +281,76 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
 
     expect(issue?.executionRunId).toBe(holderRunId);
   });
+
+  // Regression for the CEO-agent workspace-poisoning bug: a wake deferred while the
+  // holder run is active must re-check issue_assignee_changed at promotion time, not
+  // just at initial enqueue. Otherwise an agent that lost the assignment during the
+  // defer window still gets a real run once the holder releases the lock.
+  it("rejects promoting a deferred wake once its agent is no longer the issue assignee", async () => {
+    const { companyId, reviewerAgentId, issueId, holderRunId } = await seedCrossAgentScenario({
+      holderStatus: "running",
+    });
+
+    const heartbeat = heartbeatService(db);
+    const followupRun = await heartbeat.wakeup(reviewerAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" },
+      requestedByActorType: "user",
+      requestedByActorId: "local-board",
+    });
+    expect(followupRun).toBeNull();
+
+    const deferredBefore = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.agentId, reviewerAgentId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    expect(deferredBefore).not.toBeNull();
+
+    // Issue gets reassigned away from the reviewer while its wake sits deferred.
+    const thirdAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: thirdAgentId,
+      companyId,
+      name: "Third",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.update(issues).set({ assigneeAgentId: thirdAgentId }).where(eq(issues.id, issueId));
+
+    // Holder finishes: lock releases and deferred-wake promotion is attempted.
+    await heartbeat.cancelRun(holderRunId, "test: releasing holder to trigger promotion");
+
+    const deferredAfter = await db
+      .select({
+        status: agentWakeupRequests.status,
+        error: agentWakeupRequests.error,
+        runId: agentWakeupRequests.runId,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferredBefore!.id))
+      .then((rows) => rows[0] ?? null);
+
+    expect(deferredAfter?.status).toBe("cancelled");
+    expect(deferredAfter?.error).toContain("issue_assignee_changed");
+    expect(deferredAfter?.runId).toBeNull();
+
+    const promotedRuns = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, reviewerAgentId));
+    expect(promotedRuns).toHaveLength(0);
+  });
 });

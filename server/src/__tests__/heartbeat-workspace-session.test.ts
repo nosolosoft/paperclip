@@ -1512,6 +1512,63 @@ describe("effective run execution workspace config freshness", () => {
     expect(realizeWorkspace).not.toHaveBeenCalled();
   });
 
+  // Regression for the CEO-agent workspace-poisoning bug: a project issue's persisted
+  // execution_workspace_id can itself already be a poisoned ambient scratch dir (no git
+  // checkout) — observed in production with metadata.source "task_session", not just
+  // "agent_home", so detection has to key off the cwd shape (same check as
+  // isUnsafeSessionWorkspaceCwd), not the source label. Reusing it blindly re-enters the
+  // same dead loop on every retry (checkout -> workspace_validation_failed -> blocked).
+  // The reuse request must refuse to reuse it so a fresh project workspace gets resolved.
+  it("refuses to reuse a persisted ambient-poisoned workspace on a project issue", () => {
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-poisoned",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      issueProjectId: "project-1",
+      existingExecutionWorkspaceCwd:
+        "/home/manu/.paperclip/instances/default/workspaces/10ff7c61-0fab-460f-adef-9fb3a2b58ab0",
+    });
+
+    expect(reuseRequest).toEqual({
+      requestedExecutionWorkspaceId: "workspace-poisoned",
+      requestedShouldReuseExisting: false,
+      existingExecutionWorkspaceAvailable: false,
+    });
+  });
+
+  it("still reuses a persisted ambient workspace cwd when the issue has no project", () => {
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-agent-home",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      issueProjectId: null,
+      existingExecutionWorkspaceCwd:
+        "/home/manu/.paperclip/instances/default/workspaces/10ff7c61-0fab-460f-adef-9fb3a2b58ab0",
+    });
+
+    expect(reuseRequest).toEqual({
+      requestedExecutionWorkspaceId: "workspace-agent-home",
+      requestedShouldReuseExisting: true,
+      existingExecutionWorkspaceAvailable: true,
+    });
+  });
+
+  it("still reuses a persisted project-workspace cwd on a project issue", () => {
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({
+      issueExecutionWorkspaceId: "workspace-real",
+      issueExecutionWorkspacePreference: "reuse_existing",
+      existingExecutionWorkspaceStatus: "active",
+      issueProjectId: "project-1",
+      existingExecutionWorkspaceCwd: "/home/manu/.paperclip/instances/default/projects/p1/w1",
+    });
+
+    expect(reuseRequest).toEqual({
+      requestedExecutionWorkspaceId: "workspace-real",
+      requestedShouldReuseExisting: true,
+      existingExecutionWorkspaceAvailable: true,
+    });
+  });
+
   it("fails explicit reuse restore misses without realizing a fallback workspace", async () => {
     const metadata = buildWorkspaceConfigMetadata();
     const decision = resolveExecutionWorkspaceConfigFreshness({

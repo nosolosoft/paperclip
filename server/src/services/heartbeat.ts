@@ -3186,10 +3186,24 @@ export function resolveExecutionWorkspaceReuseRequestForIssue(input: {
   issueExecutionWorkspaceId?: string | null;
   issueExecutionWorkspacePreference?: string | null;
   existingExecutionWorkspaceStatus?: string | null;
+  issueProjectId?: string | null;
+  existingExecutionWorkspaceCwd?: string | null;
 }): ExecutionWorkspaceReuseRequestForIssue {
   const requestedExecutionWorkspaceId = readNonEmptyString(input.issueExecutionWorkspaceId);
+  // A persisted execution_workspaces row can itself already be a poisoned ambient scratch
+  // dir (no git checkout) left over from the CEO workspace-poisoning bug — regardless of
+  // what its metadata.source label says (observed values include both "agent_home" and
+  // "task_session", since a poisoned cwd can get re-persisted as a "resumed session" cwd
+  // on a later run). Detect it by cwd shape, the same check used for session resume cwds.
+  // Reusing it blindly here re-enters the same dead path on every retry (checkout ->
+  // workspace_validation_failed -> blocked, forever) instead of resolving a fresh
+  // project workspace.
+  const existingExecutionWorkspaceIsAmbientPoisoned =
+    Boolean(input.issueProjectId) && isUnsafeSessionWorkspaceCwd(input.existingExecutionWorkspaceCwd);
   const requestedShouldReuseExisting =
-    input.issueExecutionWorkspacePreference === "reuse_existing" && requestedExecutionWorkspaceId !== null;
+    input.issueExecutionWorkspacePreference === "reuse_existing" &&
+    requestedExecutionWorkspaceId !== null &&
+    !existingExecutionWorkspaceIsAmbientPoisoned;
 
   return {
     requestedExecutionWorkspaceId,
@@ -11066,6 +11080,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueExecutionWorkspaceId: requestedExecutionWorkspaceId,
       issueExecutionWorkspacePreference: issueRef?.executionWorkspacePreference ?? null,
       existingExecutionWorkspaceStatus: existingExecutionWorkspace?.status ?? null,
+      issueProjectId: issueRef?.projectId ?? null,
+      existingExecutionWorkspaceCwd: existingExecutionWorkspace?.cwd ?? null,
     });
   const statusOnlySourceScopedRecoveryWake = isStatusOnlySourceScopedRecoveryWake(context);
   const requestedShouldReuseExisting =

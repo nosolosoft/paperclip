@@ -109,6 +109,8 @@ const editableMembershipStatuses = ["pending", "active", "suspended"] as const;
 export const updateCompanyMemberSchema = z.object({
   membershipRole: z.enum(HUMAN_COMPANY_MEMBERSHIP_ROLES).optional().nullable(),
   status: z.enum(editableMembershipStatuses).optional(),
+  replacementResponsibleUserId: z.string().min(1).optional(),
+  apiKeyDisposition: z.enum(["transfer", "revoke"]).optional(),
 }).refine((value) => value.membershipRole !== undefined || value.status !== undefined, {
   message: "membershipRole or status is required",
 });
@@ -118,6 +120,8 @@ export type UpdateCompanyMember = z.infer<typeof updateCompanyMemberSchema>;
 export const updateCompanyMemberWithPermissionsSchema = z.object({
   membershipRole: z.enum(HUMAN_COMPANY_MEMBERSHIP_ROLES).optional().nullable(),
   status: z.enum(editableMembershipStatuses).optional(),
+  replacementResponsibleUserId: z.string().min(1).optional(),
+  apiKeyDisposition: z.enum(["transfer", "revoke"]).optional(),
   grants: updateMemberPermissionsSchema.shape.grants.default([]),
 }).refine((value) => value.membershipRole !== undefined || value.status !== undefined, {
   message: "membershipRole or status is required",
@@ -126,6 +130,8 @@ export const updateCompanyMemberWithPermissionsSchema = z.object({
 export type UpdateCompanyMemberWithPermissions = z.infer<typeof updateCompanyMemberWithPermissionsSchema>;
 
 export const archiveCompanyMemberSchema = z.object({
+  replacementResponsibleUserId: z.string().min(1).optional(),
+  apiKeyDisposition: z.enum(["transfer", "revoke"]).optional(),
   reassignment: z
     .object({
       assigneeAgentId: z.string().uuid().optional().nullable(),

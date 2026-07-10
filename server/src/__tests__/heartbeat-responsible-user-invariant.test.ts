@@ -303,4 +303,28 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
       .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId)));
     expect(runs).toHaveLength(0);
   });
+
+  it("ignores an invalid default and does not fall back to another active member", async () => {
+    const { companyId, ownerUserId, agentId } = await seedCompany();
+    await db.update(companyMemberships).set({ membershipRole: "viewer" }).where(and(
+      eq(companyMemberships.companyId, companyId),
+      eq(companyMemberships.principalId, ownerUserId),
+    ));
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: `operator-${randomUUID()}`,
+      membershipRole: "operator",
+      status: "active",
+    });
+
+    await expect(heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      requestedByActorType: "system",
+    })).rejects.toMatchObject({
+      status: 422,
+      details: { code: "responsible_user_unresolved" },
+    });
+  });
 });

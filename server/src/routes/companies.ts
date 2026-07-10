@@ -377,6 +377,16 @@ export function companyRoutes(db: Db, storage?: StorageService) {
       throw forbidden("Instance admin required");
     }
     const ownerPrincipalId = req.actor.userId ?? "local-board";
+    if (
+      req.body.defaultResponsibleUserId !== undefined &&
+      req.body.defaultResponsibleUserId !== null &&
+      req.body.defaultResponsibleUserId !== ownerPrincipalId
+    ) {
+      throw new HttpError(422, "Invalid default responsible user", {
+        code: "responsible_user_inactive_membership",
+        reason: "inactive_membership",
+      });
+    }
     const company = await svc.create({
       ...req.body,
       defaultResponsibleUserId: req.body.defaultResponsibleUserId ?? ownerPrincipalId,

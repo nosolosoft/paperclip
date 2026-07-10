@@ -122,6 +122,7 @@ import {
 import type { TaskWatchdogServiceDeps, taskWatchdogService } from "../services/task-watchdogs.js";
 import { logger } from "../middleware/logger.js";
 import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
+import { validateResponsibleUser } from "../services/responsible-user.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
@@ -5228,7 +5229,7 @@ async function applyDefaultQaDispositionRouting(input: {
       return;
     }
 
-    const { actionId, outcome, sourceIssueStatus, resolutionNote } = req.body;
+    const { actionId, outcome, sourceIssueStatus, qaVerdict, resolutionNote } = req.body;
     if (outcome === "false_positive" || outcome === "cancelled") {
       assertBoard(req);
     }
@@ -5259,6 +5260,7 @@ async function applyDefaultQaDispositionRouting(input: {
       existing,
       updateFields,
       actorAgentId: actor.agentId ?? null,
+      qaVerdict,
     });
     await applyDefaultAgentReviewRouting({
       existing,
@@ -6672,6 +6674,18 @@ async function applyDefaultQaDispositionRouting(input: {
       surface: "issues.create",
     });
     if (!sanitizedBody) return;
+    if (sanitizedBody.responsibleUserId != null) {
+      const validation = await validateResponsibleUser(db, {
+        companyId,
+        userId: sanitizedBody.responsibleUserId,
+      });
+      if (!validation.valid) {
+        throw new HttpError(422, "Invalid responsible user", {
+          code: `responsible_user_${validation.reason}`,
+          reason: validation.reason,
+        });
+      }
+    }
     const { watchdogDiscovery: rawWatchdogDiscovery, ...rawCreateBody } = sanitizedBody;
     const watchdogDiscovery = normalizeWatchdogDiscovery(rawWatchdogDiscovery);
     const watchdogProductBugFollowUp = await resolveTaskWatchdogProductBugFollowUp(
@@ -7338,6 +7352,25 @@ async function applyDefaultQaDispositionRouting(input: {
       return;
     }
     assertCompanyAccess(req, existing.companyId);
+    if (req.body.responsibleUserId !== undefined) {
+      if (req.actor.type === "agent") {
+        throw new HttpError(422, "Agents cannot change responsibleUserId", {
+          code: "responsible_user_actor_forbidden",
+        });
+      }
+      if (req.body.responsibleUserId !== null) {
+        const validation = await validateResponsibleUser(db, {
+          companyId: existing.companyId,
+          userId: req.body.responsibleUserId,
+        });
+        if (!validation.valid) {
+          throw new HttpError(422, "Invalid responsible user", {
+            code: `responsible_user_${validation.reason}`,
+            reason: validation.reason,
+          });
+        }
+      }
+    }
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;

@@ -10,6 +10,7 @@ import {
   ADAPTER_AGNOSTIC_KEYS,
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
   createAgentKeySchema,
+  rotateAgentKeySchema,
   createAgentHireSchema,
   createAgentSchema,
   deriveAgentUrlKey,
@@ -53,6 +54,7 @@ import {
   workspaceOperationService,
 } from "../services/index.js";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
+import { listOrphanedAgentApiKeys } from "../services/agent-api-key-responsibility.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
@@ -3198,6 +3200,13 @@ export function agentRoutes(
     res.json(keys);
   });
 
+  router.get("/companies/:companyId/agent-api-keys/orphaned", async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    res.json({ keys: await listOrphanedAgentApiKeys(db, companyId) });
+  });
+
   router.post("/agents/:id/keys", validate(createAgentKeySchema), async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
@@ -3259,6 +3268,34 @@ export function agentRoutes(
     });
 
     res.json({ ok: true });
+  });
+
+  router.post("/agents/:id/keys/:keyId/rotate", validate(rotateAgentKeySchema), async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    const keyId = req.params.keyId as string;
+    const idempotencyKey = req.get("Idempotency-Key")?.trim();
+    if (!idempotencyKey) throw conflict("Idempotency-Key header is required");
+    const agent = await getAccessibleAgent(req, res, id);
+    if (!agent) return;
+    const result = await svc.rotateKey(id, keyId, idempotencyKey, req.body.name);
+    await logActivity(db, {
+      companyId: agent.companyId,
+      actorType: "user",
+      actorId: req.actor.userId ?? "board",
+      action: result.replayed ? "agent.key_rotation_replayed" : "agent.key_rotated",
+      entityType: "agent",
+      entityId: agent.id,
+      details: { sourceKeyId: keyId, replacementKeyId: result.key.id },
+    });
+    res.status(result.replayed ? 200 : 201).json({
+      id: result.key.id,
+      name: result.key.name,
+      responsibleUserId: result.key.responsibleUserId,
+      token: result.token,
+      createdAt: result.key.createdAt,
+      replayed: result.replayed,
+    });
   });
 
   // Shared handler body for the wakeup-style endpoints. The two routes differ

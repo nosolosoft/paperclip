@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, timestamp, index, jsonb } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, index, jsonb, uniqueIndex } from "drizzle-orm/pg-core";
 import type { AgentApiKeyScope } from "@paperclipai/shared";
 import { agents } from "./agents.js";
 import { companies } from "./companies.js";
@@ -15,10 +15,17 @@ export const agentApiKeys = pgTable(
     scopeConfig: jsonb("scope_config").$type<AgentApiKeyScope | null>(),
     lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    rotatedFromKeyId: uuid("rotated_from_key_id"),
+    rotationIdempotencyKey: text("rotation_idempotency_key"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
     keyHashIdx: index("agent_api_keys_key_hash_idx").on(table.keyHash),
     companyAgentIdx: index("agent_api_keys_company_agent_idx").on(table.companyId, table.agentId),
+    rotationIdempotencyIdx: uniqueIndex("agent_api_keys_rotation_idempotency_uq").on(
+      table.companyId,
+      table.rotatedFromKeyId,
+      table.rotationIdempotencyKey,
+    ),
   }),
 );

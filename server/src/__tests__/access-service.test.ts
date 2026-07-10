@@ -3,6 +3,8 @@ import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
+  agentApiKeys,
+  authUsers,
   companies,
   companyMemberships,
   createDb,
@@ -56,12 +58,14 @@ describeEmbeddedPostgres("access service", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(agentApiKeys);
     await db.delete(issues);
     await db.delete(principalPermissionGrants);
     await db.delete(instanceUserRoles);
     await db.delete(agents);
     await db.delete(companyMemberships);
     await db.delete(companies);
+    await db.delete(authUsers);
   });
 
   afterAll(async () => {
@@ -179,6 +183,60 @@ describeEmbeddedPostgres("access service", () => {
       .where(eq(issues.id, doneIssue.id))
       .then((rows) => rows[0]!);
     expect(historicalIssue.assigneeUserId).toBe(member.principalId);
+  });
+
+  it("rolls back suspension until responsibility and active keys have an explicit disposition", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    const now = new Date();
+    const memberUserId = `member-${randomUUID()}`;
+    await db.insert(authUsers).values([
+      { id: owner.principalId, name: "Owner", email: `${owner.principalId}@test.invalid`, createdAt: now, updatedAt: now },
+      { id: memberUserId, name: "Member", email: `${memberUserId}@test.invalid`, createdAt: now, updatedAt: now },
+    ]);
+    const member = await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: memberUserId,
+      status: "active",
+      membershipRole: "operator",
+    }).returning().then((rows) => rows[0]!);
+    const agent = await db.insert(agents).values({
+      companyId: company.id,
+      name: "Worker",
+      role: "engineer",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    }).returning().then((rows) => rows[0]!);
+    const issue = await db.insert(issues).values({
+      companyId: company.id,
+      title: "Responsible work",
+      status: "todo",
+      responsibleUserId: memberUserId,
+    }).returning().then((rows) => rows[0]!);
+    const key = await db.insert(agentApiKeys).values({
+      companyId: company.id,
+      agentId: agent.id,
+      name: "member key",
+      keyHash: randomUUID(),
+      responsibleUserId: memberUserId,
+    }).returning().then((rows) => rows[0]!);
+    const access = accessService(db);
+
+    await expect(access.updateMember(company.id, member.id, { status: "suspended" }))
+      .rejects.toThrow("replacementResponsibleUserId is required");
+    expect((await db.select().from(companyMemberships).where(eq(companyMemberships.id, member.id)))[0]?.status).toBe("active");
+    expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0]?.responsibleUserId).toBe(memberUserId);
+
+    await access.updateMember(company.id, member.id, {
+      status: "suspended",
+      replacementResponsibleUserId: owner.principalId,
+      apiKeyDisposition: "transfer",
+    });
+    expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0]?.responsibleUserId).toBe(owner.principalId);
+    expect((await db.select().from(agentApiKeys).where(eq(agentApiKeys.id, key.id)))[0]?.responsibleUserId).toBe(owner.principalId);
   });
 
   it("rejects instance-level company access removal for self and protected users", async () => {

@@ -48,7 +48,7 @@ describe("issue validators", () => {
     expect(parsed.comment).toBe("Done\n\n- Verified the route");
   });
 
-  it("keeps issue attribution fields create-only", () => {
+  it("keeps creator attribution create-only while allowing responsible-user changes", () => {
     const created = createIssueSchema.parse({
       title: "Preserve attribution input for route checks",
       createdByUserId: "spoofed-creator",
@@ -63,7 +63,7 @@ describe("issue validators", () => {
     expect(created.createdByUserId).toBe("spoofed-creator");
     expect(created.responsibleUserId).toBe("spoofed-responsible");
     expect(updated).not.toHaveProperty("createdByUserId");
-    expect(updated).not.toHaveProperty("responsibleUserId");
+    expect(updated.responsibleUserId).toBe("spoofed-responsible");
   });
 
   it("allows false-positive recovery resolutions to atomically restore the source issue status", () => {

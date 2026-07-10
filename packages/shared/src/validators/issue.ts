@@ -284,6 +284,7 @@ export const resolveIssueRecoveryActionSchema = z.object({
   actionId: z.string().uuid().optional(),
   outcome: z.enum(RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES),
   sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked"]),
+  qaVerdict: z.enum(["pass", "fail"]).optional(),
   assigneeAgentId: z.string().uuid().optional().nullable(),
   clearAssignee: z.boolean().optional(),
   resolutionNote: multilineTextSchema.optional().nullable(),
@@ -456,7 +457,6 @@ export type CreateIssueLabel = z.infer<typeof createIssueLabelSchema>;
 
 export const updateIssueSchema = createIssueBaseSchema.omit({
   createdByUserId: true,
-  responsibleUserId: true,
   watchdog: true,
 }).partial().extend({
   requestDepth: issueRequestDepthInputSchema.optional(),

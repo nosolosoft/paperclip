@@ -852,6 +852,51 @@ export function agentService(db: Db) {
       return rows[0] ?? null;
     },
 
+    rotateKey: async (agentId: string, keyId: string, idempotencyKey: string, name?: string) => {
+      return db.transaction(async (tx) => {
+        const replay = await tx.select().from(agentApiKeys).where(and(
+          eq(agentApiKeys.agentId, agentId),
+          eq(agentApiKeys.rotatedFromKeyId, keyId),
+          eq(agentApiKeys.rotationIdempotencyKey, idempotencyKey),
+        )).then((rows) => rows[0] ?? null);
+        if (replay) return { key: replay, token: null, replayed: true };
+        await tx.execute(sql`
+          select ${agentApiKeys.id} from ${agentApiKeys}
+          where ${agentApiKeys.id} = ${keyId} and ${agentApiKeys.agentId} = ${agentId}
+          for update
+        `);
+        const replayAfterLock = await tx.select().from(agentApiKeys).where(and(
+          eq(agentApiKeys.agentId, agentId),
+          eq(agentApiKeys.rotatedFromKeyId, keyId),
+          eq(agentApiKeys.rotationIdempotencyKey, idempotencyKey),
+        )).then((rows) => rows[0] ?? null);
+        if (replayAfterLock) return { key: replayAfterLock, token: null, replayed: true };
+        const source = await tx.select().from(agentApiKeys).where(and(
+          eq(agentApiKeys.id, keyId),
+          eq(agentApiKeys.agentId, agentId),
+        )).then((rows) => rows[0] ?? null);
+        if (!source) throw notFound("Key not found");
+        if (source.revokedAt) throw conflict("Key is already revoked");
+        const token = createToken();
+        const now = new Date();
+        const created = await tx.insert(agentApiKeys).values({
+          agentId,
+          companyId: source.companyId,
+          name: name ?? source.name,
+          keyHash: hashToken(token),
+          responsibleUserId: source.responsibleUserId,
+          scopeConfig: source.scopeConfig,
+          rotatedFromKeyId: source.id,
+          rotationIdempotencyKey: idempotencyKey,
+        }).returning().then((rows) => rows[0]!);
+        await tx.update(agentApiKeys).set({ revokedAt: now }).where(and(
+          eq(agentApiKeys.id, source.id),
+          eq(agentApiKeys.agentId, agentId),
+        ));
+        return { key: created, token, replayed: false };
+      });
+    },
+
     orgForCompany: async (companyId: string) => {
       const allCompanyRows = await listCompanyAgentRows(companyId);
       const rows = allCompanyRows.filter((row) => row.status !== "terminated");

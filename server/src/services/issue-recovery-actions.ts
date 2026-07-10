@@ -337,9 +337,19 @@ export function issueRecoveryActionService(db: Db) {
         eq(issueRecoveryActions.revision, input.expectedRevision),
       ))
       .returning();
-    return updated
-      ? { kind: "transitioned", action: toReadModel(updated) }
-      : { kind: "conflict", action: null };
+    if (updated) return { kind: "transitioned", action: toReadModel(updated) };
+    const latest = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, input.companyId), eq(issueRecoveryActions.id, input.actionId)))
+      .then((rows) => rows[0] ?? null);
+    if (latest?.lastOperationId === input.operationId) {
+      return { kind: "idempotent", action: toReadModel(latest) };
+    }
+    if (latest?.status === "exhausted" && latest.nextRetryAt && latest.nextRetryAt.getTime() > Date.now()) {
+      return { kind: "not_due", action: toReadModel(latest) };
+    }
+    return { kind: "conflict", action: latest ? toReadModel(latest) : null };
   }
 
   return {

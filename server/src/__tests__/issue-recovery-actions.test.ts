@@ -51,6 +51,9 @@ function makeRecoveryActionRow(overrides: Record<string, unknown> = {}) {
     monitorPolicy: null,
     attemptCount: 1,
     maxAttempts: null,
+    revision: 0,
+    lastOperationId: null,
+    nextRetryAt: null,
     timeoutAt: null,
     lastAttemptAt: now,
     outcome: null,
@@ -154,6 +157,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const coderId = randomUUID();
     const qaCodeId = randomUUID();
     const qaBrowserId = randomUUID();
+    const qaSpecId = randomUUID();
     const sourceIssueId = randomUUID();
     const prefix = `RA${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`;
     await db.insert(companies).values({
@@ -210,6 +214,17 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         runtimeConfig: {},
         permissions: {},
       },
+      {
+        id: qaSpecId,
+        companyId,
+        name: "QA (Spec)",
+        role: "qa",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
     ]);
     await db.insert(issues).values({
       id: sourceIssueId,
@@ -222,7 +237,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       identifier: `${prefix}-1`,
     });
     const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
-    return { companyId, managerId, coderId, qaCodeId, qaBrowserId, sourceIssueId, prefix, sourceIssue: sourceIssue! };
+    return { companyId, managerId, coderId, qaCodeId, qaBrowserId, qaSpecId, sourceIssueId, prefix, sourceIssue: sourceIssue! };
   }
 
   async function seedHeartbeatRun(input: {
@@ -396,6 +411,52 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
     expect(replay.kind).toBe("idempotent");
     if (replay.kind === "idempotent") expect(replay.action.status).toBe("exhausted");
+  });
+
+  it("gates exhausted retries until nextRetryAt and allows the transition after it", async () => {
+    const { companyId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const action = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      cause: "retry-gate",
+      fingerprint: "retry-gate",
+      nextAction: "retry",
+    });
+    const exhausted = await svc.transitionRecovery({
+      companyId,
+      actionId: action.id,
+      expectedStatus: "active",
+      expectedRevision: action.revision,
+      operationId: "exhaust",
+      nextStatus: "exhausted",
+      nextRetryAt: new Date(Date.now() + 60_000),
+    });
+    expect(exhausted.kind).toBe("transitioned");
+    if (exhausted.kind !== "transitioned") return;
+
+    expect((await svc.transitionRecovery({
+      companyId,
+      actionId: action.id,
+      expectedStatus: "exhausted",
+      expectedRevision: exhausted.action.revision,
+      operationId: "early",
+      nextStatus: "active",
+    })).kind).toBe("not_due");
+
+    await db.update(issueRecoveryActions).set({ nextRetryAt: new Date(Date.now() - 1_000) })
+      .where(eq(issueRecoveryActions.id, action.id));
+    const due = await svc.transitionRecovery({
+      companyId,
+      actionId: action.id,
+      expectedStatus: "exhausted",
+      expectedRevision: exhausted.action.revision,
+      operationId: "due",
+      nextStatus: "dead_letter",
+    });
+    expect(due.kind).toBe("transitioned");
+    if (due.kind === "transitioned") expect(due.action.status).toBe("dead_letter");
   });
 
   it("reuses the same source-scoped action when latest run IDs change while the cause stays the same", async () => {
@@ -879,11 +940,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
   });
 
-  it("allows QA Browser recovery resolution to complete the issue and clear assignment", async () => {
-    const { companyId, managerId, qaBrowserId, sourceIssueId } = await seedCompany();
+  it("allows Spec QA recovery resolution to complete the issue and clear assignment", async () => {
+    const { companyId, managerId, qaBrowserId, qaSpecId, sourceIssueId } = await seedCompany();
     await db
       .update(issues)
-      .set({ status: "in_review", assigneeAgentId: qaBrowserId, assigneeUserId: null })
+      .set({ status: "in_review", assigneeAgentId: qaSpecId, assigneeUserId: null })
       .where(eq(issues.id, sourceIssueId));
     const recoveryActionSvc = issueRecoveryActionService(db);
     const action = await recoveryActionSvc.upsertSourceScoped({
@@ -891,9 +952,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       sourceIssueId,
       kind: "missing_disposition",
       ownerType: "agent",
-      ownerAgentId: qaBrowserId,
-      previousOwnerAgentId: qaBrowserId,
-      returnOwnerAgentId: qaBrowserId,
+      ownerAgentId: qaSpecId,
+      previousOwnerAgentId: qaSpecId,
+      returnOwnerAgentId: qaSpecId,
       cause: "successful_run_missing_state",
       fingerprint: "missing-disposition:qa-browser-pass",
       evidence: { qaBrowserPass: true },
@@ -902,8 +963,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
     const app = createApp({
       type: "agent",
-      agentId: qaBrowserId,
-      actorId: qaBrowserId,
+      agentId: qaSpecId,
+      actorId: qaSpecId,
       companyId,
       source: "agent",
     });
@@ -914,8 +975,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         actionId: action.id,
         outcome: "restored",
         sourceIssueStatus: "done",
+        qaVerdict: "pass",
         clearAssignee: true,
-        resolutionNote: "QA Browser PASS; complete the agent loop.",
+        resolutionNote: "Spec QA PASS; complete the agent loop.",
       });
     expect(resolved.status, JSON.stringify(resolved.body)).toBe(200);
 

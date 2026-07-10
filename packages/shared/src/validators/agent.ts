@@ -157,6 +157,12 @@ export const createAgentKeySchema = z.object({
 
 export type CreateAgentKey = z.infer<typeof createAgentKeySchema>;
 
+export const rotateAgentKeySchema = z.object({
+  name: z.string().min(1).optional(),
+});
+
+export type RotateAgentKey = z.infer<typeof rotateAgentKeySchema>;
+
 export const agentMineInboxQuerySchema = z.object({
   userId: z.string().trim().min(1),
   status: z.string().trim().min(1).optional().default(INBOX_MINE_ISSUE_STATUS_FILTER),

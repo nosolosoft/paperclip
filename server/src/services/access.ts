@@ -1,6 +1,8 @@
 import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  agentApiKeys,
+  companies,
   companyMemberships,
   instanceUserRoles,
   issues,
@@ -11,6 +13,7 @@ import { conflict } from "../errors.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "./authorization.js";
 import { ensureHumanRoleDefaultGrants } from "./principal-access-compatibility.js";
+import { validateResponsibleUser } from "./responsible-user.js";
 
 type MembershipRow = typeof companyMemberships.$inferSelect;
 type GrantInput = {
@@ -19,11 +22,15 @@ type GrantInput = {
 };
 
 type MemberArchiveInput = {
+  replacementResponsibleUserId?: string;
+  apiKeyDisposition?: "transfer" | "revoke";
   reassignment?: {
     assigneeAgentId?: string | null;
     assigneeUserId?: string | null;
   } | null;
 };
+
+type ResponsibilityTransitionInput = Pick<MemberArchiveInput, "replacementResponsibleUserId" | "apiKeyDisposition">;
 
 export function accessService(db: Db) {
   const authorization = authorizationService(db);
@@ -166,6 +173,8 @@ export function accessService(db: Db) {
     data: {
       membershipRole?: string | null;
       status?: "pending" | "active" | "suspended";
+      replacementResponsibleUserId?: string;
+      apiKeyDisposition?: "transfer" | "revoke";
       grants: GrantInput[];
     },
     grantedByUserId: string | null,
@@ -216,6 +225,9 @@ export function accessService(db: Db) {
       }
 
       const now = new Date();
+      if (existing.status === "active" && nextStatus !== "active" && existing.principalType === "user") {
+        await disposeMemberResponsibility(tx, companyId, existing.principalId, data);
+      }
       const updated = await tx
         .update(companyMemberships)
         .set({
@@ -348,12 +360,13 @@ export function accessService(db: Db) {
 
       await assertCanRemoveActiveOwner(
         companyId,
-        existing.principalType,
+        existing.principalType as PrincipalType,
         existing.status,
         existing.membershipRole,
         tx,
       );
       await assertAssignableArchiveTarget(companyId, input.reassignment, tx);
+      await disposeMemberResponsibility(tx, companyId, existing.principalId, input);
 
       const now = new Date();
       const assignmentPatch = {
@@ -719,6 +732,8 @@ export function accessService(db: Db) {
     data: {
       membershipRole?: string | null;
       status?: "pending" | "active" | "suspended";
+      replacementResponsibleUserId?: string;
+      apiKeyDisposition?: "transfer" | "revoke";
     },
   ) {
     return db.transaction(async (tx) => {
@@ -766,6 +781,10 @@ export function accessService(db: Db) {
         }
       }
 
+      if (existing.status === "active" && nextStatus !== "active" && existing.principalType === "user") {
+        await disposeMemberResponsibility(tx, companyId, existing.principalId, data);
+      }
+
       return tx
         .update(companyMemberships)
         .set({
@@ -803,4 +822,78 @@ export function accessService(db: Db) {
     setPrincipalPermission,
     updateMember,
   };
+  async function disposeMemberResponsibility(
+    tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
+    companyId: string,
+    userId: string,
+    input: ResponsibilityTransitionInput,
+  ) {
+    await tx.execute(sql`
+      select ${agentApiKeys.id}
+      from ${agentApiKeys}
+      where ${agentApiKeys.companyId} = ${companyId}
+        and ${agentApiKeys.responsibleUserId} = ${userId}
+        and ${agentApiKeys.revokedAt} is null
+      for update
+    `);
+    const [company, responsibleIssues, activeKeys] = await Promise.all([
+      tx.select({ id: companies.id }).from(companies).where(and(
+        eq(companies.id, companyId),
+        eq(companies.defaultResponsibleUserId, userId),
+      )),
+      tx.select({ id: issues.id }).from(issues).where(and(
+        eq(issues.companyId, companyId),
+        eq(issues.responsibleUserId, userId),
+      )),
+      tx.select({ id: agentApiKeys.id }).from(agentApiKeys).where(and(
+        eq(agentApiKeys.companyId, companyId),
+        eq(agentApiKeys.responsibleUserId, userId),
+        sql`${agentApiKeys.revokedAt} is null`,
+      )),
+    ]);
+    const hasReferences = company.length > 0 || responsibleIssues.length > 0;
+    if (hasReferences && !input.replacementResponsibleUserId) {
+      throw conflict("replacementResponsibleUserId is required for responsible member removal");
+    }
+    if (activeKeys.length > 0 && !input.apiKeyDisposition) {
+      throw conflict("apiKeyDisposition is required for a member with active agent API keys");
+    }
+    if (input.apiKeyDisposition === "transfer" && !input.replacementResponsibleUserId) {
+      throw conflict("replacementResponsibleUserId is required to transfer API keys");
+    }
+    if (input.replacementResponsibleUserId) {
+      if (input.replacementResponsibleUserId === userId) {
+        throw conflict("Replacement responsible user cannot be the removed member");
+      }
+      const validation = await validateResponsibleUser(tx, {
+        companyId,
+        userId: input.replacementResponsibleUserId,
+      });
+      if (!validation.valid) {
+        throw conflict(`Replacement responsible user is invalid: ${validation.reason}`);
+      }
+      await tx.update(companies).set({
+        defaultResponsibleUserId: input.replacementResponsibleUserId,
+        updatedAt: new Date(),
+      }).where(and(eq(companies.id, companyId), eq(companies.defaultResponsibleUserId, userId)));
+      await tx.update(issues).set({
+        responsibleUserId: input.replacementResponsibleUserId,
+        updatedAt: new Date(),
+      }).where(and(eq(issues.companyId, companyId), eq(issues.responsibleUserId, userId)));
+    }
+    if (input.apiKeyDisposition === "revoke") {
+      await tx.update(agentApiKeys).set({ revokedAt: new Date() }).where(and(
+        eq(agentApiKeys.companyId, companyId),
+        eq(agentApiKeys.responsibleUserId, userId),
+        sql`${agentApiKeys.revokedAt} is null`,
+      ));
+    } else if (input.apiKeyDisposition === "transfer") {
+      await tx.update(agentApiKeys).set({ responsibleUserId: input.replacementResponsibleUserId! }).where(and(
+        eq(agentApiKeys.companyId, companyId),
+        eq(agentApiKeys.responsibleUserId, userId),
+        sql`${agentApiKeys.revokedAt} is null`,
+      ));
+    }
+    return { responsibleIssueCount: responsibleIssues.length, activeKeyCount: activeKeys.length };
+  }
 }

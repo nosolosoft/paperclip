@@ -17,7 +17,7 @@ import {
   updateCompanyBrandingSchema,
   updateCompanySchema,
 } from "@paperclipai/shared";
-import { badRequest, forbidden } from "../errors.js";
+import { badRequest, forbidden, HttpError } from "../errors.js";
 import { validate } from "../middleware/validate.js";
 import {
   accessService,
@@ -33,6 +33,7 @@ import {
 import type { StorageService } from "../storage/types.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
 import { COMPANY_IMPORT_ROUTE_PATH } from "./company-import-paths.js";
+import { validateResponsibleUser } from "../services/responsible-user.js";
 
 export function companyRoutes(db: Db, storage?: StorageService) {
   const router = Router();
@@ -428,6 +429,19 @@ export function companyRoutes(db: Db, storage?: StorageService) {
     if (!existingCompany) {
       res.status(404).json({ error: "Company not found" });
       return;
+    }
+
+    if (body.defaultResponsibleUserId !== undefined && body.defaultResponsibleUserId !== null) {
+      const validation = await validateResponsibleUser(db, {
+        companyId,
+        userId: body.defaultResponsibleUserId as string,
+      });
+      if (!validation.valid) {
+        throw new HttpError(422, "Invalid default responsible user", {
+          code: `responsible_user_${validation.reason}`,
+          reason: validation.reason,
+        });
+      }
     }
 
     if (req.actor.type !== "agent") {

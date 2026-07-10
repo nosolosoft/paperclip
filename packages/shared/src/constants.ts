@@ -303,6 +303,8 @@ export type IssueRecoveryActionKind = (typeof ISSUE_RECOVERY_ACTION_KINDS)[numbe
 export const ISSUE_RECOVERY_ACTION_STATUSES = [
   "active",
   "escalated",
+  "exhausted",
+  "dead_letter",
   "resolved",
   "cancelled",
 ] as const;

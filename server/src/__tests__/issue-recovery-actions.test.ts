@@ -350,6 +350,54 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  it("transitions an exhausted action once with CAS and replays the same operation idempotently", async () => {
+    const { companyId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const action = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      cause: "test",
+      fingerprint: "cas",
+      nextAction: "retry",
+      maxAttempts: 1,
+    });
+
+    const [first, second] = await Promise.all([
+      svc.transitionRecovery({
+        companyId,
+        actionId: action.id,
+        expectedStatus: "active",
+        expectedRevision: action.revision,
+        operationId: "op-1",
+        nextStatus: "exhausted",
+        nextRetryAt: new Date(Date.now() + 60_000),
+      }),
+      svc.transitionRecovery({
+        companyId,
+        actionId: action.id,
+        expectedStatus: "active",
+        expectedRevision: action.revision,
+        operationId: "op-2",
+        nextStatus: "exhausted",
+        nextRetryAt: new Date(Date.now() + 60_000),
+      }),
+    ]);
+    expect([first.kind, second.kind].sort()).toEqual(["not_due", "transitioned"]);
+
+    const replay = await svc.transitionRecovery({
+      companyId,
+      actionId: action.id,
+      expectedStatus: "active",
+      expectedRevision: action.revision,
+      operationId: "op-1",
+      nextStatus: "exhausted",
+      nextRetryAt: new Date(Date.now() + 60_000),
+    });
+    expect(replay.kind).toBe("idempotent");
+    if (replay.kind === "idempotent") expect(replay.action.status).toBe("exhausted");
+  });
+
   it("reuses the same source-scoped action when latest run IDs change while the cause stays the same", async () => {
     const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
     const enqueueWakeup = vi.fn(async () => null);

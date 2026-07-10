@@ -506,6 +506,9 @@ export interface IssueRecoveryAction {
   monitorPolicy: Record<string, unknown> | null;
   attemptCount: number;
   maxAttempts: number | null;
+  revision: number;
+  lastOperationId: string | null;
+  nextRetryAt: Date | string | null;
   timeoutAt: Date | string | null;
   lastAttemptAt: Date | string | null;
   outcome: IssueRecoveryActionOutcome | null;

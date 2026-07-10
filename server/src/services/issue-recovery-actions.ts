@@ -46,6 +46,20 @@ export type ResolveIssueRecoveryActionInput = {
   resolutionNote?: string | null;
 };
 
+export type TransitionRecoveryInput = {
+  companyId: string;
+  actionId: string;
+  expectedStatus: IssueRecoveryActionStatus;
+  expectedRevision: number;
+  operationId: string;
+  nextStatus: IssueRecoveryActionStatus;
+  nextRetryAt?: Date | null;
+};
+
+export type TransitionRecoveryResult =
+  | { kind: "transitioned" | "idempotent"; action: IssueRecoveryAction }
+  | { kind: "conflict" | "not_due"; action: IssueRecoveryAction | null };
+
 function toReadModel(row: IssueRecoveryActionRow): IssueRecoveryAction {
   return {
     id: row.id,
@@ -67,6 +81,9 @@ function toReadModel(row: IssueRecoveryActionRow): IssueRecoveryAction {
     monitorPolicy: row.monitorPolicy,
     attemptCount: row.attemptCount,
     maxAttempts: row.maxAttempts,
+    revision: row.revision,
+    lastOperationId: row.lastOperationId,
+    nextRetryAt: row.nextRetryAt,
     timeoutAt: row.timeoutAt,
     lastAttemptAt: row.lastAttemptAt,
     outcome: row.outcome as IssueRecoveryAction["outcome"],
@@ -200,6 +217,9 @@ export function issueRecoveryActionService(db: Db) {
           maxAttempts: input.maxAttempts ?? null,
           timeoutAt: input.timeoutAt ?? null,
           lastAttemptAt: input.lastAttemptAt ?? now,
+          revision: existing.revision + 1,
+          lastOperationId: null,
+          nextRetryAt: null,
           outcome: null,
           resolutionNote: null,
           resolvedAt: null,
@@ -242,6 +262,9 @@ export function issueRecoveryActionService(db: Db) {
           maxAttempts: input.maxAttempts ?? null,
           timeoutAt: input.timeoutAt ?? null,
           lastAttemptAt: input.lastAttemptAt ?? now,
+          revision: 0,
+          lastOperationId: null,
+          nextRetryAt: null,
         })
         .returning();
       return toReadModel(created!);
@@ -286,10 +309,44 @@ export function issueRecoveryActionService(db: Db) {
     return updated ? toReadModel(updated) : null;
   }
 
+  async function transitionRecovery(input: TransitionRecoveryInput): Promise<TransitionRecoveryResult> {
+    const current = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, input.companyId), eq(issueRecoveryActions.id, input.actionId)))
+      .then((rows) => rows[0] ?? null);
+    if (!current) return { kind: "conflict", action: null };
+    if (current.lastOperationId === input.operationId) return { kind: "idempotent", action: toReadModel(current) };
+    if (current.status === "exhausted" && current.nextRetryAt && current.nextRetryAt.getTime() > Date.now()) {
+      return { kind: "not_due", action: toReadModel(current) };
+    }
+    const now = new Date();
+    const [updated] = await db
+      .update(issueRecoveryActions)
+      .set({
+        status: input.nextStatus,
+        nextRetryAt: input.nextRetryAt ?? null,
+        lastOperationId: input.operationId,
+        revision: current.revision + 1,
+        updatedAt: now,
+      })
+      .where(and(
+        eq(issueRecoveryActions.companyId, input.companyId),
+        eq(issueRecoveryActions.id, input.actionId),
+        eq(issueRecoveryActions.status, input.expectedStatus),
+        eq(issueRecoveryActions.revision, input.expectedRevision),
+      ))
+      .returning();
+    return updated
+      ? { kind: "transitioned", action: toReadModel(updated) }
+      : { kind: "conflict", action: null };
+  }
+
   return {
     getActiveForIssue,
     listActiveForIssues,
     resolveActiveForIssue,
+    transitionRecovery,
     upsertSourceScoped,
   };
 }

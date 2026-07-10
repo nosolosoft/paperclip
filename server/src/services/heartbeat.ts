@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -5561,7 +5561,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .where(eq(companies.id, companyId))
       .then((rows) => rows[0] ?? null);
     const explicitDefault = readNonEmptyString(company?.defaultResponsibleUserId);
-    if (explicitDefault) return explicitDefault;
+    if (explicitDefault) {
+      const membership = await db
+        .select({ id: companyMemberships.id })
+        .from(companyMemberships)
+        .where(and(
+          eq(companyMemberships.companyId, companyId),
+          eq(companyMemberships.principalType, "user"),
+          eq(companyMemberships.principalId, explicitDefault),
+          eq(companyMemberships.status, "active"),
+          ne(companyMemberships.membershipRole, "viewer"),
+        ))
+        .then((rows) => rows[0] ?? null);
+      if (membership) return explicitDefault;
+    }
 
     const owner = await db
       .select({ userId: companyMemberships.principalId })
@@ -5579,20 +5592,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
     if (owner?.userId) return owner.userId;
 
-    const firstUser = await db
-      .select({ userId: companyMemberships.principalId })
-      .from(companyMemberships)
-      .where(
-        and(
-          eq(companyMemberships.companyId, companyId),
-          eq(companyMemberships.principalType, "user"),
-          eq(companyMemberships.status, "active"),
-        ),
-      )
-      .orderBy(asc(companyMemberships.createdAt), asc(companyMemberships.id))
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-    return firstUser?.userId ?? null;
+    return null;
   }
 
   async function resolveParentIssueResponsibleUserId(companyId: string, parentId: string | null | undefined) {

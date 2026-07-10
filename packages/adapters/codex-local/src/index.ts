@@ -83,6 +83,7 @@ Core fields:
 - command (string, optional): defaults to "codex"
 - extraArgs (string[], optional): additional CLI args
 - env (object, optional): KEY=VALUE environment variables
+- mcpServers (object, optional): named stdio MCP servers, each with required command and optional args, cwd, and env fields; Paperclip injects these into the effective Codex home only for the run and restores the prior config afterward
 - workspaceStrategy (object, optional): execution workspace strategy; currently supports { type: "git_worktree", baseRef?, branchTemplate?, worktreeParentDir? }
 - workspaceRuntime (object, optional): reserved for workspace runtime metadata; workspace runtime services are manually controlled from the workspace UI and are not auto-started by heartbeats
 

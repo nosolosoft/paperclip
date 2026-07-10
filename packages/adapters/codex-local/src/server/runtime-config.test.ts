@@ -413,4 +413,64 @@ describe("prepareCodexRuntimeConfig", () => {
     const content = await readConfigToml(home);
     expect(content).toBe("model = \"gpt-5.1-codex\"\n");
   });
+
+  it("merges declared MCP servers for the run and restores conflicting user configuration", async () => {
+    const original = [
+      'model = "gpt-5.1-codex"',
+      "",
+      "[mcp_servers.playwright]",
+      'command = "old-playwright"',
+      "",
+    ].join("\n");
+    const home = await makeCodexHome(original);
+
+    const prepared = await prepareCodexRuntimeConfig({
+      env: {},
+      codexHome: home,
+      mcpServers: {
+        playwright: {
+          command: "npx",
+          args: ["-y", "@playwright/mcp@latest", "--headless", "--browser", "chrome"],
+        },
+      },
+    });
+
+    const content = await readConfigToml(home);
+    expect(content).toContain("[mcp_servers.playwright]");
+    expect(content).toContain('command = "npx"');
+    expect(content).toContain('args = ["-y", "@playwright/mcp@latest", "--headless", "--browser", "chrome"]');
+    expect(content).not.toContain("old-playwright");
+
+    await prepared.cleanup();
+    expect(await readConfigToml(home)).toBe(original);
+  });
+
+  it("ignores malformed declared MCP servers without changing the existing config", async () => {
+    const original = 'model = "gpt-5.1-codex"\n';
+    const home = await makeCodexHome(original);
+
+    const prepared = await prepareCodexRuntimeConfig({
+      env: {},
+      codexHome: home,
+      mcpServers: { playwright: { args: ["-y", "@playwright/mcp@latest"] } },
+    });
+
+    expect(prepared.notes).toContain("codex_local mcpServers skipped invalid server(s): playwright.");
+    expect(await readConfigToml(home)).toBe(original);
+    await prepared.cleanup();
+  });
+
+  it("self-heals a stale managed MCP block after an interrupted run", async () => {
+    const home = await makeCodexHome();
+    await prepareCodexRuntimeConfig({
+      env: {},
+      codexHome: home,
+      mcpServers: { playwright: { command: "npx", args: ["-y", "@playwright/mcp@latest"] } },
+    });
+
+    const prepared = await prepareCodexRuntimeConfig({ env: {}, codexHome: home });
+    expect(prepared.notes.some((note) => note.includes("backup"))).toBe(true);
+    expect(await readConfigToml(home)).toBe("");
+    await prepared.cleanup();
+  });
 });

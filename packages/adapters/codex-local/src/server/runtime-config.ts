@@ -11,6 +11,13 @@ type ParsedCodexProvidersConfig = {
   modelProvider: string | null;
 };
 
+type ParsedCodexMcpServer = {
+  command: string;
+  args?: string[];
+  cwd?: string;
+  env?: Record<string, string>;
+};
+
 // Marker comments delimiting the Paperclip-managed regions of config.toml.
 // TOML requires root-level keys (model_provider) to appear before the first
 // table header, while [model_providers.*] tables must not swallow the user's
@@ -143,6 +150,58 @@ function parseCodexProvidersConfig(
   return { providers, modelProvider };
 }
 
+function parseCodexMcpServersConfig(
+  raw: unknown,
+  notes: string[],
+): Record<string, ParsedCodexMcpServer> {
+  if (raw === undefined || raw === null) return {};
+  if (!isPlainObject(raw)) {
+    notes.push("codex_local mcpServers must be an object; MCP servers ignored.");
+    return {};
+  }
+
+  const servers: Record<string, ParsedCodexMcpServer> = {};
+  const skipped: string[] = [];
+  for (const [name, value] of Object.entries(raw)) {
+    if (name.trim().length === 0 || !isPlainObject(value)) {
+      skipped.push(name.trim().length === 0 ? "(empty name)" : name);
+      continue;
+    }
+    const command = typeof value.command === "string" ? value.command.trim() : "";
+    if (!command) {
+      skipped.push(name);
+      continue;
+    }
+    const server: ParsedCodexMcpServer = { command };
+    if (value.args !== undefined) {
+      if (!Array.isArray(value.args) || value.args.some((entry) => typeof entry !== "string")) {
+        skipped.push(name);
+        continue;
+      }
+      server.args = value.args;
+    }
+    if (value.cwd !== undefined) {
+      if (typeof value.cwd !== "string" || value.cwd.trim().length === 0) {
+        skipped.push(name);
+        continue;
+      }
+      server.cwd = value.cwd.trim();
+    }
+    if (value.env !== undefined) {
+      if (!isPlainObject(value.env) || Object.values(value.env).some((entry) => typeof entry !== "string")) {
+        skipped.push(name);
+        continue;
+      }
+      server.env = value.env as Record<string, string>;
+    }
+    servers[name] = server;
+  }
+  if (skipped.length > 0) {
+    notes.push(`codex_local mcpServers skipped invalid server(s): ${skipped.join(", ")}.`);
+  }
+  return servers;
+}
+
 function escapeTomlString(value: string): string {
   // TOML 1.0 basic strings require escaping U+0000-U+001F and U+007F (DEL).
   return value.replace(/[\\"\u0000-\u001f\u007f]/g, (char) => {
@@ -203,6 +262,14 @@ function emitProviderTable(name: string, fields: Record<string, unknown>): strin
   return lines;
 }
 
+function emitMcpServerTable(name: string, server: ParsedCodexMcpServer): string[] {
+  const lines = [`[mcp_servers.${tomlKey(name)}]`, `command = ${tomlValue(server.command)}`];
+  if (server.args !== undefined) lines.push(`args = ${tomlValue(server.args)}`);
+  if (server.cwd !== undefined) lines.push(`cwd = ${tomlValue(server.cwd)}`);
+  if (server.env !== undefined) lines.push(`env = ${tomlValue(server.env)}`);
+  return lines;
+}
+
 function stripManagedBlock(lines: string[], begin: string, end: string): string[] {
   const out: string[] = [];
   let inBlock = false;
@@ -250,9 +317,11 @@ function parseTableHeaderPath(line: string): string[] | null {
 function stripConflictingDefinitions(
   content: string,
   providerNames: string[],
+  mcpServerNames: string[],
   removeRootModelProvider: boolean,
 ): string {
   const names = new Set(providerNames);
+  const mcpNames = new Set(mcpServerNames);
   const lines = content.split("\n");
   const out: string[] = [];
   let inRootRegion = true;
@@ -262,9 +331,12 @@ function stripConflictingDefinitions(
     if (headerPath) {
       inRootRegion = false;
       skippingSection =
-        headerPath.length >= 2 &&
-        headerPath[0] === "model_providers" &&
-        names.has(headerPath[1]);
+        (headerPath.length >= 2 &&
+          headerPath[0] === "model_providers" &&
+          names.has(headerPath[1])) ||
+        (headerPath.length >= 2 &&
+          headerPath[0] === "mcp_servers" &&
+          mcpNames.has(headerPath[1]));
       if (skippingSection) continue;
     } else if (skippingSection) {
       continue;
@@ -277,9 +349,13 @@ function stripConflictingDefinitions(
   return out.join("\n");
 }
 
-function buildMergedConfigToml(base: string, parsed: ParsedCodexProvidersConfig): string {
+function buildMergedConfigToml(
+  base: string,
+  parsed: ParsedCodexProvidersConfig | null,
+  mcpServers: Record<string, ParsedCodexMcpServer>,
+): string {
   const sections: string[] = [];
-  if (parsed.modelProvider) {
+  if (parsed?.modelProvider) {
     sections.push(
       [
         MANAGED_ROOT_BEGIN,
@@ -291,8 +367,11 @@ function buildMergedConfigToml(base: string, parsed: ParsedCodexProvidersConfig)
   const trimmedBase = base.replace(/^\n+/, "").replace(/\n+$/, "");
   if (trimmedBase.length > 0) sections.push(trimmedBase);
   const tableLines: string[] = [MANAGED_TABLES_BEGIN];
-  for (const [name, fields] of Object.entries(parsed.providers)) {
+  for (const [name, fields] of Object.entries(parsed?.providers ?? {})) {
     tableLines.push(...emitProviderTable(name, fields), "");
+  }
+  for (const [name, server] of Object.entries(mcpServers)) {
+    tableLines.push(...emitMcpServerTable(name, server), "");
   }
   while (tableLines[tableLines.length - 1] === "") tableLines.pop();
   tableLines.push(MANAGED_TABLES_END);
@@ -336,6 +415,7 @@ function configTomlBackupPath(configTomlPath: string): string {
 export async function prepareCodexRuntimeConfig(input: {
   env: Record<string, string>;
   codexHome: string | null;
+  mcpServers?: unknown;
 }): Promise<PreparedCodexRuntimeConfig> {
   const resolveEnv = (name: string): string | undefined => input.env[name] ?? process.env[name];
   const notes: string[] = [];
@@ -344,8 +424,11 @@ export async function prepareCodexRuntimeConfig(input: {
     resolveEnv,
     notes,
   );
+  const mcpServers = parseCodexMcpServersConfig(input.mcpServers, notes);
+  const providerNames = Object.keys(parsed?.providers ?? {});
+  const mcpServerNames = Object.keys(mcpServers);
 
-  if (!parsed) {
+  if (!parsed && mcpServerNames.length === 0) {
     // Self-heal state left behind by a crashed run (cleanup() never ran).
     if (input.codexHome) {
       const configTomlPath = path.join(input.codexHome, "config.toml");
@@ -388,7 +471,7 @@ export async function prepareCodexRuntimeConfig(input: {
     return {
       notes: [
         ...notes,
-        "PAPERCLIP_CODEX_PROVIDERS is set but the adapter config explicitly sets env.CODEX_HOME; leaving the user-managed Codex home untouched (no model provider merge).",
+        "Paperclip Codex runtime configuration is declared but the adapter config explicitly sets env.CODEX_HOME; leaving the user-managed Codex home untouched.",
       ],
       cleanup: async () => {},
     };
@@ -399,23 +482,27 @@ export async function prepareCodexRuntimeConfig(input: {
   // A surviving backup from an interrupted run is the true pre-run content;
   // the current config.toml would still carry that run's managed blocks.
   const original = (await readFileOrNull(backupPath)) ?? (await readFileOrNull(configTomlPath));
-  const providerNames = Object.keys(parsed.providers);
   const base = stripConflictingDefinitions(
     stripManagedCodexProviderBlocks(original ?? ""),
     providerNames,
-    parsed.modelProvider !== null,
+    mcpServerNames,
+    parsed?.modelProvider !== null,
   );
   await fs.mkdir(input.codexHome, { recursive: true });
   // Persist the original BEFORE writing the merged file so a run that never
   // reaches cleanup() can be restored by the next prepare.
   await fs.writeFile(backupPath, original ?? "", "utf8");
-  await fs.writeFile(configTomlPath, buildMergedConfigToml(base, parsed), "utf8");
+  await fs.writeFile(configTomlPath, buildMergedConfigToml(base, parsed, mcpServers), "utf8");
 
+  const mergedParts = [
+    providerNames.length > 0 ? `${providerNames.length} custom Codex model provider(s): ${providerNames.join(", ")}` : "",
+    mcpServerNames.length > 0 ? `${mcpServerNames.length} MCP server(s): ${mcpServerNames.join(", ")}` : "",
+  ].filter(Boolean);
   return {
     notes: [
       ...notes,
-      `Merged ${providerNames.length} custom Codex model provider(s) from PAPERCLIP_CODEX_PROVIDERS into "${configTomlPath}": ${providerNames.join(", ")}${
-        parsed.modelProvider ? `; selected model_provider "${parsed.modelProvider}"` : ""
+      `Merged ${mergedParts.join("; ")} into "${configTomlPath}"${
+        parsed?.modelProvider ? `; selected model_provider "${parsed.modelProvider}"` : ""
       }.`,
     ],
     cleanup: async () => {

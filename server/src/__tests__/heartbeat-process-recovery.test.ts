@@ -101,6 +101,7 @@ import {
   heartbeatService,
   redactDetectedSuccessfulRunProgressSummaryForBoard,
 } from "../services/heartbeat.ts";
+import { issueThreadInteractionService } from "../services/issue-thread-interactions.ts";
 import { secretService } from "../services/secrets.ts";
 import {
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
@@ -1831,6 +1832,92 @@ async function seedQueuedIssueRunFixture() {
     );
     // Terminal run cleanup releases the checkout lock so future checkout 409s only mean a live owner exists.
     expect(checkoutReleasedIssue?.checkoutRunId).toBeNull();
+  });
+
+  it("finalizes a lost run's workspace as failed and expires its pending confirmation", async () => {
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      agentStatus: "idle",
+      processPid: 999_999_999,
+    });
+    const projectId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const startedAt = new Date("2026-03-19T00:00:01.000Z");
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspace project",
+      status: "in_progress",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      sourceIssueId: issueId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "lost-run-worktree",
+      status: "active",
+      providerType: "git_worktree",
+    });
+    await db
+      .update(issues)
+      .set({ executionWorkspaceId })
+      .where(eq(issues.id, issueId));
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      heartbeatRunId: runId,
+      issueId,
+      phase: "worktree_prepare",
+      status: "succeeded",
+      startedAt,
+    });
+
+    const interaction = await issueThreadInteractionService(db).create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "none",
+      sourceRunId: runId,
+      payload: {
+        version: 1,
+        prompt: "Approve this lost run?",
+      },
+    }, {
+      agentId,
+    });
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.reapOrphanedRuns();
+
+    const operations = await db
+      .select()
+      .from(workspaceOperations)
+      .where(and(
+        eq(workspaceOperations.executionWorkspaceId, executionWorkspaceId),
+        eq(workspaceOperations.heartbeatRunId, runId),
+      ));
+    expect(operations.filter((operation) => operation.phase === "workspace_finalize")).toMatchObject([
+      expect.objectContaining({ status: "failed" }),
+    ]);
+
+    const resolved = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, interaction.id))
+      .then((rows) => rows[0]);
+    expect(resolved).toMatchObject({
+      status: "expired",
+      result: {
+        version: 1,
+        outcome: "source_run_terminal",
+        sourceRunId: runId,
+        sourceRunStatus: "failed",
+        sourceRunErrorCode: "process_lost",
+      },
+    });
   });
 
   it("releases active environment leases when an orphaned run is reaped", async () => {

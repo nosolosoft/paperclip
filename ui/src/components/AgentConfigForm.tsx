@@ -14,7 +14,10 @@ import { environmentsApi } from "../api/environments";
 import { instanceSettingsApi } from "../api/instanceSettings";
 import { secretsApi } from "../api/secrets";
 import { assetsApi } from "../api/assets";
-import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "@paperclipai/adapter-codex-local";
+import {
+  DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX,
+  DEFAULT_CODEX_LOCAL_MODEL,
+} from "@paperclipai/adapter-codex-local";
 import { DEFAULT_CURSOR_LOCAL_MODEL } from "@paperclipai/adapter-cursor-local";
 import { DEFAULT_GEMINI_LOCAL_MODEL } from "@paperclipai/adapter-gemini-local";
 import { DEFAULT_OPENCODE_LOCAL_MODEL } from "@paperclipai/adapter-opencode-local";
@@ -1116,6 +1119,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                     const { adapterType: _at, ...defaults } = defaultCreateValues;
                     const nextValues: CreateConfigValues = { ...defaults, adapterType: t };
                     if (t === "codex_local") {
+                      nextValues.model = DEFAULT_CODEX_LOCAL_MODEL;
                       nextValues.dangerouslyBypassSandbox =
                         DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX;
                     } else if (t === "gemini_local") {
@@ -1135,7 +1139,9 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                       modelProfiles: { cheap: { cleared: true } },
                       adapterConfig: {
                         model:
-                          t === "gemini_local"
+                          t === "codex_local"
+                            ? DEFAULT_CODEX_LOCAL_MODEL
+                            : t === "gemini_local"
                             ? DEFAULT_GEMINI_LOCAL_MODEL
                             : t === "opencode_local"
                               ? DEFAULT_OPENCODE_LOCAL_MODEL

@@ -112,6 +112,7 @@ import {
   sanitizeRuntimeServiceBaseEnv,
 } from "./workspace-runtime.js";
 import { issueService } from "./issues.js";
+import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeIdempotencyKey,
@@ -5278,6 +5279,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     environmentRuntime,
   });
   const workspaceOperationsSvc = workspaceOperationService(db);
+  const issueThreadInteractionsSvc = issueThreadInteractionService(db);
   const liveRunExecutions = {
     has(id: string) {
       return runningProcesses.has(id) || activeRunExecutions.has(id);
@@ -10487,6 +10489,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (!finalizedRun) finalizedRun = await getRun(run.id);
       if (!finalizedRun) continue;
       finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
+      const orphanedWorkspaceOperations = await db
+        .select({
+          executionWorkspaceId: workspaceOperations.executionWorkspaceId,
+          issueId: workspaceOperations.issueId,
+          phase: workspaceOperations.phase,
+        })
+        .from(workspaceOperations)
+        .where(and(
+          eq(workspaceOperations.companyId, finalizedRun.companyId),
+          eq(workspaceOperations.heartbeatRunId, finalizedRun.id),
+        ));
+      const workspacesNeedingFinalize = new Map<string, string | null>();
+      for (const operation of orphanedWorkspaceOperations) {
+        if (!operation.executionWorkspaceId || operation.phase === "workspace_finalize") continue;
+        if (!workspacesNeedingFinalize.has(operation.executionWorkspaceId)) {
+          workspacesNeedingFinalize.set(operation.executionWorkspaceId, operation.issueId ?? null);
+        }
+      }
+      for (const [executionWorkspaceId, issueId] of workspacesNeedingFinalize) {
+        try {
+          const recorder = workspaceOperationsSvc.createRecorder({
+            companyId: finalizedRun.companyId,
+            heartbeatRunId: finalizedRun.id,
+            executionWorkspaceId,
+            issueId,
+          });
+          await recorder.recordOperation({
+            phase: "workspace_finalize",
+            metadata: {
+              reason: "process_lost",
+              sourceRunId: finalizedRun.id,
+            },
+            run: async () => ({
+              status: "failed",
+              stderr: "Heartbeat process was lost before workspace finalization completed.\n",
+            }),
+          });
+        } catch (error) {
+          logger.warn(
+            { err: error, runId: finalizedRun.id, executionWorkspaceId },
+            "failed to record workspace_finalize=failed for orphaned heartbeat run",
+          );
+        }
+      }
+      await issueThreadInteractionsSvc.expireRequestConfirmationsForTerminalSourceRun({
+        companyId: finalizedRun.companyId,
+        sourceRunId: finalizedRun.id,
+      });
       await releaseEnvironmentLeasesForRun({
         runId: finalizedRun.id,
         companyId: finalizedRun.companyId,

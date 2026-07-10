@@ -1031,10 +1031,13 @@ export interface RequestCheckboxConfirmationPayload {
 
 export interface RequestConfirmationResult {
   version: 1;
-  outcome: "accepted" | "rejected" | "superseded_by_comment" | "stale_target";
+  outcome: "accepted" | "rejected" | "superseded_by_comment" | "stale_target" | "source_run_terminal";
   reason?: string | null;
   commentId?: string | null;
   staleTarget?: RequestConfirmationTarget | null;
+  sourceRunId?: string | null;
+  sourceRunStatus?: "failed" | "cancelled" | "timed_out" | null;
+  sourceRunErrorCode?: string | null;
 }
 
 export interface RequestCheckboxConfirmationResult extends RequestConfirmationResult {

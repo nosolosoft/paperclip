@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Agent, Environment } from "@paperclipai/shared";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AgentConfigForm } from "./AgentConfigForm";
+import { defaultCreateValues } from "./agent-config-defaults";
 
 const mockAgentsApi = vi.hoisted(() => ({
   adapterModelProfiles: vi.fn(),
@@ -93,7 +94,7 @@ vi.mock("../adapters/use-adapter-capabilities", () => ({
 }));
 
 vi.mock("../adapters/use-disabled-adapters", () => ({
-  useDisabledAdaptersSync: () => [],
+  useDisabledAdaptersSync: () => new Set<string>(),
 }));
 
 vi.mock("./MarkdownEditor", () => ({
@@ -221,6 +222,36 @@ async function renderForm(
   return { container, root };
 }
 
+async function renderCreateForm(onChange: (patch: Record<string, unknown>) => void) {
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  const root = createRoot(container);
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false },
+      mutations: { retry: false },
+    },
+  });
+
+  await act(async () => {
+    root.render(
+      <QueryClientProvider client={queryClient}>
+        <TooltipProvider>
+          <AgentConfigForm
+            mode="create"
+            values={defaultCreateValues}
+            onChange={onChange}
+            hidePromptTemplate
+          />
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+  });
+
+  await flushReact();
+  return { container, root };
+}
+
 describe("AgentConfigForm environment selector", () => {
   let roots: Root[] = [];
 
@@ -260,6 +291,36 @@ describe("AgentConfigForm environment selector", () => {
 
     expect(result.container.textContent).not.toContain("Environment override");
     expect(result.container.querySelector("select")).toBeNull();
+  });
+
+  it("selects GPT-5.6 Sol explicitly when creating a Codex agent", async () => {
+    const onChange = vi.fn();
+    const result = await renderCreateForm(onChange);
+    roots.push(result.root);
+
+    const adapterButton = Array.from(result.container.querySelectorAll("button")).find(
+      (button) => button.textContent?.trim() === "Claude Code",
+    );
+    expect(adapterButton).toBeTruthy();
+
+    await act(async () => {
+      adapterButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    const codexButton = Array.from(document.body.querySelectorAll("button")).find(
+      (button) => button.textContent?.trim() === "Codex",
+    );
+    expect(codexButton).toBeTruthy();
+
+    await act(async () => {
+      codexButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({
+      adapterType: "codex_local",
+      model: "gpt-5.6-sol",
+    }));
   });
 
   it("shows concise Environment copy when one runnable non-local environment exists", async () => {

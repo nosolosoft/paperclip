@@ -85,6 +85,9 @@ type RequestConfirmationLikeInteraction =
   | RequestConfirmationInteraction
   | RequestCheckboxConfirmationInteraction;
 
+const TERMINAL_UNFINALIZED_SOURCE_RUN_STATUSES = ["failed", "cancelled", "timed_out"] as const;
+type TerminalUnfinalizedSourceRunStatus = (typeof TERMINAL_UNFINALIZED_SOURCE_RUN_STATUSES)[number];
+
 const USER_COMMENT_SUPERSEDABLE_INTERACTION_KINDS = [
   ...REQUEST_CONFIRMATION_INTERACTION_KINDS,
   "ask_user_questions",
@@ -757,6 +760,82 @@ export function issueThreadInteractionService(db: Db) {
     );
   }
 
+  async function expireRequestConfirmationsForTerminalSourceRun(args: {
+    companyId: string;
+    sourceRunId: string | null;
+  }) {
+    if (!args.sourceRunId) return [];
+    const sourceRun = await db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+      })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.id, args.sourceRunId),
+        eq(heartbeatRuns.companyId, args.companyId),
+      ))
+      .then((rows) => rows[0] ?? null);
+    if (!sourceRun || !(TERMINAL_UNFINALIZED_SOURCE_RUN_STATUSES as readonly string[]).includes(sourceRun.status)) {
+      return [];
+    }
+
+    const candidates = await db
+      .select({
+        interaction: issueThreadInteractions,
+        executionWorkspaceId: issues.executionWorkspaceId,
+      })
+      .from(issueThreadInteractions)
+      .innerJoin(issues, eq(issues.id, issueThreadInteractions.issueId))
+      .where(and(
+        eq(issueThreadInteractions.companyId, args.companyId),
+        eq(issueThreadInteractions.sourceRunId, sourceRun.id),
+        inArray(issueThreadInteractions.kind, [...REQUEST_CONFIRMATION_INTERACTION_KINDS]),
+        eq(issueThreadInteractions.status, "pending"),
+      ));
+    const rows = [] as IssueThreadInteractionRow[];
+    for (const candidate of candidates) {
+      if (!candidate.executionWorkspaceId) continue;
+      const finalized = await runWorkspaceIsFinalized(
+        db,
+        args.companyId,
+        candidate.executionWorkspaceId,
+        sourceRun.id,
+      );
+      if (!finalized) rows.push(candidate.interaction);
+    }
+    if (rows.length === 0) return [];
+
+    const now = new Date();
+    const updatedRows = await db
+      .update(issueThreadInteractions)
+      .set({
+        status: "expired",
+        result: {
+          version: 1,
+          outcome: "source_run_terminal",
+          sourceRunId: sourceRun.id,
+          sourceRunStatus: sourceRun.status as TerminalUnfinalizedSourceRunStatus,
+          sourceRunErrorCode: sourceRun.errorCode ?? null,
+        },
+        resolvedByAgentId: null,
+        resolvedByUserId: null,
+        resolvedAt: now,
+        updatedAt: now,
+      })
+      .where(and(
+        inArray(issueThreadInteractions.id, rows.map((row) => row.id)),
+        eq(issueThreadInteractions.status, "pending"),
+      ))
+      .returning();
+    const expired = updatedRows.map(hydrateInteraction);
+    await Promise.all([...new Set(expired.map((interaction) => interaction.issueId))]
+      .map((issueId) => touchIssue(db, issueId)));
+    await emitResolvedInteractionsTelemetry(db, expired);
+    return expired;
+  }
+
   async function getPendingInteractionForResolution(args: {
     issue: { id: string; companyId: string };
     interactionId: string;
@@ -1067,6 +1146,14 @@ export function issueThreadInteractionService(db: Db) {
           // workspace_finalize gate (PAPA-440) does not apply here.
           return issueThreadInteractionService(db).acceptSuggestedTasks(issue, interactionId, data, actor);
         case "request_confirmation": {
+          const expired = await expireRequestConfirmationsForTerminalSourceRun({
+            companyId: issue.companyId,
+            sourceRunId: current.sourceRunId,
+          });
+          const terminalRunExpiration = expired.find((interaction) => interaction.id === current.id);
+          if (terminalRunExpiration) {
+            return { interaction: terminalRunExpiration, continuationIssue: null, createdIssues: [] };
+          }
           await assertIssueWorkspaceFinalizedForAccept({ db, issue, sourceRunId: current.sourceRunId });
           const accepted = await acceptRequestConfirmation({
             issue,
@@ -1081,6 +1168,14 @@ export function issueThreadInteractionService(db: Db) {
           };
         }
         case "request_checkbox_confirmation": {
+          const expired = await expireRequestConfirmationsForTerminalSourceRun({
+            companyId: issue.companyId,
+            sourceRunId: current.sourceRunId,
+          });
+          const terminalRunExpiration = expired.find((interaction) => interaction.id === current.id);
+          if (terminalRunExpiration) {
+            return { interaction: terminalRunExpiration, continuationIssue: null, createdIssues: [] };
+          }
           await assertIssueWorkspaceFinalizedForAccept({ db, issue, sourceRunId: current.sourceRunId });
           const accepted = await acceptRequestConfirmation({
             issue,
@@ -1098,6 +1193,8 @@ export function issueThreadInteractionService(db: Db) {
           throw unprocessable(`Interactions of kind ${current.kind} cannot be accepted`);
       }
     },
+
+    expireRequestConfirmationsForTerminalSourceRun,
 
     acceptSuggestedTasks: async (
       issue: { id: string; companyId: string; projectId: string | null; goalId: string | null },

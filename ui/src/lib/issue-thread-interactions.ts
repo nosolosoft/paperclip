@@ -125,6 +125,7 @@ export function buildIssueThreadInteractionSummary(
       const outcome = interaction.result?.outcome;
       if (outcome === "superseded_by_comment") return "Confirmation expired after comment";
       if (outcome === "stale_target") return "Confirmation expired after target changed";
+      if (outcome === "source_run_terminal") return "Confirmation expired after source run ended";
       return "Confirmation expired";
     }
     return "Requested confirmation";
@@ -144,6 +145,7 @@ export function buildIssueThreadInteractionSummary(
       const outcome = interaction.result?.outcome;
       if (outcome === "superseded_by_comment") return "Selection expired after comment";
       if (outcome === "stale_target") return "Selection expired after target changed";
+      if (outcome === "source_run_terminal") return "Selection expired after source run ended";
       return "Selection expired";
     }
     return optionCount === 1

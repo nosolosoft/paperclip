@@ -1817,6 +1817,36 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       });
     });
 
+    it("allows a failed source run confirmation when its workspace finalized successfully", async () => {
+      const { companyId, executionWorkspaceId, issueId, goalId, interactionId, sourceRunId } =
+        await seedAcceptGateFixture();
+
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "failed", errorCode: "adapter_failed" })
+        .where(eq(heartbeatRuns.id, sourceRunId!));
+      await db.insert(workspaceOperations).values({
+        companyId,
+        executionWorkspaceId,
+        heartbeatRunId: sourceRunId,
+        phase: "workspace_finalize",
+        status: "succeeded",
+        startedAt: new Date("2026-05-23T22:05:00.000Z"),
+      });
+
+      const accepted = await interactionsSvc.acceptInteraction(
+        { id: issueId, companyId, goalId, projectId: null },
+        interactionId,
+        {},
+        { userId: "local-board" },
+      );
+
+      expect(accepted.interaction).toMatchObject({
+        id: interactionId,
+        status: "accepted",
+      });
+    });
+
     it("allows request_confirmation accept when sourceRunId is null", async () => {
       const { companyId, executionWorkspaceId, issueId, goalId, interactionId, foreignRunId } =
         await seedAcceptGateFixture({ sourceRunId: null });

@@ -2,6 +2,23 @@ import { describe, expect, it } from "vitest";
 import { buildCodexExecArgs } from "./codex-args.js";
 
 describe("buildCodexExecArgs", () => {
+  it("passes GPT-5.6 Sol with low reasoning effort to Codex", () => {
+    const result = buildCodexExecArgs({
+      model: "gpt-5.6-sol",
+      modelReasoningEffort: "low",
+    });
+
+    expect(result.args).toEqual([
+      "exec",
+      "--json",
+      "--model",
+      "gpt-5.6-sol",
+      "-c",
+      'model_reasoning_effort="low"',
+      "-",
+    ]);
+  });
+
   it("enables Codex fast mode overrides for GPT-5.4", () => {
     const result = buildCodexExecArgs({
       model: "gpt-5.4",

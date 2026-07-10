@@ -5,7 +5,7 @@ export const label = "Codex";
 
 export const SANDBOX_INSTALL_COMMAND = "npm install -g @openai/codex";
 
-export const DEFAULT_CODEX_LOCAL_MODEL = "gpt-5.5";
+export const DEFAULT_CODEX_LOCAL_MODEL = "gpt-5.6-sol";
 export const DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX = true;
 export const CODEX_LOCAL_FAST_MODE_SUPPORTED_MODELS = ["gpt-5.5", "gpt-5.4"] as const;
 
@@ -39,6 +39,9 @@ export function isCodexLocalFastModeSupported(model: string | null | undefined):
 
 export const models = [
   { id: DEFAULT_CODEX_LOCAL_MODEL, label: DEFAULT_CODEX_LOCAL_MODEL },
+  { id: "gpt-5.6-terra", label: "gpt-5.6-terra" },
+  { id: "gpt-5.6-luna", label: "gpt-5.6-luna" },
+  { id: "gpt-5.5", label: "gpt-5.5" },
   { id: "gpt-5.4", label: "gpt-5.4" },
   { id: "gpt-5.3-codex-spark", label: "gpt-5.3-codex-spark" },
   { id: "gpt-5", label: "gpt-5" },
@@ -71,7 +74,7 @@ Adapter: codex_local
 Core fields:
 - cwd (string, optional): default absolute working directory fallback for the agent process (created if missing when possible)
 - instructionsFilePath (string, optional): absolute path to a markdown instructions file prepended to stdin prompt at runtime
-- model (string, optional): Codex model id
+- model (string, optional): Codex model id; new Paperclip agents default to gpt-5.6-sol
 - modelReasoningEffort (string, optional): reasoning effort override (minimal|low|medium|high|xhigh) passed via -c model_reasoning_effort=...
 - promptTemplate (string, optional): run prompt template
 - search (boolean, optional): run codex with --search

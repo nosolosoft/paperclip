@@ -87,6 +87,9 @@ When you are creating a plan file in the repository itself, new plan documents b
 6. Attach inspectable generated artifacts.
 When your task produces a user-inspectable deliverable file, follow the Paperclip skill's "Generated Artifacts and Work Products" workflow before final disposition. In this repo, prefer the self-contained skill helper at `skills/paperclip/scripts/paperclip-upload-artifact.sh` so the file is available through the Paperclip API, create/update an artifact work product when the file is the deliverable, link the uploaded artifact in the final issue comment, and then set status. Do not rely on local filesystem paths as the only access path. If an important file intentionally remains workspace-only, create/update a work product with `metadata.resourceRef.kind: "workspace_file"` and a workspace-relative path, then name that work product and path in the final comment. Treat browse/search as a fallback for recovering workspace files, not the preferred deliverable path. See `doc/AGENT-ARTIFACTS.md` for details and `.mp4`/`.webm` examples.
 
+7. Treat manual agent configuration as authoritative.
+A newer user-authored agent configuration revision always overrides backups, forensic manifests, baselines, defaults, and previously documented target values. Never "correct" `adapterConfig`, `runtimeConfig`, model selection, instructions, or workspace settings from historical evidence after a user has changed them. Recovery watchers and anomaly handlers are detect-only and must never remediate configuration. An agent may mutate configuration only when the current user request explicitly names the exact desired change; immediately before applying it, read the live configuration and latest revision again. If live user intent conflicts with recovery evidence, preserve the live value and report the conflict.
+
 ## 6. Database Change Workflow
 
 When changing data model:

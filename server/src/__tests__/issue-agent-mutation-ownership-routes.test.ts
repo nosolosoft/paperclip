@@ -262,6 +262,7 @@ function createRunContextDb(
   contextSnapshot: Record<string, unknown> = {},
   runAgentOrRows: string | Record<string, unknown>[] = ownerAgentId,
   runId: string = ownerRunId,
+  responsibleUserId?: string,
 ) {
   const runRows = Array.isArray(runAgentOrRows)
     ? runAgentOrRows
@@ -280,6 +281,12 @@ function createRunContextDb(
     if (keys.includes("entityId")) return [];
     if (keys.includes("contextSnapshot")) return runRows;
     if (keys.includes("agentCompanyId")) return runRows;
+    if (responsibleUserId && keys.length === 1 && keys.includes("id")) {
+      return [{ id: responsibleUserId }];
+    }
+    if (responsibleUserId && keys.includes("status") && keys.includes("role")) {
+      return [{ status: "active", role: "owner" }];
+    }
     return [{ id: runAgentId, companyId: runAgentCompanyId, permissions: {}, role: "engineer", reportsTo: null }];
   };
   const buildQuery = (selection: Record<string, unknown>) => {
@@ -1298,7 +1305,10 @@ describe("agent issue mutation checkout ownership", () => {
   });
 
   it("allows board-created issues to pass explicit responsibleUserId as trusted attribution", async () => {
-    const app = await createApp(boardActor());
+    const app = await createApp(
+      boardActor(),
+      createRunContextDb({}, ownerAgentId, ownerRunId, "responsible-board-user"),
+    );
 
     const res = await request(app)
       .post(`/api/companies/${companyId}/issues`)

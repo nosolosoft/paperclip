@@ -533,6 +533,57 @@ describe.sequential("agent permission routes", () => {
     expect(res.status).toBe(403);
   });
 
+  it("preserves untouched adapter config when a board changes only the model", async () => {
+    const originalAdapterConfig = {
+      command: "/usr/local/bin/paperclip-agent",
+      env: {
+        PAPERCLIP_API_URL: "http://localhost:3100",
+        PAPERCLIP_API_KEY: "legacy-secret-binding",
+      },
+      promptTemplate: "Read the agent instructions before running.",
+      timeoutSec: 600,
+    };
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      adapterType: "process",
+      adapterConfig: originalAdapterConfig,
+    });
+    mockSecretService.normalizeAdapterConfigForPersistence.mockImplementation(async (_companyId, config) => ({
+      ...config,
+      env: Object.fromEntries(
+        Object.entries(config.env as Record<string, string>).map(([key, value]) => [
+          key,
+          { type: "plain", value },
+        ]),
+      ),
+    }));
+
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}`)
+      .send({ adapterConfig: { model: "gpt-5.6-sol" } }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockSecretService.normalizeAdapterConfigForPersistence).not.toHaveBeenCalled();
+    expect(mockAgentService.update).toHaveBeenCalledWith(
+      agentId,
+      expect.objectContaining({
+        adapterConfig: {
+          ...originalAdapterConfig,
+          model: "gpt-5.6-sol",
+        },
+      }),
+      expect.anything(),
+    );
+  });
+
   it("blocks wakeups for authenticated company members without agent admin permission", async () => {
     mockAccessService.canUser.mockResolvedValue(false);
 

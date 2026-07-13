@@ -2871,6 +2871,13 @@ export function agentRoutes(
       if (requestedAdapterConfig && !changingAdapterType && !replaceAdapterConfig) {
         rawEffectiveAdapterConfig = { ...existingAdapterConfig, ...requestedAdapterConfig };
       }
+      const changingOnlyModel = Boolean(
+        requestedAdapterConfig
+        && !changingAdapterType
+        && !replaceAdapterConfig
+        && Object.keys(requestedAdapterConfig).length === 1
+        && hasOwn(requestedAdapterConfig, "model")
+      );
       if (changingAdapterType) {
         // Preserve adapter-agnostic keys (env, cwd, etc.) from the existing config
         // when the adapter type changes. Without this, a PATCH that includes
@@ -2886,21 +2893,27 @@ export function agentRoutes(
           rawEffectiveAdapterConfig,
         );
       }
-      const effectiveAdapterConfig = applyCodexLocalKeyIsolation(
-        existing.companyId,
-        existing.id,
-        requestedAdapterType,
-        applyCreateDefaultsByAdapterType(
+      const effectiveAdapterConfig = changingOnlyModel
+        ? rawEffectiveAdapterConfig
+        : applyCodexLocalKeyIsolation(
+          existing.companyId,
+          existing.id,
           requestedAdapterType,
-          rawEffectiveAdapterConfig,
-        ),
-      );
-      const normalizedEffectiveAdapterConfig = await normalizeMediatedAdapterConfigForPersistence({
-        companyId: existing.companyId,
-        adapterType: requestedAdapterType,
-        adapterConfig: effectiveAdapterConfig,
-      });
-      patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, normalizedEffectiveAdapterConfig);
+          applyCreateDefaultsByAdapterType(
+            requestedAdapterType,
+            rawEffectiveAdapterConfig,
+          ),
+        );
+      const normalizedEffectiveAdapterConfig = changingOnlyModel
+        ? effectiveAdapterConfig
+        : await normalizeMediatedAdapterConfigForPersistence({
+          companyId: existing.companyId,
+          adapterType: requestedAdapterType,
+          adapterConfig: effectiveAdapterConfig,
+        });
+      patchData.adapterConfig = changingOnlyModel
+        ? effectiveAdapterConfig
+        : syncInstructionsBundleConfigFromFilePath(existing, normalizedEffectiveAdapterConfig);
     }
     if (requestedRuntimeConfig) {
       const baseAdapterConfig = asRecord(patchData.adapterConfig) ?? asRecord(existing.adapterConfig) ?? {};

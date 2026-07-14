@@ -49,6 +49,18 @@ describe("shipped teams catalog", () => {
     expect(instructions).toContain("update your task with a comment before exiting");
   });
 
+  it("keeps the shipped senior coder aligned with the canonical engineering contract", () => {
+    const instructionsPath = path.join(
+      PACKAGE_DIR,
+      "catalog/bundled/software-development/product-engineering/agents/senior-coder/AGENTS.md",
+    );
+    const instructions = fs.readFileSync(instructionsPath, "utf8");
+    expectKarpathyEngineeringContract(instructions);
+    expect(instructions).toContain("smallest verification that proves the work");
+    expect(instructions).toContain("Ship in logical commits");
+    expect(instructions).toContain("security review before merge");
+  });
+
   it("ships the expected bundled and optional team fixtures", () => {
     const bundledKeys = catalogTeams
       .filter((team) => team.kind === "bundled")

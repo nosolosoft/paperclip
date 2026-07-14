@@ -17,8 +17,38 @@ const EXPECTED_OPTIONAL_KEYS = [
 ];
 
 const PACKAGE_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const REPO_ROOT = path.resolve(PACKAGE_DIR, "../..");
+
+function readCoderTemplateInstructions() {
+  const templatePath = path.join(
+    REPO_ROOT,
+    "skills/paperclip-create-agent/references/agents/coder.md",
+  );
+  const source = fs.readFileSync(templatePath, "utf8");
+  const match = source.match(/## `AGENTS\.md`\s+```md\n([\s\S]*?)\n```/);
+  expect(match, "coder template must contain a fenced AGENTS.md block").not.toBeNull();
+  return match![1]!;
+}
+
+function expectKarpathyEngineeringContract(content: string) {
+  expect(content).toMatch(/state (?:your )?assumptions/i);
+  expect(content).toMatch(/simplest reasonable interpretation/i);
+  expect(content).toMatch(/minimum change/i);
+  expect(content).toMatch(/every changed line must trace/i);
+  expect(content).toMatch(/criterion and its evidence/i);
+  expect(content).not.toContain("Leave code better than you found it");
+}
 
 describe("shipped teams catalog", () => {
+  it("keeps the canonical coder template minimal, surgical, and verifiable", () => {
+    const instructions = readCoderTemplateInstructions();
+    expectKarpathyEngineeringContract(instructions);
+    expect(instructions).toContain("smallest verification that proves the work");
+    expect(instructions).toContain("Make sure you know the success condition");
+    expect(instructions).toContain("Commit things in logical commits");
+    expect(instructions).toContain("update your task with a comment before exiting");
+  });
+
   it("ships the expected bundled and optional team fixtures", () => {
     const bundledKeys = catalogTeams
       .filter((team) => team.kind === "bundled")

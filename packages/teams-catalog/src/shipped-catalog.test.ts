@@ -35,7 +35,13 @@ function expectKarpathyEngineeringContract(content: string) {
   expect(content).toMatch(/simplest reasonable interpretation/i);
   expect(content).toMatch(/minimum change/i);
   expect(content).toMatch(/every changed line must trace/i);
-  expect(content).toMatch(/criterion and its evidence/i);
+  expect(content).toMatch(/do not refactor, reformat, rename, or clean up adjacent code/i);
+  expect(content).toMatch(
+    /remove imports, variables, functions, or other code that becomes unused as a direct consequence of your change/i,
+  );
+  expect(content).toMatch(/do not remove unrelated pre-existing dead code/i);
+  expect(content).toMatch(/before implementation, map each acceptance criterion/i);
+  expect(content).toMatch(/final comment, list each criterion and its evidence/i);
   expect(content).not.toContain("Leave code better than you found it");
 }
 
@@ -43,6 +49,10 @@ describe("shipped teams catalog", () => {
   it("keeps the canonical coder template minimal, surgical, and verifiable", () => {
     const instructions = readCoderTemplateInstructions();
     expectKarpathyEngineeringContract(instructions);
+    expect(instructions).not.toContain("Ask for clarification when requirements are ambiguous");
+    expect(instructions).toMatch(
+      /ask for clarification only when ambiguity changes scope, public behavior, data compatibility, or requires an irreversible action/i,
+    );
     expect(instructions).toContain("smallest verification that proves the work");
     expect(instructions).toContain("Make sure you know the success condition");
     expect(instructions).toContain("Commit things in logical commits");

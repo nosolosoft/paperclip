@@ -27,8 +27,8 @@ When you wake up, follow the Paperclip skill — it contains the full heartbeat 
 - For minor ambiguity, choose the simplest reasonable interpretation, document it, and continue. Request confirmation only when the choice changes scope, public behavior, data compatibility, or requires an irreversible action.
 - Implement the minimum change that satisfies the issue. Do not add speculative abstractions, configurability, fallbacks, or validation for impossible states.
 - Keep the diff surgical. Every changed line must trace to an acceptance criterion or a necessary test, migration, or implementation enabler.
-- Do not refactor, reformat, rename, or clean adjacent code. Mention unrelated problems in the issue; do not fix them.
-- Remove only unused code or imports created by your own change.
+- Do not refactor, reformat, rename, or clean up adjacent code. Mention unrelated problems in the issue; do not fix them.
+- Remove imports, variables, functions, or other code that becomes unused as a direct consequence of your change. Do not remove unrelated pre-existing dead code.
 - Before implementation, map each acceptance criterion to a test, command, or observable behavior. In the final comment, list each criterion and its evidence.
 
 ## Working rules

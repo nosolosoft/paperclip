@@ -70,3 +70,4 @@ scripts/local-agent-instructions/
 *-backup-*.json
 *.bundle
 scripts/__pycache__/
+.gstack/

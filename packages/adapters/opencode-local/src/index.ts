@@ -115,6 +115,7 @@ Core fields:
 - instructionsFilePath (string, optional): absolute path to a markdown instructions file prepended to the run prompt
 - model (string, required): OpenCode model id in provider/model format (for example anthropic/claude-sonnet-4-5)
 - variant (string, optional): provider-specific reasoning/profile variant passed as --variant (for example minimal|low|medium|high|xhigh|max)
+- agent (string, optional): exact OpenCode agent name to select via --agent (must be a \`primary\` or \`all\` mode agent from \`opencode agent list\`, case-sensitive); the environment test validates it against the live \`opencode agent list\` output and both execution and the hello probe fail closed if OpenCode reports an unknown-agent fallback
 - dangerouslySkipPermissions (boolean, optional): inject a runtime OpenCode config that allows \`external_directory\` access without interactive prompts; defaults to true for unattended Paperclip runs
 - promptTemplate (string, optional): run prompt template
 - command (string, optional): defaults to "opencode"

@@ -27,6 +27,11 @@ import {
 } from "@paperclipai/adapter-utils/execution-target";
 import { discoverOpenCodeModels, ensureOpenCodeModelConfiguredAndAvailable } from "./models.js";
 import { parseOpenCodeJsonl } from "./parse.js";
+import {
+  detectOpenCodeFallbackWarning,
+  parseAgentListOutput,
+  validateAgentSelection,
+} from "./agent-selection.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
 
@@ -213,6 +218,73 @@ export async function testEnvironment(
     const canRunProbe =
       checks.every((check) => check.code !== "opencode_cwd_invalid" && check.code !== "opencode_command_unresolvable");
 
+    const configuredAgentName = asString(config.agent, "");
+    let agentSelectionValid = true;
+    if (configuredAgentName !== configuredAgentName.trim()) {
+      agentSelectionValid = false;
+      checks.push({
+        code: "opencode_agent_selection_invalid",
+        failureCode: "AGENT_NAME_MISMATCH",
+        level: "error",
+        message: "Configured OpenCode agent name must match exactly without leading or trailing whitespace.",
+        hint: "Run `opencode agent list` and copy an exact primary or all-mode agent name.",
+      });
+    } else if (configuredAgentName && canRunProbe) {
+      try {
+        const agentListProbe = await runAdapterExecutionTargetProcess(
+          runId,
+          runtimeTarget,
+          command,
+          ["agent", "list"],
+          {
+            cwd: runtimeCwd,
+            env: runtimeEnv,
+            timeoutSec: 20,
+            graceSec: 5,
+            onLog: async () => {},
+          },
+        );
+        if (agentListProbe.timedOut || (agentListProbe.exitCode ?? 1) !== 0) {
+          agentSelectionValid = false;
+          checks.push({
+            code: "opencode_agent_selection_invalid",
+            failureCode: "AGENT_NOT_FOUND",
+            level: "error",
+            message: `Failed to run \`opencode agent list\` to validate the configured agent "${configuredAgentName}".`,
+            detail: summarizeProbeDetail(agentListProbe.stdout, agentListProbe.stderr, null) ?? undefined,
+            hint: "Run `opencode agent list` manually and verify OpenCode primaries.",
+          });
+        } else {
+          const available = parseAgentListOutput(agentListProbe.stdout);
+          const validation = validateAgentSelection(configuredAgentName, available);
+          if (!validation.ok) {
+            agentSelectionValid = false;
+            checks.push({
+              code: "opencode_agent_selection_invalid",
+              failureCode: validation.code,
+              level: "error",
+              message: `Configured OpenCode agent selection failed: ${validation.code}.`,
+              hint: "Run `opencode agent list` and choose an exact primary or all-mode agent name.",
+            });
+          } else {
+            checks.push({
+              code: "opencode_agent_selection_valid",
+              level: "info",
+              message: `Configured OpenCode agent "${configuredAgentName}" is valid.`,
+            });
+          }
+        }
+      } catch (err) {
+        agentSelectionValid = false;
+        checks.push({
+          code: "opencode_agent_selection_invalid",
+          failureCode: "AGENT_NOT_FOUND",
+          level: "error",
+          message: err instanceof Error ? err.message : "Failed to validate the configured OpenCode agent.",
+        });
+      }
+    }
+
     let modelValidationPassed = false;
     const configuredModel = asString(config.model, "").trim();
 
@@ -322,7 +394,7 @@ export async function testEnvironment(
       }
     }
 
-    if (canRunProbe && modelValidationPassed) {
+    if (canRunProbe && modelValidationPassed && agentSelectionValid) {
       const extraArgs = (() => {
         const fromExtraArgs = asStringArray(config.extraArgs);
         if (fromExtraArgs.length > 0) return fromExtraArgs;
@@ -332,6 +404,7 @@ export async function testEnvironment(
       const probeModel = configuredModel;
 
       const args = ["run", "--format", "json"];
+      if (configuredAgentName) args.push("--agent", configuredAgentName);
       args.push("--model", probeModel);
       if (variant) args.push("--variant", variant);
       if (extraArgs.length > 0) args.push(...extraArgs);
@@ -363,6 +436,7 @@ export async function testEnvironment(
         const parsed = parseOpenCodeJsonl(probe.stdout);
         const detail = summarizeProbeDetail(probe.stdout, probe.stderr, parsed.errorMessage);
         const authEvidence = `${parsed.errorMessage ?? ""}\n${probe.stdout}\n${probe.stderr}`.trim();
+        const helloProbeFellBack = detectOpenCodeFallbackWarning(probe.stdout, probe.stderr);
 
         if (probe.timedOut) {
           checks.push({
@@ -370,6 +444,14 @@ export async function testEnvironment(
             level: "warn",
             message: "OpenCode hello probe timed out.",
             hint: "Retry the probe. If this persists, run OpenCode manually in this working directory.",
+          });
+        } else if (helloProbeFellBack) {
+          checks.push({
+            code: "opencode_hello_probe_failed",
+            level: "error",
+            message: "OpenCode reported an unknown agent and silently fell back to the default agent.",
+            ...(detail ? { detail } : {}),
+            hint: "Run `opencode agent list` and confirm the configured agent name and mode.",
           });
         } else if ((probe.exitCode ?? 1) === 0 && !parsed.errorMessage) {
           const summary = parsed.summary.trim();

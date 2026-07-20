@@ -141,6 +141,7 @@ export type AdapterEnvironmentTestStatus = "pass" | "warn" | "fail";
 
 export interface AdapterEnvironmentCheck {
   code: string;
+  failureCode?: string | null;
   level: AdapterEnvironmentCheckLevel;
   message: string;
   detail?: string | null;

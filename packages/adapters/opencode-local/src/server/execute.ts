@@ -45,6 +45,7 @@ import {
   resolvePaperclipDesiredSkillNames,
 } from "@paperclipai/adapter-utils/server-utils";
 import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl } from "./parse.js";
+import { detectOpenCodeFallbackWarning } from "./agent-selection.js";
 import {
   ensureOpenCodeModelConfiguredAndAvailable,
   isTruthyEnvFlag,
@@ -358,6 +359,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (fromExtraArgs.length > 0) return fromExtraArgs;
       return asStringArray(config.args);
     })();
+    const configuredAgentName = asString(config.agent, "");
+    if (configuredAgentName !== configuredAgentName.trim()) {
+      throw new Error("opencode_local: AGENT_NAME_MISMATCH");
+    }
+    if (configuredAgentName && extraArgs.includes("--agent")) {
+      throw new Error(
+        'opencode_local: adapterConfig.agent conflicts with a literal "--agent" already present in extraArgs/args; remove one.',
+      );
+    }
     let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
     let localSkillsDir: string | null = null;
     let remoteRuntimeRootDir: string | null = null;
@@ -574,6 +584,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const buildArgs = (resumeSessionId: string | null) => {
       const args = ["run", "--format", "json"];
       if (printLogs) args.push("--print-logs");
+      if (configuredAgentName) args.push("--agent", configuredAgentName);
       if (resumeSessionId) args.push("--session", resumeSessionId);
       if (model) args.push("--model", model);
       if (variant) args.push("--variant", variant);
@@ -654,11 +665,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const parsedError = typeof attempt.parsed.errorMessage === "string" ? attempt.parsed.errorMessage.trim() : "";
       const stderrLine = firstNonEmptyLine(attempt.proc.stderr);
       const rawExitCode = attempt.proc.exitCode;
-      const synthesizedExitCode = parsedError && (rawExitCode ?? 0) === 0 ? 1 : rawExitCode;
-      const fallbackErrorMessage =
+      let synthesizedExitCode = parsedError && (rawExitCode ?? 0) === 0 ? 1 : rawExitCode;
+      let fallbackErrorMessage =
         parsedError ||
         stderrLine ||
         `OpenCode exited with code ${synthesizedExitCode ?? -1}`;
+      // OpenCode can silently fall back to its default agent (unknown/invalid
+      // --agent name or mode) and still exit 0 with no structured JSON error.
+      // Fail closed on the final attempt's output regardless of raw exit code.
+      if (detectOpenCodeFallbackWarning(attempt.proc.stdout, attempt.rawStderr)) {
+        synthesizedExitCode = 1;
+        fallbackErrorMessage =
+          "OpenCode reported an unknown agent and silently fell back to the default agent.";
+      }
       const modelId = model || null;
 
       return {

@@ -161,6 +161,7 @@ export type AdapterEnvironmentCheckLevel = "info" | "warn" | "error";
 
 export interface AdapterEnvironmentCheck {
   code: string;
+  failureCode?: string | null;
   level: AdapterEnvironmentCheckLevel;
   message: string;
   detail?: string | null;

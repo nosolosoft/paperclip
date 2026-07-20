@@ -65,6 +65,8 @@ tests/release-smoke/playwright-report/
 scripts/local-agent-instructions/
 
 # Local maintenance artifacts — never commit (public repo, may contain state/secrets)
+.omo/
+.playwright-mcp/
 .paperclip-rollback-*.json
 .paperclip-agy-migration-backup-*.json
 *-backup-*.json

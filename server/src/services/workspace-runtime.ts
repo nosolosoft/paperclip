@@ -1997,15 +1997,15 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     }
     return realized;
   }
-  const baseRepoRoot = await runGit(["rev-parse", "--show-toplevel"], input.base.baseCwd);
   const recordedBaseRefSha = readRecordedBaseRefSha(input.workspace.metadata);
-  let repoRoot = baseRepoRoot;
   if (await directoryExists(cwd)) {
     const reuseBaseRef = input.workspace.baseRef ?? input.base.repoRef ?? null;
     const reuseWorktreePath = realized.worktreePath ?? cwd;
     const resolvedReuseWorktreePath = await resolvePathForWorktreeComparison(reuseWorktreePath);
     const ownerRepoRoot = await resolveGitOwnerRepoRoot(reuseWorktreePath).catch(() => null);
-    repoRoot = ownerRepoRoot && ownerRepoRoot !== resolvedReuseWorktreePath ? ownerRepoRoot : baseRepoRoot;
+    const repoRoot = ownerRepoRoot && ownerRepoRoot !== resolvedReuseWorktreePath
+      ? ownerRepoRoot
+      : await runGit(["rev-parse", "--show-toplevel"], input.base.baseCwd);
     if (await isGitCheckout(reuseWorktreePath)) {
       await ensureGitWorktreeBranchCoherent({
         repoRoot,
@@ -2077,6 +2077,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     return realized;
   }
 
+  const repoRoot = await runGit(["rev-parse", "--show-toplevel"], input.base.baseCwd);
   const worktreePath = realized.worktreePath ?? cwd;
   const branchName = asString(input.workspace.branchName, "").trim();
   if (!branchName) {

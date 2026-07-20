@@ -2664,6 +2664,77 @@ describe("realizeExecutionWorkspace", () => {
   });
 });
 
+  it("reuses a persisted git worktree through its owner repo when the agent home is not a git checkout", async () => {
+    const agentHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-agent-home-"));
+    const ownerRepoRoot = await createTempRepo();
+    const initial = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: ownerRepoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-owner",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: {
+        id: "issue-agent-home",
+        identifier: "PAP-456",
+        title: "Reuse persisted worktree from agent home",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    const restored = await ensurePersistedExecutionWorkspaceAvailable({
+      base: {
+        baseCwd: agentHome,
+        source: "agent_home",
+        projectId: null,
+        workspaceId: null,
+        repoUrl: null,
+        repoRef: null,
+      },
+      workspace: {
+        id: "execution-workspace-agent-home",
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        cwd: initial.cwd,
+        providerRef: initial.cwd,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-owner",
+        repoUrl: null,
+        baseRef: "HEAD",
+        branchName: initial.branchName,
+      },
+      issue: {
+        id: "issue-agent-home",
+        identifier: "PAP-456",
+        title: "Reuse persisted worktree from agent home",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(restored).toMatchObject({
+      cwd: initial.cwd,
+      created: false,
+      source: "task_session",
+      workspaceId: "workspace-owner",
+    });
+  });
+
 it("repairs a stale project-primary shared workspace by returning to the current project cwd", async () => {
   const staleRepoRoot = await createTempRepo();
   const currentProjectRepoRoot = await createTempRepo();

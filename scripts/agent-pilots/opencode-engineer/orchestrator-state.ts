@@ -6,9 +6,20 @@ import type { OrchestrationRequest, OrchestrationStage, OrchestrationState } fro
 const SECRET_PATTERNS = [
   /\b(?:PAPERCLIP|OPENAI|ANTHROPIC|API)[A-Z0-9_]*\s*=\s*[^\s,;]+/gi,
   /\bAuthorization:\s*Bearer\s+[^\s,;]+/gi,
+  /\b[A-Z][A-Z0-9_]*PASSWORD\s*=\s*[^\s,;]+/gi,
+  /\b[A-Z][A-Z0-9_]*(?:SECRET|TOKEN|API_KEY)\s*=\s*[^\s,;]+/gi,
+  /\b(?:KEY|[A-Z][A-Z0-9_]*_KEY)\s*=\s*[^\s,;]+/gi,
+  /\bBearer\s+[A-Za-z0-9\-._~+/]+=*/gi,
   /\b(?:sk|pk|rk)_[A-Za-z0-9_-]+\b/g,
 ] as const;
 const MAX_SAVED_ERROR_LENGTH = 800;
+
+export class OrchestrationStateCorruptionError extends Error {
+  constructor(reason: string) {
+    super(`state corruption: ${reason}`);
+    this.name = "OrchestrationStateCorruptionError";
+  }
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -20,6 +31,10 @@ function isStage(value: unknown): value is OrchestrationStage {
 
 function stringValue(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function isMissingFileError(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
 
 export function redactExcerpt(value: string): string {
@@ -71,24 +86,29 @@ export async function loadState(path: string): Promise<OrchestrationState | null
   try {
     raw = await readFile(path, "utf8");
   } catch (error) {
-    if (error instanceof Error) return null;
+    if (isMissingFileError(error)) return null;
+    if (error instanceof Error) throw new OrchestrationStateCorruptionError("state file cannot be read");
     throw error;
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch (error) {
-    if (error instanceof Error) return null;
+    if (error instanceof Error) throw new OrchestrationStateCorruptionError("state file is not valid JSON");
     throw error;
   }
-  if (!isRecord(parsed) || parsed.schemaVersion !== 1 || !isStage(parsed.stage)) return null;
+  if (!isRecord(parsed) || parsed.schemaVersion !== 1 || !isStage(parsed.stage)) {
+    throw new OrchestrationStateCorruptionError("state file has an invalid schema or stage");
+  }
   const taskId = stringValue(parsed.taskId);
   const companyId = stringValue(parsed.companyId);
   const agentId = stringValue(parsed.agentId);
   const timestamps = isRecord(parsed.timestamps) ? parsed.timestamps : null;
   const createdAt = timestamps ? stringValue(timestamps.createdAt) : null;
   const updatedAt = timestamps ? stringValue(timestamps.updatedAt) : null;
-  if (!taskId || !companyId || !agentId || !createdAt || !updatedAt || typeof parsed.attempt !== "number" || !Number.isInteger(parsed.attempt)) return null;
+  if (!taskId || !companyId || !agentId || !createdAt || !updatedAt || typeof parsed.attempt !== "number" || !Number.isInteger(parsed.attempt) || parsed.attempt < 0 || parsed.attempt > 3) {
+    throw new OrchestrationStateCorruptionError("state file has invalid required values");
+  }
   const sessions = isRecord(parsed.childSessionIds) ? parsed.childSessionIds : {};
   const seenRunIds = Array.isArray(parsed.seenRunIds) && parsed.seenRunIds.every((id) => typeof id === "string") ? parsed.seenRunIds : [];
   return {

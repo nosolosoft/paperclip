@@ -1,8 +1,9 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { validatePlanPolicy } from "./plan-policy-validator.js";
+import { resolveAllowedWorkspacePaths, validatePlanPolicy } from "./plan-policy-validator.js";
+import { resolveWorkspacePath } from "./plan-policy-validator.js";
 import { detectOpenCodeFallbackWarning, createNodeChildRunner, parseOpenCodeJsonl } from "./orchestrator-runner.js";
-import { createState, hashText, loadState, redactExcerpt, statePathForTask, writeOrchestrationEvidence, writeStateAtomically } from "./orchestrator-state.js";
+import { createState, hashText, loadState, OrchestrationStateCorruptionError, redactExcerpt, statePathForTask, writeOrchestrationEvidence, writeStateAtomically } from "./orchestrator-state.js";
 import type { ChildInvocation, ChildProcessResult, OrchestrationDependencies, OrchestrationRequest, OrchestrationStage, OrchestrationState } from "./orchestrator-types.js";
 
 export type { ChildInvocation, ChildProcessResult, OrchestrationDependencies, OrchestrationRequest, OrchestrationState } from "./orchestrator-types.js";
@@ -53,7 +54,19 @@ export async function orchestrateOpenCodeTask(request: OrchestrationRequest, dep
   const now = dependencies.now ?? Date.now;
   const runner = dependencies.runner ?? createNodeChildRunner();
   const statePath = statePathForTask(request.worktree, request.taskId);
-  const loaded = await loadState(statePath);
+  let loaded: OrchestrationState | null;
+  try {
+    loaded = await loadState(statePath);
+  } catch (error) {
+    if (!(error instanceof OrchestrationStateCorruptionError)) throw error;
+    const state = withState(
+      createState(request, nowDate(now), null),
+      "failed_closed",
+      nowDate(now),
+      { lastError: error.message },
+    );
+    return { statePath, state };
+  }
   let state = loaded ?? createState(request, nowDate(now), null);
   const persist = async (next: OrchestrationState) => { state = next; await writeStateAtomically(statePath, state); };
   if (loaded && (loaded.taskId !== request.taskId || loaded.companyId !== request.companyId || loaded.agentId !== request.agentId)) {
@@ -69,6 +82,21 @@ export async function orchestrateOpenCodeTask(request: OrchestrationRequest, dep
   let prometheusUsedMs = 0;
   let atlasUsedMs = 0;
   const invoke = async (command: string, args: readonly string[], stdin: string, timeoutMs: number): Promise<ChildProcessResult> => runner.run({ command, args, cwd: request.worktree, env: request.paperclipEnv, stdin, timeoutMs, detached: false, shell: false, signal: dependencies.signal });
+  const ensureAtlasDiffRespectsAllowlist = async (sidecar: unknown): Promise<string | null> => {
+    const allowedPaths = resolveAllowedWorkspacePaths(sidecar, request.worktree);
+    if (!allowedPaths) return "approved plan allowlist could not be resolved safely";
+    const diff = await invoke("git", ["diff", "--name-only", "--no-renames", "-z", "HEAD"], "", 20_000);
+    const untracked = await invoke("git", ["ls-files", "--others", "--exclude-standard", "-z"], "", 20_000);
+    if (!isSuccessful(diff) || !isSuccessful(untracked)) return "unable to inspect Atlas git diff for allowlist enforcement";
+    const changedPaths = new Set([...diff.stdout.split("\0"), ...untracked.stdout.split("\0")].filter(Boolean));
+    for (const changedPath of changedPaths) {
+      const resolvedPath = resolveWorkspacePath(request.worktree, changedPath);
+      if (!resolvedPath || !allowedPaths.includes(resolvedPath)) {
+        return `Atlas touched a path outside the approved allowlist: ${redactExcerpt(changedPath)}`;
+      }
+    }
+    return null;
+  };
   const preflight = async (): Promise<string | null> => {
     if (resolve(request.worktree) !== resolve(request.taskOwnedWorktree)) return "worktree is not task-owned";
     if (REQUIRED_ENV.some((key) => !request.paperclipEnv[key])) return "required Paperclip environment is missing";
@@ -151,6 +179,26 @@ export async function orchestrateOpenCodeTask(request: OrchestrationRequest, dep
       if (state.fallbackUsed) { await persist(withState(state, "exhausted_or_blocked", nowDate(now), { lastError: atlas.error })); return { statePath, state }; }
       await persist(withState(state, "sisyphus_fallback", nowDate(now), { fallbackUsed: true, lastError: atlas.error }));
     } else {
+      let approvedPlan: string;
+      let approvedSidecar: unknown;
+      try {
+        approvedPlan = await (dependencies.readPlan ?? ((path) => readFile(path, "utf8")))(state.planPath ?? request.planPath);
+        approvedSidecar = await (dependencies.readSidecar ?? (async (path) => JSON.parse(await readFile(path, "utf8"))))(request.sidecarPath);
+      } catch {
+        await persist(withState(state, "failed_closed", nowDate(now), { lastError: "approved plan artifacts are missing" }));
+        return { statePath, state };
+      }
+      const currentDecision = validatePlanPolicy(approvedSidecar, approvedPlan, request.worktree);
+      const currentSidecarMatchesTask = isRecord(approvedSidecar) && approvedSidecar.taskId === request.taskId && approvedSidecar.planPath === request.planPath;
+      if (!currentDecision.approved || !currentSidecarMatchesTask || hashText(approvedPlan) !== state.planHash) {
+        await persist(withState(state, "failed_closed", nowDate(now), { lastError: currentDecision.reasons.join("; ") || "approved plan artifacts no longer match the persisted approval" }));
+        return { statePath, state };
+      }
+      const allowlistError = await ensureAtlasDiffRespectsAllowlist(approvedSidecar);
+      if (allowlistError) {
+        await persist(withState(state, "failed_closed", nowDate(now), { lastError: allowlistError }));
+        return { statePath, state };
+      }
       await persist(withState(state, "sisyphus_verify", nowDate(now), { childSessionIds: { ...state.childSessionIds, atlas: atlas.sessionId ?? undefined } }));
     }
   }

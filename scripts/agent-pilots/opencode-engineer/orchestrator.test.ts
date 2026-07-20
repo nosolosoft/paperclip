@@ -1,8 +1,9 @@
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { orchestrateOpenCodeTask, writeOrchestrationEvidence } from "./orchestrator.js";
 import { agentName, createFakeRunner, createWorktree, dependencies, jsonl, PLAN_TEXT, requestFor, runCalls, sha256, writeRestartState } from "./orchestrator.test-helpers.js";
+import { statePathForTask } from "./orchestrator-state.js";
 
 describe("orchestrateOpenCodeTask", () => {
   it("fails closed before an agent run when the OpenCode version drifts", async () => {
@@ -110,6 +111,27 @@ describe("orchestrateOpenCodeTask", () => {
     expect(runCalls(runner).map(agentName)).toEqual(["Prometheus - Plan Builder"]);
   });
 
+  it.each([
+    ["malformed JSON", "{"],
+    ["negative attempt", JSON.stringify({ schemaVersion: 1, taskId: "PAP-123", companyId: "company-1", agentId: "agent-1", stage: "init", attempt: -1, seenRunIds: [], childSessionIds: {}, planPath: null, planHash: null, baselineGitStatusHash: null, fallbackUsed: false, timestamps: { createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }, lastError: null })],
+    ["out-of-range attempt", JSON.stringify({ schemaVersion: 1, taskId: "PAP-123", companyId: "company-1", agentId: "agent-1", stage: "init", attempt: 999, seenRunIds: [], childSessionIds: {}, planPath: null, planHash: null, baselineGitStatusHash: null, fallbackUsed: false, timestamps: { createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }, lastError: null })],
+  ])("fails closed without spawning a child for %s state", async (_label, contents) => {
+    // Given
+    const worktree = await createWorktree();
+    const statePath = statePathForTask(worktree, "PAP-123");
+    await mkdir(dirname(statePath), { recursive: true });
+    await writeFile(statePath, contents, "utf8");
+    const runner = createFakeRunner(() => jsonl("unexpected"));
+
+    // When
+    const result = await orchestrateOpenCodeTask(requestFor(worktree), dependencies(runner, worktree));
+
+    // Then
+    expect(result.state.stage).toBe("failed_closed");
+    expect(result.state.lastError).toContain("state corruption");
+    expect(runCalls(runner)).toEqual([]);
+  });
+
   it("resumes Atlas without invoking Prometheus twice after interruption", async () => {
     // Given
     const worktree = await createWorktree();
@@ -141,6 +163,28 @@ describe("orchestrateOpenCodeTask", () => {
     expect(result.state.stage).toBe("complete");
     expect(runCalls(runner).map(agentName)).toEqual([
       "Prometheus - Plan Builder", "Prometheus - Plan Builder", "Atlas - Plan Executor", "Sisyphus - ultraworker",
+    ]);
+  });
+
+  it("fails closed before Sisyphus when Atlas touches a path outside the approved allowlist", async () => {
+    // Given
+    const worktree = await createWorktree();
+    const runner = createFakeRunner((input) => {
+      if (agentName(input) === "Prometheus - Plan Builder") return jsonl("prometheus-session");
+      if (agentName(input) === "Atlas - Plan Executor") return jsonl("atlas-session");
+      return jsonl("sisyphus-session");
+    }, { tracked: "outside-approved-scope.ts\0" });
+
+    // When
+    const result = await orchestrateOpenCodeTask(requestFor(worktree), dependencies(runner, worktree));
+
+    // Then
+    expect(result.state.stage).toBe("failed_closed");
+    expect(result.state.lastError).toContain("outside the approved allowlist");
+    expect(runCalls(runner).map(agentName)).toEqual([
+      "Prometheus - Plan Builder",
+      "Prometheus - Plan Builder",
+      "Atlas - Plan Executor",
     ]);
   });
 

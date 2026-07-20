@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 export const PLAN_POLICY_REASONS = {
   invalidSidecar: "sidecar does not match plan-policy manifest schema",
@@ -67,7 +68,7 @@ const TEXT_POLICY_PATTERNS = [
   [PLAN_POLICY_REASONS.secretMutation, /(?:^|[\s/'"])\.env(?:\b|$)|\bmaster\.key\b|\bsecrets[\\/]|\b[A-Z0-9_]*(?:SECRET|API_KEY)[A-Z0-9_]*\s*=/i],
   [PLAN_POLICY_REASONS.releaseAction, /\bgh\s+pr\s+merge\b|\bnpm\s+publish\b|\bdeploy(?:ment|ing|ed)?\b|\bgit\s+push\s+origin\s+(?:main|master)\b/i],
   [PLAN_POLICY_REASONS.externalCommunication, /\b(?:email|slack|webhook)\b|\bPOST\s+https?:\/\/(?!(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:[/?#]|$))[^\s'"`]+|\bcurl\b[^\r\n]*?(?:-X|--request)\s*POST\b[^\r\n]*https?:\/\/(?!(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:[/?#]|$))/i],
-  [PLAN_POLICY_REASONS.promptInjection, /ignore\s+previous\s+instructions|disable\s+safety\s+checks|you\s+are\s+now\s+unrestricted/i],
+  [PLAN_POLICY_REASONS.promptInjection, /ignore\s+previous\s+instructions|disable\s+safety\s+checks|you\s+are\s+now\s+unrestricted|\b(?:ignore|disregard|override|bypass|skip|forget|discard)\b[\s\w]{0,30}\b(?:prior|previous|above|preceding|earlier|all|any)?[\s\w]{0,15}\b(?:instruction|rule|polic(?:y|ies)|safety|constraint|restriction|guideline|prompt)\b|\b(?:you\s+are\s+now|act\s+as|new\s+instructions\s*:|system\s*:)/i],
 ] as const;
 
 const REQUIRED_PLAN_HEADERS = [
@@ -172,6 +173,39 @@ function parsePlanPolicySidecar(sidecar: unknown): SidecarParseResult {
   };
 }
 
+function isWithinWorkspace(workspaceRoot: string, candidate: string): boolean { const relativePath = relative(workspaceRoot, candidate); return relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath); }
+
+function canonicalizePath(path: string): string | null {
+  const unresolvedSegments: string[] = []; let candidate = path;
+  while (true) {
+    try {
+      return resolve(realpathSync(candidate), ...unresolvedSegments);
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) return null;
+      const parent = dirname(candidate);
+      if (parent === candidate) return null;
+      unresolvedSegments.unshift(basename(candidate)); candidate = parent;
+    }
+  }
+}
+
+export function resolveWorkspacePath(workspaceRoot: string, path: string): string | null {
+  const canonicalWorkspaceRoot = canonicalizePath(resolve(workspaceRoot));
+  const canonicalPath = canonicalWorkspaceRoot ? canonicalizePath(isAbsolute(path) ? resolve(path) : resolve(workspaceRoot, path)) : null;
+  return canonicalWorkspaceRoot && canonicalPath && isWithinWorkspace(canonicalWorkspaceRoot, canonicalPath) ? canonicalPath : null;
+}
+
+export function resolveAllowedWorkspacePaths(sidecar: unknown, workspaceRoot: string): readonly string[] | null {
+  const parsedSidecar = parsePlanPolicySidecar(sidecar);
+  if (!parsedSidecar.success || resolve(parsedSidecar.data.workspaceRoot) !== resolve(workspaceRoot)) return null; const paths: string[] = [];
+  for (const allowedPath of parsedSidecar.data.allowedRelativePaths) {
+    if (allowedPath.includes("..")) return null;
+    const resolvedPath = resolveWorkspacePath(workspaceRoot, allowedPath);
+    if (!resolvedPath) return null; paths.push(resolvedPath);
+  }
+  return paths;
+}
+
 export function validatePlanPolicy(sidecar: unknown, planText: string, workspaceRoot: string): PlanPolicyDecision {
   const parsedSidecar = parsePlanPolicySidecar(sidecar);
   if (!parsedSidecar.success) {
@@ -197,11 +231,7 @@ export function validatePlanPolicy(sidecar: unknown, planText: string, workspace
       continue;
     }
 
-    const resolvedPath = isAbsolute(allowedPath)
-      ? resolve(allowedPath)
-      : resolve(trustedWorkspaceRoot, allowedPath);
-    const relativePath = relative(trustedWorkspaceRoot, resolvedPath);
-    if (relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
+    if (!resolveWorkspacePath(trustedWorkspaceRoot, allowedPath)) {
       reasons.push(PLAN_POLICY_REASONS.pathOutsideWorkspace);
     }
   }

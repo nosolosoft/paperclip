@@ -46,6 +46,7 @@ const MODEL = "anthropic/claude-sonnet-5";
 const PRIMARY_AGENTS = ["Sisyphus - ultraworker", "Hephaestus - Deep Agent", "Prometheus - Plan Builder", "Atlas - Plan Executor"] as const;
 
 export type FakeRunner = { readonly calls: ChildInvocation[]; run: (input: ChildInvocation) => Promise<ChildProcessResult> };
+export type FakeGitChanges = { readonly tracked?: string; readonly untracked?: string };
 
 export function sha256(value: string): string { return createHash("sha256").update(value).digest("hex"); }
 
@@ -53,7 +54,10 @@ export function jsonl(sessionId: string, text = "complete"): ChildProcessResult 
   return { exitCode: 0, timedOut: false, stdout: `${JSON.stringify({ type: "text", sessionID: sessionId, part: { text } })}\n`, stderr: "" };
 }
 
-export function createFakeRunner(onRun?: (input: ChildInvocation) => ChildProcessResult): FakeRunner {
+export function createFakeRunner(
+  onRun?: (input: ChildInvocation) => ChildProcessResult,
+  gitChanges: FakeGitChanges = {},
+): FakeRunner {
   const calls: ChildInvocation[] = [];
   return { calls, run: async (input) => {
     calls.push(input);
@@ -63,6 +67,12 @@ export function createFakeRunner(onRun?: (input: ChildInvocation) => ChildProces
     if (command === "models") return { exitCode: 0, timedOut: false, stdout: `${MODEL}\n`, stderr: "" };
     if (command === "worktree list --porcelain") return { exitCode: 0, timedOut: false, stdout: `worktree ${input.cwd}\n`, stderr: "" };
     if (command === "status --porcelain") return { exitCode: 0, timedOut: false, stdout: "", stderr: "" };
+    if (command === "diff --name-only --no-renames -z HEAD") {
+      return { exitCode: 0, timedOut: false, stdout: gitChanges.tracked ?? "", stderr: "" };
+    }
+    if (command === "ls-files --others --exclude-standard -z") {
+      return { exitCode: 0, timedOut: false, stdout: gitChanges.untracked ?? "", stderr: "" };
+    }
     return onRun?.(input) ?? jsonl("unexpected");
   } };
 }

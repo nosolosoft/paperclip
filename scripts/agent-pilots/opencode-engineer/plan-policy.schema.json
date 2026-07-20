@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paperclip.ai/schemas/agent-pilots/opencode-engineer/plan-policy/v1.json",
+  "title": "OpenCode Engineer plan policy sidecar",
+  "description": "Version 1 manifest for deterministic autonomous-plan policy review.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "taskId",
+    "planPath",
+    "planHash",
+    "workspaceRoot",
+    "allowedRelativePaths",
+    "verificationCommands",
+    "unresolvedDecisions",
+    "destructiveActions",
+    "externalSideEffects",
+    "requiresHumanDecision"
+  ],
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "taskId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "planPath": {
+      "type": "string",
+      "minLength": 1
+    },
+    "planHash": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$"
+    },
+    "workspaceRoot": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?:/|[A-Za-z]:[\\\\/])"
+    },
+    "allowedRelativePaths": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "verificationCommands": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "unresolvedDecisions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "destructiveActions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "externalSideEffects": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "requiresHumanDecision": {
+      "type": "boolean"
+    }
+  }
+}

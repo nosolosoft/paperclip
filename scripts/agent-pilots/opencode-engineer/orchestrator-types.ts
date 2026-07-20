@@ -73,4 +73,5 @@ export type OrchestrationDependencies = {
   readonly readSidecar?: (path: string) => Promise<unknown>;
   readonly detectFallbackWarning?: (stdout: string, stderr: string) => Promise<boolean>;
   readonly signal?: AbortSignal;
+  readonly instanceRoot?: string;
 };

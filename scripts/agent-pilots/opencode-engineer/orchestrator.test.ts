@@ -1,8 +1,8 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { orchestrateOpenCodeTask, writeOrchestrationEvidence } from "./orchestrator.js";
-import { agentName, createFakeRunner, createWorktree, dependencies, jsonl, PLAN_TEXT, requestFor, runCalls, sha256, writeRestartState } from "./orchestrator.test-helpers.js";
+import { agentName, createFakeRunner, createWorktree, dependencies, instanceRootForWorktree, jsonl, PLAN_TEXT, requestFor, runCalls, sha256, writeRestartState } from "./orchestrator.test-helpers.js";
 import { statePathForTask } from "./orchestrator-state.js";
 
 describe("orchestrateOpenCodeTask", () => {
@@ -118,7 +118,7 @@ describe("orchestrateOpenCodeTask", () => {
   ])("fails closed without spawning a child for %s state", async (_label, contents) => {
     // Given
     const worktree = await createWorktree();
-    const statePath = statePathForTask(worktree, "PAP-123");
+    const statePath = statePathForTask("PAP-123", instanceRootForWorktree(worktree));
     await mkdir(dirname(statePath), { recursive: true });
     await writeFile(statePath, contents, "utf8");
     const runner = createFakeRunner(() => jsonl("unexpected"));
@@ -129,6 +129,28 @@ describe("orchestrateOpenCodeTask", () => {
     // Then
     expect(result.state.stage).toBe("failed_closed");
     expect(result.state.lastError).toContain("state corruption");
+    expect(runCalls(runner)).toEqual([]);
+  });
+
+  it("keeps the attempt cap after the disposable worktree is deleted and recreated", async () => {
+    // Given
+    const originalWorktree = await createWorktree();
+    const externalInstanceRoot = instanceRootForWorktree(originalWorktree);
+    await writeRestartState(originalWorktree, "init", 3, false, externalInstanceRoot);
+    await rm(originalWorktree, { recursive: true, force: true });
+    const recreatedWorktree = await createWorktree();
+    const runner = createFakeRunner(() => jsonl("unexpected"));
+
+    // When
+    const result = await orchestrateOpenCodeTask(
+      requestFor(recreatedWorktree),
+      dependencies(runner, recreatedWorktree, () => 0, externalInstanceRoot),
+    );
+
+    // Then
+    await expect(access(join(recreatedWorktree, ".omo"))).rejects.toThrow();
+    expect(result.state.stage).toBe("exhausted_or_blocked");
+    expect(result.state.attempt).toBe(3);
     expect(runCalls(runner)).toEqual([]);
   });
 

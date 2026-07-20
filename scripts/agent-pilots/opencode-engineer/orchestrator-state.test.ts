@@ -2,7 +2,7 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { loadState, redactExcerpt } from "./orchestrator-state.js";
+import { loadState, redactExcerpt, statePathForTask } from "./orchestrator-state.js";
 
 describe("redactExcerpt", () => {
   it.each([
@@ -34,5 +34,16 @@ describe("loadState", () => {
 
     // Then
     await expect(load).rejects.toThrow("state corruption");
+  });
+
+  it("stores task state below the external instance-owned root", async () => {
+    // Given
+    const instanceRoot = await mkdtemp(join(tmpdir(), "paperclip-instance-"));
+
+    // When
+    const statePath = statePathForTask("PAP-123", instanceRoot);
+
+    // Then
+    expect(statePath).toBe(join(instanceRoot, "data", "pilots", "opencode-engineer", "PAP-123", "state.json"));
   });
 });

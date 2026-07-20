@@ -53,7 +53,7 @@ async function defaultOhMyOpenAgentVersion(): Promise<string | null> {
 export async function orchestrateOpenCodeTask(request: OrchestrationRequest, dependencies: OrchestrationDependencies): Promise<{ readonly statePath: string; readonly state: OrchestrationState }> {
   const now = dependencies.now ?? Date.now;
   const runner = dependencies.runner ?? createNodeChildRunner();
-  const statePath = statePathForTask(request.worktree, request.taskId);
+  const statePath = statePathForTask(request.taskId, dependencies.instanceRoot);
   let loaded: OrchestrationState | null;
   try {
     loaded = await loadState(statePath);

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { resolvePaperclipInstanceRoot } from "../../../packages/shared/src/home-paths.js";
 import type { OrchestrationRequest, OrchestrationStage, OrchestrationState } from "./orchestrator-types.js";
 
 const SECRET_PATTERNS = [
@@ -42,8 +43,8 @@ export function redactExcerpt(value: string): string {
   return redacted.length > MAX_SAVED_ERROR_LENGTH ? `${redacted.slice(0, MAX_SAVED_ERROR_LENGTH)}...` : redacted;
 }
 
-export function statePathForTask(worktree: string, taskId: string): string {
-  return join(worktree, ".omo", "opencode-engineer", taskId, "state.json");
+export function statePathForTask(taskId: string, instanceRoot = resolvePaperclipInstanceRoot()): string {
+  return join(instanceRoot, "data", "pilots", "opencode-engineer", taskId, "state.json");
 }
 
 export function createState(request: OrchestrationRequest, now: Date, baselineGitStatusHash: string | null): OrchestrationState {
@@ -70,7 +71,7 @@ export function hashText(value: string): string {
 }
 
 export async function writeStateAtomically(path: string, state: OrchestrationState): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const temporaryPath = `${path}.${process.pid}.${Date.now()}.tmp`;
   await writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   await rename(temporaryPath, path);

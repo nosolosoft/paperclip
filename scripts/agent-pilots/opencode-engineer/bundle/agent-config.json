@@ -1,0 +1,49 @@
+{
+  "name": "OpenCode Engineer",
+  "role": "engineer",
+  "title": "OpenCode Engineer (Pilot)",
+  "icon": "terminal",
+  "reportsTo": "00000000-0000-0000-0000-000000000000",
+  "capabilities": "Implements exactly one assigned OppTests issue at a time through the bounded Prometheus->Atlas->Sisyphus orchestration helper, opens PRs against develop, and hands work to QA. Pilot agent; see _pilotNotes for authoring-time placeholders.",
+  "desiredSkills": [
+    "paperclipai/optional/product/design-critique",
+    "paperclipai/bundled/software-development/github-pr-workflow",
+    "paperclipai/bundled/paperclip-operations/issue-triage"
+  ],
+  "adapterType": "opencode_local",
+  "adapterConfig": {
+    "agent": "Sisyphus - ultraworker",
+    "model": "anthropic/claude-sonnet-5",
+    "variant": "high",
+    "timeoutSec": 3600,
+    "cwd": "/home/manu/proyectos/www/opptests-pilot-smoke-placeholder",
+    "dangerouslySkipPermissions": false
+  },
+  "runtimeConfig": {
+    "heartbeat": {
+      "enabled": false,
+      "wakeOnDemand": true,
+      "maxTurnContinuation": {
+        "enabled": true,
+        "maxAttempts": 2,
+        "delayMs": 1000
+      }
+    }
+  },
+  "budgetMonthlyCents": 0,
+  "permissions": {
+    "canCreateAgents": false,
+    "canCreateSkills": false
+  },
+  "metadata": {
+    "pilot": true,
+    "planId": "recover-opencode-engineer-pilot",
+    "sourceTodo": "T5"
+  },
+  "_pilotNotes": {
+    "reportsTo": "Placeholder UUID (all zeros), not a real agent id. T7 MUST overwrite this with the live CEO agent id, re-read fresh at hire time; never hire an agent with this literal value.",
+    "adapterConfig.cwd": "Pilot-default placeholder for authoring/testing only, not a real directory. T7 creates a real disposable smoke worktree for the e2e smoke; T10 sets the final cwd to /home/manu/proyectos/www/opptests per plan Wave 2.",
+    "instructionsBundle": "Not embedded in this file. T8 uploads AGENTS.md, HEARTBEAT.md, SOUL.md, and TOOLS.md from this same bundle directory verbatim as the managed instructions bundle with entryFile=AGENTS.md; the content lives once, in those four files.",
+    "forbiddenFields": "adapterConfig must never contain promptTemplate, chrome, search, fastMode, effort, or modelReasoningEffort. See plan Out-of-scope section."
+  }
+}

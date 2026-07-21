@@ -73,3 +73,4 @@ scripts/local-agent-instructions/
 *.bundle
 scripts/__pycache__/
 .gstack/
+.tokensave

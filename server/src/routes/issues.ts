@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
@@ -28,6 +28,7 @@ import {
   acceptIssueThreadInteractionSchema,
   attachmentArtifactWorkProductMetadataSchema,
   cancelIssueThreadInteractionSchema,
+  companySearchExtractQuerySchema,
   companySearchQuerySchema,
   createIssueAttachmentMetadataSchema,
   createIssueThreadInteractionSchema,
@@ -54,6 +55,7 @@ import {
   rejectIssueThreadInteractionSchema,
   restoreIssueDocumentRevisionSchema,
   respondIssueThreadInteractionSchema,
+  submitIssueThreadInteractionVerdictsSchema,
   updateIssueWorkProductSchema,
   updateDocumentAnnotationThreadSchema,
   upsertIssueDocumentSchema,
@@ -62,6 +64,9 @@ import {
   isClosedIsolatedExecutionWorkspace,
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
+  type CompactIssue,
+  type CompanySearchExtractQuery,
+  type CompanySearchExtractResponse,
   type CompanySearchQuery,
   type CompanySearchResponse,
   type ExecutionWorkspace,
@@ -93,6 +98,7 @@ import * as serviceIndex from "../services/index.js";
 import {
   accessService,
   agentService,
+  companySkillService,
   companyService,
   companySearchService,
   executionWorkspaceService,
@@ -101,10 +107,12 @@ import {
   issueApprovalService,
   issueRecoveryActionService,
   issueThreadInteractionService,
+  inboxAgentPolicyService,
   ISSUE_LIST_DEFAULT_LIMIT,
   ISSUE_LIST_MAX_LIMIT,
   issueReferenceService,
   issueService,
+  type IssueFilters,
   clampIssueListLimit,
   documentService,
   documentAnnotationService,
@@ -114,6 +122,7 @@ import {
   workProductService,
 } from "../services/index.js";
 import { buildPlanReviewContext } from "../services/plan-review-context.js";
+import { hydrateSuccessfulRunHandoffLiveness } from "../services/successful-run-handoff-state.js";
 import {
   TASK_WATCHDOG_ORIGIN_KIND,
   resolveTaskWatchdogMutationScope,
@@ -123,7 +132,7 @@ import type { TaskWatchdogServiceDeps, taskWatchdogService } from "../services/t
 import { logger } from "../middleware/logger.js";
 import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
 import { validateResponsibleUser } from "../services/responsible-user.js";
-import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
+import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectIssueWorkspaceCommandPaths,
@@ -143,6 +152,7 @@ import {
 } from "../services/issue-dependency-wakeups.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { executionWorkspaceService as executionWorkspaceServiceDirect } from "../services/execution-workspaces.js";
+import { decisionTrainingService } from "../services/decision-training.js";
 import { feedbackService } from "../services/feedback.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import {
@@ -193,6 +203,9 @@ const updateIssueRouteSchema = updateIssueSchema.extend({
 const refreshExternalObjectsSchema = z.object({
   objectIds: z.array(z.string().uuid()).max(50).optional(),
 }).strict();
+const inboxArchiveBodySchema = z.object({
+  userId: z.string().trim().min(1).optional(),
+}).strict().default({});
 const externalObjectSummariesSchema = z.object({
   issueIds: z.array(z.string().uuid()).max(1000),
 }).strict();
@@ -252,6 +265,7 @@ type RecoveryRevalidationTrigger =
   | "work_product"
   | "read_projection";
 type CompanySearchService = {
+  extract(companyId: string, query: CompanySearchExtractQuery): Promise<CompanySearchExtractResponse>;
   search(companyId: string, query: CompanySearchQuery): Promise<CompanySearchResponse>;
 };
 type ActivityIssueRelationSummary = {
@@ -445,6 +459,7 @@ async function auditAgentIssueCreateAttributionSpoof(input: {
     actorId: actor.actorId,
     agentId: actor.agentId,
     runId: actor.runId,
+    agentApiKeyId: actor.agentApiKeyId,
     action: input.action === "rejected"
       ? "issue.attribution_spoof_rejected"
       : "issue.attribution_spoof_stripped",
@@ -576,7 +591,7 @@ function summarizeIssueWorkspaceForActivity(
   issue: IssueWorkspaceAuditInput,
   names: WorkspaceNameMaps,
 ) {
-  const settings = parseIssueExecutionWorkspaceSettings(issue.executionWorkspaceSettings);
+  const settings = parseIssueExecutionWorkspaceSettings(issue.executionWorkspaceSettings, { includeEnvironmentId: true });
   const mode = settings?.mode ?? issue.executionWorkspacePreference ?? null;
   const executionWorkspaceId = issue.executionWorkspaceId ?? null;
   const projectWorkspaceId = issue.projectWorkspaceId ?? null;
@@ -687,6 +702,7 @@ function successfulRunHandoffStateFromActivity(row: {
   return {
     state,
     required: state === "required",
+    hasLiveContinuation: false,
     sourceRunId:
       readNonEmptyString(details.sourceRunId)
       ?? readNonEmptyString(details.source_run_id)
@@ -713,6 +729,7 @@ async function listSuccessfulRunHandoffStates(
   db: Db,
   companyId: string,
   issueIds: string[],
+  options?: { hydrateLiveness?: boolean },
 ): Promise<Map<string, SuccessfulRunHandoffState>> {
   if (issueIds.length === 0) return new Map();
   const rows = await db
@@ -739,7 +756,9 @@ async function listSuccessfulRunHandoffStates(
     const state = successfulRunHandoffStateFromActivity(row);
     if (state) states.set(row.entityId, state);
   }
-  return states;
+  return options?.hydrateLiveness === false
+    ? states
+    : hydrateSuccessfulRunHandoffLiveness(db, companyId, states);
 }
 
 type RecoveryActionsLister = {
@@ -1768,6 +1787,94 @@ function isAssigneeSelfCommentOnTerminalIssue(input: {
   return input.actorId === input.assigneeAgentId;
 }
 
+function readToolActionExecutionStatus(value: unknown) {
+  return value === "approved"
+    || value === "executing"
+    || value === "executed"
+    || value === "failed"
+    || value === "expired"
+    ? value
+    : null;
+}
+
+function readToolActionContinuationContext(interaction: {
+  status: string;
+  payload?: unknown;
+  result?: unknown;
+}) {
+  const payload = readObject(interaction.payload);
+  const toolActionPayload = readObject(payload.toolAction);
+  const toolName = readNonEmptyString(toolActionPayload.toolName);
+  const actionRequestId = readNonEmptyString(toolActionPayload.actionRequestId);
+  if (!toolName || !actionRequestId) return null;
+
+  const result = readObject(interaction.result);
+  const toolActionResult = readObject(result.toolAction);
+  const declineReason = interaction.status === "rejected"
+    ? readNonEmptyString(result.reason)
+    : null;
+  const error = readNonEmptyString(toolActionResult.errorMessage);
+  const resultSummary = readNonEmptyString(toolActionResult.resultSummary);
+
+  if (interaction.status === "rejected") {
+    return {
+      toolName,
+      actionRequestId,
+      decision: "rejected",
+      executionStatus: "rejected",
+      ...(declineReason ? { declineReason } : {}),
+      instructions: `the action was declined${declineReason ? `: ${declineReason}` : ""}; do not retry the same call — adjust your approach or mark the task blocked/in_review with the decline reason.`,
+    };
+  }
+
+  if (interaction.status !== "accepted") return null;
+  const executionStatus = readToolActionExecutionStatus(toolActionResult.status);
+  if (!executionStatus) return null;
+
+  if (executionStatus === "executed") {
+    return {
+      toolName,
+      actionRequestId,
+      decision: "accepted",
+      executionStatus,
+      ...(resultSummary ? { resultSummary } : {}),
+      instructions: `the approved ${toolName} action already ran — do not call the tool again; continue with this result.`,
+    };
+  }
+
+  if (executionStatus === "failed") {
+    const failureMessage = error ?? "an unknown error";
+    return {
+      toolName,
+      actionRequestId,
+      decision: "accepted",
+      executionStatus,
+      ...(error ? { error } : {}),
+      instructions: `the approved action ran and failed with ${failureMessage}; adjust your approach — a fresh call will open a new approval.`,
+    };
+  }
+
+  return {
+    toolName,
+    actionRequestId,
+    decision: "accepted",
+    executionStatus,
+    instructions: `the approved ${toolName} action is ${executionStatus}; do not call the tool again while this approval is being processed.`,
+  };
+}
+
+const REQUEST_ITEM_VERDICTS_WAKE_COALESCE_WINDOW_MS = 2_000;
+
+function buildRequestItemVerdictsWakeIdempotencyKey(args: {
+  issueId: string;
+  interactionId: string;
+  at?: Date;
+}) {
+  const now = args.at ?? new Date();
+  const bucket = Math.floor(now.getTime() / REQUEST_ITEM_VERDICTS_WAKE_COALESCE_WINDOW_MS);
+  return `request_item_verdicts:${args.issueId}:${args.interactionId}:${bucket}`;
+}
+
 function queueResolvedInteractionContinuationWakeup(input: {
   heartbeat: ReturnType<typeof heartbeatService>;
   issue: { id: string; assigneeAgentId: string | null; status: string };
@@ -1785,6 +1892,8 @@ function queueResolvedInteractionContinuationWakeup(input: {
   source: string;
   forceFreshSession?: boolean;
   workspaceRefreshReason?: string | null;
+  newlyResolvedItemIds?: string[];
+  idempotencyKey?: string | null;
 }) {
   if (
     input.interaction.continuationPolicy !== "wake_assignee"
@@ -1802,6 +1911,14 @@ function queueResolvedInteractionContinuationWakeup(input: {
   const planTarget = readPlanConfirmationTargetForIssue(input.interaction.payload, input.issue.id);
   const interactionResult = readConfirmationResultForWake(input.interaction.result);
   const checkboxSelection = readCheckboxSelectionForWake(input.interaction);
+  const toolAction = readToolActionContinuationContext(input.interaction);
+  const newlyResolvedItemIds = input.newlyResolvedItemIds?.filter((value) => value.length > 0) ?? [];
+  const itemVerdicts = newlyResolvedItemIds.length > 0
+    ? {
+        newlyResolvedItemIds,
+        coalesceWindowMs: REQUEST_ITEM_VERDICTS_WAKE_COALESCE_WINDOW_MS,
+      }
+    : null;
   const planReviewInteraction =
     planTarget && input.interaction.kind === "request_confirmation"
       ? {
@@ -1826,8 +1943,11 @@ function queueResolvedInteractionContinuationWakeup(input: {
       sourceRunId: input.interaction.sourceRunId ?? null,
       ...(planReviewInteraction ? { planReviewInteraction } : {}),
       ...(checkboxSelection ? { checkboxSelection } : {}),
+      ...(toolAction ? { toolAction } : {}),
+      ...(itemVerdicts ? { itemVerdicts, newlyResolvedItemIds } : {}),
       mutation: "interaction",
     },
+    idempotencyKey: input.idempotencyKey ?? null,
     requestedByActorType: input.actor.actorType,
     requestedByActorId: input.actor.actorId,
     contextSnapshot: {
@@ -1840,6 +1960,8 @@ function queueResolvedInteractionContinuationWakeup(input: {
       sourceRunId: input.interaction.sourceRunId ?? null,
       ...(planReviewInteraction ? { planReviewInteraction } : {}),
       ...(checkboxSelection ? { checkboxSelection } : {}),
+      ...(toolAction ? { toolAction } : {}),
+      ...(itemVerdicts ? { itemVerdicts, newlyResolvedItemIds } : {}),
       wakeReason: "issue_commented",
       source: input.source,
       ...(forceFreshSession ? { forceFreshSession: true } : {}),
@@ -2034,6 +2156,420 @@ class AutoApprovalIssueMissingError extends Error {
   }
 }
 
+function toCompactIssue(issue: any): CompactIssue {
+  return {
+    id: issue.id,
+    companyId: issue.companyId,
+    projectId: issue.projectId,
+    projectWorkspaceId: issue.projectWorkspaceId,
+    goalId: issue.goalId,
+    parentId: issue.parentId,
+    title: issue.title,
+    description: issue.description,
+    status: issue.status,
+    workMode: issue.workMode,
+    priority: issue.priority,
+    assigneeAgentId: issue.assigneeAgentId,
+    assigneeUserId: issue.assigneeUserId,
+    checkoutRunId: issue.checkoutRunId,
+    executionRunId: issue.executionRunId,
+    executionAgentNameKey: issue.executionAgentNameKey,
+    executionLockedAt: issue.executionLockedAt,
+    createdByAgentId: issue.createdByAgentId,
+    createdByUserId: issue.createdByUserId,
+    issueNumber: issue.issueNumber,
+    identifier: issue.identifier,
+    originKind: issue.originKind,
+    originId: issue.originId,
+    originRunId: issue.originRunId,
+    requestDepth: issue.requestDepth,
+    billingCode: issue.billingCode,
+    executionWorkspaceId: issue.executionWorkspaceId,
+    startedAt: issue.startedAt,
+    completedAt: issue.completedAt,
+    cancelledAt: issue.cancelledAt,
+    createdAt: issue.createdAt,
+    updatedAt: issue.updatedAt,
+    ...(issue.labelIds ? { labelIds: issue.labelIds } : {}),
+    ...(issue.labels ? { labels: issue.labels } : {}),
+    ...(issue.blockedBy ? { blockedBy: issue.blockedBy } : {}),
+    ...(issue.blockerAttention ? { blockerAttention: issue.blockerAttention } : {}),
+    ...(issue.blockedInboxAttention !== undefined ? { blockedInboxAttention: issue.blockedInboxAttention } : {}),
+    ...(issue.productivityReview ? { productivityReview: issue.productivityReview } : {}),
+    ...(issue.scheduledRetry ? { scheduledRetry: issue.scheduledRetry } : {}),
+    ...(issue.liveDescendantCount !== undefined ? { liveDescendantCount: issue.liveDescendantCount } : {}),
+    ...(issue.myLastTouchAt !== undefined ? { myLastTouchAt: issue.myLastTouchAt } : {}),
+    ...(issue.lastExternalCommentAt !== undefined ? { lastExternalCommentAt: issue.lastExternalCommentAt } : {}),
+    ...(issue.lastActivityAt !== undefined ? { lastActivityAt: issue.lastActivityAt } : {}),
+    ...(issue.isUnreadForMe !== undefined ? { isUnreadForMe: issue.isUnreadForMe } : {}),
+    activeRecoveryAction: issue.activeRecoveryAction ?? null,
+    successfulRunHandoff: issue.successfulRunHandoff ?? null,
+  };
+}
+
+function compactIssueListEtag(issues: CompactIssue[]): string {
+  const hash = createHash("sha256")
+    .update(JSON.stringify(issues))
+    .digest("base64url");
+  return `"compact-issues:${hash}"`;
+}
+
+function requestMatchesEtag(ifNoneMatchHeader: string | undefined, etag: string): boolean {
+  if (!ifNoneMatchHeader) return false;
+  return ifNoneMatchHeader
+    .split(",")
+    .map((value) => value.trim())
+    .some((value) => value === "*" || value === etag || value === `W/${etag}`);
+}
+
+const ISSUE_LIST_SERVER_CACHE_TTL_MS = 2_000;
+const ISSUE_LIST_SERVER_CACHE_STALE_MS = 5_000;
+export const ISSUE_LIST_SERVER_CACHE_MAX_ENTRIES = 256;
+const ISSUE_LIST_STORM_WINDOW_MS = 500;
+const ISSUE_LIST_STORM_THRESHOLD = 4;
+const ISSUE_LIST_MAX_ACTOR_CLIENT_INFLIGHT = 8;
+
+type IssueListPreparedResponse =
+  | {
+      kind: "compact";
+      body: CompactIssue[];
+      etag: string;
+      cacheControl: string;
+    }
+  | {
+      kind: "full";
+      body: unknown[];
+    };
+
+type IssueListCacheStatus = "miss" | "hit" | "coalesced" | "stale" | "retry";
+
+type IssueListStormEvent = {
+  event: "request_storm_detected";
+  route: string;
+  companyId: string;
+  actorType: string;
+  actorIdentityHash: string;
+  clientHash: string;
+  cacheKeyHash: string;
+  queryKeys: string[];
+  identicalInFlightCount: number;
+  windowMs: number;
+  referer: string | null;
+  visibilityHint: string | null;
+};
+
+type IssueListDiagnostics = {
+  onComputeStart?: (context: { companyId: string; cacheKeyHash: string }) => void | Promise<void>;
+  onStormDetected?: (event: IssueListStormEvent) => void;
+};
+
+type IssueListCacheEntry = {
+  response: IssueListPreparedResponse;
+  expiresAt: number;
+  staleUntil: number;
+};
+
+type IssueListInflightEntry = {
+  promise: Promise<IssueListPreparedResponse>;
+  startedAt: number;
+  waiterCount: number;
+  stormLogged: boolean;
+};
+
+const issueListResponseCache = new Map<string, IssueListCacheEntry>();
+const issueListInflight = new Map<string, IssueListInflightEntry>();
+const issueListActorClientInflight = new Map<string, number>();
+
+export function __getIssueListResponseCacheSizeForTests() {
+  return issueListResponseCache.size;
+}
+
+export function __clearIssueListResponseCacheForTests() {
+  issueListResponseCache.clear();
+}
+
+function shortHash(value: string): string {
+  return createHash("sha256").update(value).digest("base64url").slice(0, 16);
+}
+
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .filter((key) => record[key] !== undefined)
+    .map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`)
+    .join(",")}}`;
+}
+
+function normalizeIssueListCacheValue(value: unknown): unknown {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (Array.isArray(value)) {
+    return value.map(normalizeIssueListCacheValue).sort((a, b) => stableJson(a).localeCompare(stableJson(b)));
+  }
+  if (typeof value === "object") {
+    const normalized: Record<string, unknown> = {};
+    for (const [key, nestedValue] of Object.entries(value as Record<string, unknown>)) {
+      const next = normalizeIssueListCacheValue(nestedValue);
+      if (next !== undefined) normalized[key] = next;
+    }
+    return normalized;
+  }
+  return value;
+}
+
+function issueListActorIdentity(req: Request, companyId: string) {
+  if (req.actor.type === "agent") {
+    const onBehalfMembership = req.actor.onBehalfOfUserId
+      ? req.actor.onBehalfOfMemberships?.find((membership) => membership.companyId === companyId) ?? null
+      : null;
+    const key = [
+      "agent",
+      companyId,
+      req.actor.agentId ?? "unknown-agent",
+      req.actor.keyId ?? req.actor.source ?? "agent-auth",
+      req.actor.onBehalfOfUserId ?? "no-responsible-user",
+      onBehalfMembership?.status ?? "no-responsible-user-status",
+      onBehalfMembership?.membershipRole ?? "no-responsible-user-role",
+    ].join(":");
+    return { actorType: "agent", key, hash: shortHash(key) };
+  }
+
+  if (req.actor.type === "board") {
+    const sessionPart = req.actor.source === "session"
+      ? `cookie:${shortHash(String(req.headers.cookie ?? "no-cookie"))}`
+      : req.actor.keyId ?? req.actor.source ?? "board";
+    const key = [
+      "board",
+      companyId,
+      req.actor.source ?? "board",
+      req.actor.userId ?? "unknown-user",
+      sessionPart,
+    ].join(":");
+    return { actorType: "board", key, hash: shortHash(key) };
+  }
+
+  const key = ["none", companyId, req.actor.source ?? "none"].join(":");
+  return { actorType: "none", key, hash: shortHash(key) };
+}
+
+function issueListClientIdentity(req: Request) {
+  const forwardedFor = Array.isArray(req.headers["x-forwarded-for"])
+    ? req.headers["x-forwarded-for"][0]
+    : req.headers["x-forwarded-for"];
+  const client = [
+    String(forwardedFor ?? req.ip ?? "unknown-ip").split(",")[0]?.trim() ?? "unknown-ip",
+    req.header("user-agent") ?? "unknown-agent",
+  ].join(":");
+  return { key: client, hash: shortHash(client) };
+}
+
+function safeRefererPath(req: Request): string | null {
+  const referer = req.header("referer");
+  if (!referer) return null;
+  try {
+    return new URL(referer).pathname;
+  } catch {
+    return referer.split("?")[0]?.slice(0, 160) ?? null;
+  }
+}
+
+function issueListRequestKey(input: {
+  req: Request;
+  companyId: string;
+  normalizedQuery: Record<string, unknown>;
+}) {
+  const route = "GET /api/companies/:companyId/issues";
+  const actor = issueListActorIdentity(input.req, input.companyId);
+  const client = issueListClientIdentity(input.req);
+  const normalizedQuery = normalizeIssueListCacheValue(input.normalizedQuery) as Record<string, unknown>;
+  const queryKeys = Object.keys(normalizedQuery).sort();
+  const key = stableJson({
+    actor: actor.key,
+    companyId: input.companyId,
+    query: normalizedQuery,
+    route,
+  });
+  return {
+    actor,
+    client,
+    key,
+    keyHash: shortHash(key),
+    queryKeys,
+    route,
+  };
+}
+
+function pruneIssueListResponseCache(now: number) {
+  for (const [key, entry] of issueListResponseCache) {
+    if (entry.staleUntil <= now) issueListResponseCache.delete(key);
+  }
+}
+
+function touchIssueListResponseCacheEntry(key: string, entry: IssueListCacheEntry) {
+  issueListResponseCache.delete(key);
+  issueListResponseCache.set(key, entry);
+}
+
+function trimIssueListResponseCache() {
+  while (issueListResponseCache.size > ISSUE_LIST_SERVER_CACHE_MAX_ENTRIES) {
+    const oldestKey = issueListResponseCache.keys().next().value as string | undefined;
+    if (oldestKey === undefined) return;
+    issueListResponseCache.delete(oldestKey);
+  }
+}
+
+function setIssueListResponseCacheEntry(key: string, entry: IssueListCacheEntry) {
+  touchIssueListResponseCacheEntry(key, entry);
+  trimIssueListResponseCache();
+}
+
+function decrementIssueListActorClientInflight(actorClientKey: string) {
+  const next = (issueListActorClientInflight.get(actorClientKey) ?? 1) - 1;
+  if (next <= 0) issueListActorClientInflight.delete(actorClientKey);
+  else issueListActorClientInflight.set(actorClientKey, next);
+}
+
+async function coordinateIssueListGet(input: {
+  req: Request;
+  companyId: string;
+  requestKey: ReturnType<typeof issueListRequestKey>;
+  allowTtlCache: boolean;
+  diagnostics?: IssueListDiagnostics;
+  compute: () => Promise<IssueListPreparedResponse>;
+}): Promise<{
+  response: IssueListPreparedResponse | null;
+  cacheStatus: IssueListCacheStatus;
+  identicalInFlightCount: number;
+  retryAfterSeconds?: number;
+}> {
+  const now = Date.now();
+  pruneIssueListResponseCache(now);
+
+  const cached = input.allowTtlCache ? issueListResponseCache.get(input.requestKey.key) : undefined;
+  if (cached && cached.expiresAt > now) {
+    touchIssueListResponseCacheEntry(input.requestKey.key, cached);
+    return { response: cached.response, cacheStatus: "hit", identicalInFlightCount: 0 };
+  }
+
+  const existing = issueListInflight.get(input.requestKey.key);
+  if (existing) {
+    existing.waiterCount += 1;
+    const identicalInFlightCount = existing.waiterCount + 1;
+    if (
+      !existing.stormLogged &&
+      identicalInFlightCount >= ISSUE_LIST_STORM_THRESHOLD &&
+      now - existing.startedAt <= ISSUE_LIST_STORM_WINDOW_MS
+    ) {
+      existing.stormLogged = true;
+      const event: IssueListStormEvent = {
+        event: "request_storm_detected",
+        route: input.requestKey.route,
+        companyId: input.companyId,
+        actorType: input.requestKey.actor.actorType,
+        actorIdentityHash: input.requestKey.actor.hash,
+        clientHash: input.requestKey.client.hash,
+        cacheKeyHash: input.requestKey.keyHash,
+        queryKeys: input.requestKey.queryKeys,
+        identicalInFlightCount,
+        windowMs: now - existing.startedAt,
+        referer: safeRefererPath(input.req),
+        visibilityHint: input.req.header("x-paperclip-tab-visible") ?? null,
+      };
+      logger.warn(event, "request_storm_detected");
+      input.diagnostics?.onStormDetected?.(event);
+    }
+    const response = await existing.promise;
+    return { response, cacheStatus: "coalesced", identicalInFlightCount };
+  }
+
+  const actorClientKey = `${input.requestKey.actor.key}:${input.requestKey.client.key}`;
+  const actorClientInflight = issueListActorClientInflight.get(actorClientKey) ?? 0;
+  if (actorClientInflight >= ISSUE_LIST_MAX_ACTOR_CLIENT_INFLIGHT) {
+    if (cached && cached.staleUntil > now) {
+      touchIssueListResponseCacheEntry(input.requestKey.key, cached);
+      return { response: cached.response, cacheStatus: "stale", identicalInFlightCount: 0 };
+    }
+    return { response: null, cacheStatus: "retry", identicalInFlightCount: 0, retryAfterSeconds: 1 };
+  }
+
+  issueListActorClientInflight.set(actorClientKey, actorClientInflight + 1);
+  const promise = (async () => {
+    await input.diagnostics?.onComputeStart?.({
+      companyId: input.companyId,
+      cacheKeyHash: input.requestKey.keyHash,
+    });
+    return input.compute();
+  })();
+  const inflightEntry: IssueListInflightEntry = {
+    promise,
+    startedAt: now,
+    waiterCount: 0,
+    stormLogged: false,
+  };
+  issueListInflight.set(input.requestKey.key, inflightEntry);
+
+  try {
+    const response = await promise;
+    if (input.allowTtlCache) {
+      setIssueListResponseCacheEntry(input.requestKey.key, {
+        response,
+        expiresAt: Date.now() + ISSUE_LIST_SERVER_CACHE_TTL_MS,
+        staleUntil: Date.now() + ISSUE_LIST_SERVER_CACHE_STALE_MS,
+      });
+    }
+    return { response, cacheStatus: "miss", identicalInFlightCount: 1 };
+  } finally {
+    if (issueListInflight.get(input.requestKey.key) === inflightEntry) {
+      issueListInflight.delete(input.requestKey.key);
+    }
+    decrementIssueListActorClientInflight(actorClientKey);
+  }
+}
+
+function estimatedJsonBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+function logIssueListRequest(input: {
+  req: Request;
+  res: Response;
+  companyId: string;
+  requestKey: ReturnType<typeof issueListRequestKey>;
+  startedAt: number;
+  cacheStatus: IssueListCacheStatus;
+  bodyBytes: number;
+  etagOutcome: "none" | "fresh" | "not_modified";
+  identicalInFlightCount: number;
+}) {
+  input.res.once("finish", () => {
+    const contentEncoding = input.res.getHeader("content-encoding");
+    const contentLength = Number(input.res.getHeader("content-length"));
+    logger.debug({
+      event: "safe_get_request_observed",
+      route: input.requestKey.route,
+      companyId: input.companyId,
+      actorType: input.requestKey.actor.actorType,
+      actorIdentityHash: input.requestKey.actor.hash,
+      clientHash: input.requestKey.client.hash,
+      cacheKeyHash: input.requestKey.keyHash,
+      queryKeys: input.requestKey.queryKeys,
+      requestCount: input.identicalInFlightCount,
+      durationMs: Date.now() - input.startedAt,
+      statusCode: input.res.statusCode,
+      responseBytes: input.bodyBytes,
+      compressedBytes: contentEncoding && Number.isFinite(contentLength) ? contentLength : null,
+      contentEncoding: contentEncoding ? String(contentEncoding) : null,
+      cacheStatus: input.cacheStatus,
+      etagOutcome: input.etagOutcome,
+      referer: safeRefererPath(input.req),
+      visibilityHint: input.req.header("x-paperclip-tab-visible") ?? null,
+    }, "safe authenticated GET observed");
+  });
+}
+
 export function issueRoutes(
   db: Db,
   storage: StorageService,
@@ -2050,6 +2586,18 @@ export function issueRoutes(
     searchRateLimiter?: CompanySearchRateLimiter;
     pluginWorkerManager?: PluginWorkerManager;
     taskWatchdogEnqueueWakeup?: TaskWatchdogServiceDeps["enqueueWakeup"] | null;
+    recoveryActionEnqueueWakeup?: (
+      agentId: string,
+      options: Parameters<ReturnType<typeof heartbeatService>["wakeup"]>[1],
+    ) => ReturnType<ReturnType<typeof heartbeatService>["wakeup"]>;
+    issueListDiagnostics?: IssueListDiagnostics;
+    approveToolActionRequest?: (input: {
+      companyId: string;
+      issueId: string;
+      interactionId: string;
+      actionRequestId: string;
+      actor: { agentId?: string | null; userId?: string | null };
+    }) => Promise<unknown>;
   } = {},
 ) {
   const router = Router();
@@ -2058,6 +2606,7 @@ export function issueRoutes(
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
   });
+  const enqueueRecoveryActionWakeup = opts.recoveryActionEnqueueWakeup ?? heartbeat.wakeup;
   const feedback = feedbackService(db);
   const companiesSvc = companyService(db);
   let searchSvc = opts.searchService ?? null;
@@ -2075,7 +2624,9 @@ export function issueRoutes(
   const executionWorkspacesSvc = executionWorkspaceServiceDirect(db);
   const workProductsSvc = workProductService(db);
   const documentsSvc = documentService(db);
+  const companySkillsSvc = companySkillService(db);
   const documentAnnotationsSvc = documentAnnotationService(db);
+  const decisionTrainingSvc = decisionTrainingService(db);
   const issueReferencesSvc = issueReferenceService(db);
   const issueThreadInteractionsSvc = issueThreadInteractionService(db);
   const taskWatchdogFactory: TaskWatchdogServiceFactory | undefined = Object.prototype.hasOwnProperty.call(
@@ -2341,9 +2892,11 @@ export function issueRoutes(
         actorId: input.actor.actorId,
         agentId: input.actor.agentId,
         runId: input.actor.runId,
+        agentApiKeyId: input.actor.agentApiKeyId,
         action: "heartbeat.cancelled",
         entityType: "heartbeat_run",
         entityId: cancelledRunId,
+        issueId: input.issue.id,
         details: {
           source: "issue_comment_scheduled_retry_superseded",
           issueId: input.issue.id,
@@ -3078,6 +3631,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: input.actor.actorId,
         agentId: input.actor.agentId,
         runId: input.actor.runId,
+        agentApiKeyId: input.actor.agentApiKeyId,
         action: "issue.thread_interaction_expired",
         entityType: "issue",
         entityId: input.issue.id,
@@ -3185,6 +3739,10 @@ async function applyDefaultQaDispositionRouting(input: {
 
   function isTaskBridgeKeyActor(req: Request) {
     return req.actor.type === "agent" && req.actor.source === "agent_key" && req.actor.keyScope?.kind === "task_bridge";
+  }
+
+  function isSkillTestScopedActor(req: Request) {
+    return req.actor.type === "agent" && req.actor.keyScope?.kind === "skill_test";
   }
 
   function taskBridgeOriginForActor(req: Request) {
@@ -3417,6 +3975,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "issue.checkout_lock_adopted",
         entityType: "issue",
         entityId: issue.id,
@@ -3638,6 +4197,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: input.actor.actorId,
       agentId: input.actor.agentId,
       runId: input.actor.runId,
+      agentApiKeyId: input.actor.agentApiKeyId,
       action: "issue.task_watchdog_followups_serialized",
       entityType: "issue",
       entityId: watchdogParent.id,
@@ -4379,6 +4939,40 @@ async function applyDefaultQaDispositionRouting(input: {
     });
   });
 
+  router.get("/companies/:companyId/search/extract", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const companyScopeDecision = await access.decide({
+      actor: req.actor,
+      action: "company_scope:read",
+      resource: { type: "company", companyId },
+    });
+    if (!companyScopeDecision.allowed) {
+      res.status(403).json({ error: "Company search is outside this actor's authorization boundary" });
+      return;
+    }
+    const parsedQuery = companySearchExtractQuerySchema.safeParse(req.query);
+    if (!parsedQuery.success) {
+      res.status(400).json({
+        error: parsedQuery.error.issues[0]?.message ?? "Invalid extract search query",
+      });
+      return;
+    }
+    const rateLimit = searchRateLimiter.consume(companySearchRateLimitActor(req, companyId));
+    res.setHeader("X-RateLimit-Limit", String(rateLimit.limit));
+    res.setHeader("X-RateLimit-Remaining", String(rateLimit.remaining));
+    if (!rateLimit.allowed) {
+      res.setHeader("Retry-After", String(rateLimit.retryAfterSeconds));
+      res.status(429).json({
+        error: "Search rate limit exceeded",
+        retryAfterSeconds: rateLimit.retryAfterSeconds,
+      });
+      return;
+    }
+    const result = await getSearchService().extract(companyId, parsedQuery.data);
+    res.json(result);
+  });
+
   router.get("/companies/:companyId/search", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
@@ -4391,7 +4985,21 @@ async function applyDefaultQaDispositionRouting(input: {
       res.status(403).json({ error: "Company search is outside this actor's authorization boundary" });
       return;
     }
-    const query = companySearchQuerySchema.parse(req.query);
+    const parsedQuery = companySearchQuerySchema.safeParse(req.query);
+    if (!parsedQuery.success) {
+      res.status(400).json({
+        error: parsedQuery.error.issues[0]?.message ?? "Invalid search query",
+      });
+      return;
+    }
+    let query = parsedQuery.data;
+    if (query.assigneeUserId === "me") {
+      if (req.actor.type !== "board" || !req.actor.userId) {
+        res.status(403).json({ error: "assigneeUserId=me requires board authentication" });
+        return;
+      }
+      query = { ...query, assigneeUserId: req.actor.userId };
+    }
     const rateLimit = searchRateLimiter.consume(companySearchRateLimitActor(req, companyId));
     res.setHeader("X-RateLimit-Limit", String(rateLimit.limit));
     res.setHeader("X-RateLimit-Remaining", String(rateLimit.remaining));
@@ -4408,6 +5016,7 @@ async function applyDefaultQaDispositionRouting(input: {
   });
 
   router.get("/companies/:companyId/issues", async (req, res) => {
+    const startedAt = Date.now();
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     if (isTaskBridgeKeyActor(req)) {
@@ -4446,6 +5055,8 @@ async function applyDefaultQaDispositionRouting(input: {
     const attention = req.query.attention as string | undefined;
     const sortField = req.query.sortField as string | undefined;
     const sortDir = req.query.sortDir as string | undefined;
+    const view = req.query.view as string | undefined;
+    const compactView = view === "compact";
     const hasPlanDocument = parseOptionalBooleanQuery(req.query.hasPlanDocument);
     const includeLiveDescendantSummary = parseOptionalBooleanQuery(req.query.includeLiveDescendantSummary);
     const assigneeAgentFilterRaw = req.query.assigneeAgentId;
@@ -4469,6 +5080,10 @@ async function applyDefaultQaDispositionRouting(input: {
     }
     if (attention !== undefined && attention !== "blocked") {
       res.status(400).json({ error: "attention must be 'blocked' when provided" });
+      return;
+    }
+    if (view !== undefined && view !== "compact") {
+      res.status(400).json({ error: "view must be 'compact' when provided" });
       return;
     }
     if (rawLimit !== undefined && (parsedLimit === null || !Number.isInteger(parsedLimit) || parsedLimit <= 0)) {
@@ -4514,7 +5129,7 @@ async function applyDefaultQaDispositionRouting(input: {
     }
     const offset = parsedOffset ?? 0;
 
-    const rawResult = await svc.list(companyId, {
+    const listFilters: IssueFilters = {
       attention: attention === "blocked" ? "blocked" : undefined,
       status: req.query.status as string | string[] | undefined,
       assigneeAgentId,
@@ -4548,33 +5163,143 @@ async function applyDefaultQaDispositionRouting(input: {
       offset,
       sortField: sortField === "updated" ? "updated" : undefined,
       sortDir: sortDir === "asc" || sortDir === "desc" ? sortDir : undefined,
+    };
+    const requestKey = issueListRequestKey({
+      req,
+      companyId,
+      normalizedQuery: {
+        ...listFilters,
+        view: compactView ? "compact" : undefined,
+      },
     });
-    const result = await actorCanReadCompanyScope(req, companyId)
-      ? rawResult
-      : await filterIssuesForActor(req, rawResult);
-    const issueIds = result.map((issue) => issue.id);
-    const [handoffStates, recoveryActionByIssue] = await Promise.all([
-      listSuccessfulRunHandoffStates(db, companyId, issueIds),
-      recoveryActionsSvc.listActiveForIssues(companyId, issueIds),
-    ]);
-    const actor = getActorInfo(req);
-    await Promise.all(result.map(async (issue) => {
-      const activeRecoveryAction = recoveryActionByIssue.get(issue.id) ?? null;
-      if (!activeRecoveryAction) return;
-      const revalidated = await revalidateActiveSourceRecoveryForRead({
-        issue,
-        trigger: "read_projection",
-        actor,
-        activeRecoveryAction,
+    const coordinated = await coordinateIssueListGet({
+      req,
+      companyId,
+      requestKey,
+      allowTtlCache: compactView,
+      diagnostics: opts.issueListDiagnostics,
+      compute: async () => {
+        const rawResult = await svc.list(companyId, listFilters);
+        const result = await actorCanReadCompanyScope(req, companyId)
+          ? rawResult
+          : await filterIssuesForActor(req, rawResult);
+        const issueIds = result.map((issue) => issue.id);
+        if (compactView) {
+          const [handoffStates, recoveryActionByIssue] = await Promise.all([
+            listSuccessfulRunHandoffStates(db, companyId, issueIds),
+            recoveryActionsSvc.listActiveForIssues(companyId, issueIds),
+          ]);
+          const actor = getActorInfo(req);
+          await Promise.all(result.map(async (issue) => {
+            const activeRecoveryAction = recoveryActionByIssue.get(issue.id) ?? null;
+            if (!activeRecoveryAction) return;
+            const revalidated = await revalidateActiveSourceRecoveryForRead({
+              issue,
+              trigger: "read_projection",
+              actor,
+              activeRecoveryAction,
+            });
+            if (revalidated) recoveryActionByIssue.set(issue.id, revalidated);
+            else recoveryActionByIssue.delete(issue.id);
+          }));
+          const compactResult = result.map((issue) =>
+            toCompactIssue({
+              ...issue,
+              activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
+              successfulRunHandoff: handoffStates.get(issue.id) ?? null,
+            }));
+          return {
+            kind: "compact",
+            body: compactResult,
+            etag: compactIssueListEtag(compactResult),
+            cacheControl: "private, must-revalidate",
+          };
+        }
+        const [handoffStates, recoveryActionByIssue] = await Promise.all([
+          listSuccessfulRunHandoffStates(db, companyId, issueIds),
+          recoveryActionsSvc.listActiveForIssues(companyId, issueIds),
+        ]);
+        const actor = getActorInfo(req);
+        await Promise.all(result.map(async (issue) => {
+          const activeRecoveryAction = recoveryActionByIssue.get(issue.id) ?? null;
+          if (!activeRecoveryAction) return;
+          const revalidated = await revalidateActiveSourceRecoveryForRead({
+            issue,
+            trigger: "read_projection",
+            actor,
+            activeRecoveryAction,
+          });
+          if (revalidated) recoveryActionByIssue.set(issue.id, revalidated);
+          else recoveryActionByIssue.delete(issue.id);
+        }));
+        return {
+          kind: "full",
+          body: result.map((issue) => ({
+            ...issue,
+            successfulRunHandoff: handoffStates.get(issue.id) ?? null,
+            activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
+          })),
+        };
+      },
+    });
+
+    res.setHeader("X-Paperclip-Request-Cache", coordinated.cacheStatus);
+    if (!coordinated.response) {
+      const body = {
+        error: "Too many concurrent issue-list requests for this actor/client",
+        retryAfterSeconds: coordinated.retryAfterSeconds ?? 1,
+      };
+      res.setHeader("Retry-After", String(body.retryAfterSeconds));
+      logIssueListRequest({
+        req,
+        res,
+        companyId,
+        requestKey,
+        startedAt,
+        cacheStatus: "retry",
+        bodyBytes: estimatedJsonBytes(body),
+        etagOutcome: "none",
+        identicalInFlightCount: coordinated.identicalInFlightCount,
       });
-      if (revalidated) recoveryActionByIssue.set(issue.id, revalidated);
-      else recoveryActionByIssue.delete(issue.id);
-    }));
-    res.json(result.map((issue) => ({
-      ...issue,
-      successfulRunHandoff: handoffStates.get(issue.id) ?? null,
-      activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
-    })));
+      res.status(429).json(body);
+      return;
+    }
+
+    if (coordinated.response.kind === "compact") {
+      res.setHeader("Cache-Control", coordinated.response.cacheControl);
+      res.setHeader("ETag", coordinated.response.etag);
+      const etagMatched = requestMatchesEtag(req.header("if-none-match"), coordinated.response.etag);
+      logIssueListRequest({
+        req,
+        res,
+        companyId,
+        requestKey,
+        startedAt,
+        cacheStatus: coordinated.cacheStatus,
+        bodyBytes: etagMatched ? 0 : estimatedJsonBytes(coordinated.response.body),
+        etagOutcome: etagMatched ? "not_modified" : "fresh",
+        identicalInFlightCount: coordinated.identicalInFlightCount,
+      });
+      if (etagMatched) {
+        res.status(304).end();
+        return;
+      }
+      res.json(coordinated.response.body);
+      return;
+    }
+
+    logIssueListRequest({
+      req,
+      res,
+      companyId,
+      requestKey,
+      startedAt,
+      cacheStatus: coordinated.cacheStatus,
+      bodyBytes: estimatedJsonBytes(coordinated.response.body),
+      etagOutcome: "none",
+      identicalInFlightCount: coordinated.identicalInFlightCount,
+    });
+    res.json(coordinated.response.body);
   });
 
   router.get("/companies/:companyId/issues/count", async (req, res) => {
@@ -4683,6 +5408,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "label.created",
       entityType: "label",
       entityId: label.id,
@@ -4693,12 +5419,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.delete("/labels/:labelId", async (req, res) => {
     const labelId = req.params.labelId as string;
-    const existing = await svc.getLabelById(labelId);
-    if (!existing) {
-      res.status(404).json({ error: "Label not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const existing = await getAccessibleResource(req, res, svc.getLabelById(labelId), "Label not found");
+    if (!existing) return;
     const removed = await svc.deleteLabel(labelId);
     if (!removed) {
       res.status(404).json({ error: "Label not found" });
@@ -4711,6 +5433,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "label.deleted",
       entityType: "label",
       entityId: removed.id,
@@ -4721,12 +5444,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.get("/issues/:id/heartbeat-context", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
 
     const wakeCommentId =
@@ -4869,18 +5588,14 @@ async function applyDefaultQaDispositionRouting(input: {
           }
         : null,
       planReviewContext,
-      currentExecutionWorkspace,
+      currentExecutionWorkspace: compactIssueExecutionWorkspace(currentExecutionWorkspace),
     });
   });
 
   router.get("/issues/:id/diagnostics/blockers", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
 
     const diagnostic = await svc.getBlockerDiagnostics(issue.id);
@@ -4910,12 +5625,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.get("/issues/:id/diagnostics/wakes", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
 
     const [wakeDiagnostic, blockerDiagnostic, includeInternalIds] = await Promise.all([
@@ -4959,12 +5670,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.get("/issues/:id/diagnostics/subtree", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
 
     const [diagnostic, includeInternalIds] = await Promise.all([
@@ -5013,13 +5720,12 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.get("/issues/:id", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    const inboxArchiveFieldsPromise = req.actor.type === "board" && req.actor.userId
+      ? svc.getActiveInboxArchiveFields(issue, req.actor.userId)
+      : Promise.resolve({});
     const [
       { project, goal },
       ancestors,
@@ -5033,6 +5739,7 @@ async function applyDefaultQaDispositionRouting(input: {
       scheduledRetry,
       activeRecoveryAction,
       linkedCases,
+      inboxArchiveFields,
     ] = await Promise.all([
       resolveIssueProjectAndGoal(issue),
       svc.getAncestors(issue.id),
@@ -5046,6 +5753,7 @@ async function applyDefaultQaDispositionRouting(input: {
       svc.getCurrentScheduledRetry(issue.id),
       recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id),
       listIssueLinkedCases(db, issue.companyId, issue.id),
+      inboxArchiveFieldsPromise,
     ]);
     const recoveryActionsByRelationIssue = await relationRecoveryActionMap(
       recoveryActionsSvc,
@@ -5071,6 +5779,7 @@ async function applyDefaultQaDispositionRouting(input: {
     const workProducts = await workProductsSvc.listForIssue(issue.id);
     res.json({
       ...issue,
+      ...inboxArchiveFields,
       goalId: goal?.id ?? issue.goalId,
       ancestors,
       ...(blockerAttention ? { blockerAttention } : {}),
@@ -5094,24 +5803,16 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.get("/issues/:id/watchdog", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
     res.json(await taskWatchdogsSvc.getActiveForIssue(issue.companyId, issue.id));
   });
 
   router.put("/issues/:id/watchdog", validate(upsertIssueWatchdogSchema), async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (await rejectTaskWatchdogConfigMutation(req, res)) return;
@@ -5134,6 +5835,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: created ? "issue.watchdog_created" : "issue.watchdog_updated",
       entityType: "issue",
       entityId: issue.id,
@@ -5150,12 +5852,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.delete("/issues/:id/watchdog", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (await rejectTaskWatchdogConfigMutation(req, res)) return;
@@ -5174,6 +5872,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "issue.watchdog_removed",
         entityType: "issue",
         entityId: issue.id,
@@ -5190,12 +5889,9 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.get("/issues/:id/recovery-actions", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const active = await revalidateActiveSourceRecoveryForRead({
       issue,
       trigger: "read_projection",
@@ -5209,12 +5905,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.post("/issues/:id/recovery-actions/resolve", validate(resolveIssueRecoveryActionSchema), async (req, res) => {
     const id = req.params.id as string;
-    const existing = await svc.getById(id);
-    if (!existing) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!existing) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
     const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(existing.companyId, existing.id);
     if (
@@ -5267,7 +5959,11 @@ async function applyDefaultQaDispositionRouting(input: {
       updateFields,
       actorType: req.actor.type,
     });
-
+    const recordedOutcome = restoredReturnAgentId
+      ? "handed_back"
+      : outcome === "restored" && sourceIssueStatus === "done"
+        ? "owner_completed"
+        : outcome;
     const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
     const result = await db.transaction(async (tx) => {
       let issue = existing;
@@ -5311,7 +6007,7 @@ async function applyDefaultQaDispositionRouting(input: {
           sourceIssueId: existing.id,
           actionId: actionId ?? null,
           status: actionStatus,
-          outcome,
+          outcome: recordedOutcome,
           resolutionNote: resolutionNote ?? null,
         },
         tx,
@@ -5330,6 +6026,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "issue.updated",
         entityType: "issue",
         entityId: result.issue.id,
@@ -5351,6 +6048,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.recovery_action_resolved",
       entityType: "issue",
       entityId: result.issue.id,
@@ -5366,32 +6064,36 @@ async function applyDefaultQaDispositionRouting(input: {
 
     if (
       sourceIssueStatus === "todo" &&
-      existing.status !== result.issue.status &&
-      result.issue.assigneeAgentId
+      result.issue.assigneeAgentId &&
+      (existing.status !== result.issue.status ||
+        existing.assigneeAgentId !== result.issue.assigneeAgentId)
     ) {
-      void heartbeat.wakeup(result.issue.assigneeAgentId, {
-        source: "automation",
-        triggerDetail: "system",
-        reason: "issue_recovery_action_restored",
-        payload: {
-          issueId: result.issue.id,
-          recoveryActionId: result.recoveryAction.id,
-          mutation: "recovery_action_resolution",
-        },
-        requestedByActorType: actor.actorType,
-        requestedByActorId: actor.actorId,
-        contextSnapshot: {
-          issueId: result.issue.id,
-          taskId: result.issue.id,
-          wakeReason: "issue_recovery_action_restored",
-          source: "issue.recovery_action_resolution",
-          recoveryActionId: result.recoveryAction.id,
-        },
-      }).catch((err) =>
+      try {
+        await enqueueRecoveryActionWakeup(result.issue.assigneeAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_recovery_action_restored",
+          payload: {
+            issueId: result.issue.id,
+            recoveryActionId: result.recoveryAction.id,
+            mutation: "recovery_action_resolution",
+          },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          contextSnapshot: {
+            issueId: result.issue.id,
+            taskId: result.issue.id,
+            wakeReason: "issue_recovery_action_restored",
+            source: "issue.recovery_action_resolution",
+            recoveryActionId: result.recoveryAction.id,
+          },
+        });
+      } catch (err) {
         logger.warn(
           { err, issueId: result.issue.id, agentId: result.issue.assigneeAgentId },
           "failed to wake agent after recovery action restored issue",
-        ));
+        );
+      }
     }
 
     res.json({
@@ -5405,12 +6107,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.get("/issues/:id/work-products", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const workProducts = await workProductsSvc.listForIssue(issue.id);
     res.json(workProducts);
@@ -5418,24 +6116,18 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.get("/issues/:id/external-objects", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const objects = await externalObjectsSvc.listForIssue(issue.id);
     res.json(objects);
   });
 
   router.get("/issues/:id/external-object-summary", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const summary = await externalObjectsSvc.getIssueSummary(issue.id);
     res.json(summary);
   });
@@ -5443,18 +6135,30 @@ async function applyDefaultQaDispositionRouting(input: {
   router.post("/companies/:companyId/issues/external-object-summaries", validate(externalObjectSummariesSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const summaries = await externalObjectsSvc.getIssueSummaries(companyId, req.body.issueIds);
+    const requestedIssueIds = [...new Set(req.body.issueIds as string[])];
+    const candidateIssues = requestedIssueIds.length > 0
+      ? await db
+        .select({
+          id: issueRows.id,
+          companyId: issueRows.companyId,
+          projectId: issueRows.projectId,
+          parentId: issueRows.parentId,
+          assigneeAgentId: issueRows.assigneeAgentId,
+          assigneeUserId: issueRows.assigneeUserId,
+          status: issueRows.status,
+        })
+        .from(issueRows)
+        .where(and(eq(issueRows.companyId, companyId), inArray(issueRows.id, requestedIssueIds)))
+      : [];
+    const readableIssueIds = (await filterIssuesForActor(req, candidateIssues)).map((issue) => issue.id);
+    const summaries = await externalObjectsSvc.getIssueSummaries(companyId, readableIssueIds);
     res.json({ summaries: Object.fromEntries(summaries) });
   });
 
   router.post("/issues/:id/external-objects/refresh", validate(refreshExternalObjectsSchema), async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     const actor = getActorInfo(req);
     const results = await externalObjectsSvc.refreshIssueObjects(issue.id, {
@@ -5468,6 +6172,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "external_object.refresh_requested",
       entityType: "issue",
       entityId: issue.id,
@@ -5481,12 +6186,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.get("/issues/:id/documents", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const docs = await documentsSvc.listIssueDocuments(issue.id, {
       includeSystem: req.query.includeSystem === "true",
@@ -5496,12 +6197,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.get("/issues/:id/documents/:key", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
     if (!keyParsed.success) {
@@ -5526,12 +6223,9 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.get("/issues/:id/documents/:key/annotations", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
     if (!keyParsed.success) {
       res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });
@@ -5550,12 +6244,8 @@ async function applyDefaultQaDispositionRouting(input: {
     validate(createDocumentAnnotationThreadSchema),
     async (req, res) => {
       const id = req.params.id as string;
-      const issue = await svc.getById(id);
-      if (!issue) {
-        res.status(404).json({ error: "Issue not found" });
-        return;
-      }
-      assertCompanyAccess(req, issue.companyId);
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
       if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
       const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
       if (!keyParsed.success) {
@@ -5577,6 +6267,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "issue.document_annotation_thread_created",
         entityType: "issue",
         entityId: issue.id,
@@ -5602,12 +6293,9 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.get("/issues/:id/documents/:key/annotations/:threadId", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
     if (!keyParsed.success) {
       res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });
@@ -5630,12 +6318,8 @@ async function applyDefaultQaDispositionRouting(input: {
     validate(createDocumentAnnotationCommentSchema),
     async (req, res) => {
       const id = req.params.id as string;
-      const issue = await svc.getById(id);
-      if (!issue) {
-        res.status(404).json({ error: "Issue not found" });
-        return;
-      }
-      assertCompanyAccess(req, issue.companyId);
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
       if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
       const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
       if (!keyParsed.success) {
@@ -5662,6 +6346,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "issue.document_annotation_comment_added",
         entityType: "issue",
         entityId: issue.id,
@@ -5688,12 +6373,8 @@ async function applyDefaultQaDispositionRouting(input: {
     validate(updateDocumentAnnotationThreadSchema),
     async (req, res) => {
       const id = req.params.id as string;
-      const issue = await svc.getById(id);
-      if (!issue) {
-        res.status(404).json({ error: "Issue not found" });
-        return;
-      }
-      assertCompanyAccess(req, issue.companyId);
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
       if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
       const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
       if (!keyParsed.success) {
@@ -5714,6 +6395,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: thread.status === "resolved"
           ? "issue.document_annotation_thread_resolved"
           : "issue.document_annotation_thread_reopened",
@@ -5733,12 +6415,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.put("/issues/:id/documents/:key", validate(upsertIssueDocumentSchema), async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
     const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
@@ -5788,6 +6466,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: result.created ? "issue.document_created" : "issue.document_updated",
       entityType: "issue",
       entityId: issue.id,
@@ -5813,6 +6492,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "issue.document_annotation_remapped",
         entityType: "issue",
         entityId: issue.id,
@@ -5862,12 +6542,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.post("/issues/:id/documents/:key/lock", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (req.actor.type !== "board") {
       res.status(403).json({ error: "Board authentication required" });
       return;
@@ -5893,6 +6569,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "issue.document_locked",
         entityType: "issue",
         entityId: issue.id,
@@ -5910,12 +6587,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.post("/issues/:id/documents/:key/unlock", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (req.actor.type !== "board") {
       res.status(403).json({ error: "Board authentication required" });
       return;
@@ -5936,6 +6609,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "issue.document_unlocked",
         entityType: "issue",
         entityId: issue.id,
@@ -5952,12 +6626,9 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.get("/issues/:id/documents/:key/revisions", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
     if (!keyParsed.success) {
       res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });
@@ -5973,12 +6644,8 @@ async function applyDefaultQaDispositionRouting(input: {
     async (req, res) => {
       const id = req.params.id as string;
       const revisionId = req.params.revisionId as string;
-      const issue = await svc.getById(id);
-      if (!issue) {
-        res.status(404).json({ error: "Issue not found" });
-        return;
-      }
-      assertCompanyAccess(req, issue.companyId);
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
       if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
       if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
       const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
@@ -6015,6 +6682,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "issue.document_restored",
         entityType: "issue",
         entityId: issue.id,
@@ -6041,6 +6709,7 @@ async function applyDefaultQaDispositionRouting(input: {
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
           action: "issue.document_annotation_remapped",
           entityType: "issue",
           entityId: issue.id,
@@ -6089,12 +6758,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.delete("/issues/:id/documents/:key", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (req.actor.type !== "board") {
       res.status(403).json({ error: "Board authentication required" });
       return;
@@ -6121,6 +6786,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.document_deleted",
       entityType: "issue",
       entityId: issue.id,
@@ -6165,12 +6831,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.post("/issues/:id/work-products", validate(createIssueWorkProductSchema), async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
     const actor = getActorInfo(req);
@@ -6199,6 +6861,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.work_product_created",
       entityType: "issue",
       entityId: issue.id,
@@ -6215,12 +6878,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.post("/issues/:id/low-trust/promotions", validate(promoteLowTrustOutputSchema), async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
@@ -6336,6 +6995,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.low_trust_output_promoted",
       entityType: "issue",
       entityId: issue.id,
@@ -6360,12 +7020,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.patch("/work-products/:id", validate(updateIssueWorkProductSchema), async (req, res) => {
     const id = req.params.id as string;
-    const existing = await workProductsSvc.getById(id);
-    if (!existing) {
-      res.status(404).json({ error: "Work product not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const existing = await getAccessibleResource(req, res, workProductsSvc.getById(id), "Work product not found");
+    if (!existing) return;
     const issue = await svc.getById(existing.issueId);
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
@@ -6404,6 +7060,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.work_product_updated",
       entityType: "issue",
       entityId: existing.issueId,
@@ -6420,12 +7077,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.delete("/work-products/:id", async (req, res) => {
     const id = req.params.id as string;
-    const existing = await workProductsSvc.getById(id);
-    if (!existing) {
-      res.status(404).json({ error: "Work product not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const existing = await getAccessibleResource(req, res, workProductsSvc.getById(id), "Work product not found");
+    if (!existing) return;
     const issue = await svc.getById(existing.issueId);
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
@@ -6445,6 +7098,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.work_product_deleted",
       entityType: "issue",
       entityId: existing.issueId,
@@ -6461,12 +7115,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.post("/issues/:id/read", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (req.actor.type !== "board") {
       res.status(403).json({ error: "Board authentication required" });
       return;
@@ -6483,6 +7133,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.read_marked",
       entityType: "issue",
       entityId: issue.id,
@@ -6493,12 +7144,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.delete("/issues/:id/read", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (req.actor.type !== "board") {
       res.status(403).json({ error: "Board authentication required" });
       return;
@@ -6515,6 +7162,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.read_unmarked",
       entityType: "issue",
       entityId: issue.id,
@@ -6523,55 +7171,90 @@ async function applyDefaultQaDispositionRouting(input: {
     res.json({ id: issue.id, removed });
   });
 
-  router.post("/issues/:id/inbox-archive", async (req, res) => {
+  async function resolveInboxArchiveTarget(
+    req: Request,
+    issue: { id: string; companyId: string },
+  ) {
+    if (req.actor.type === "board") {
+      if (!req.actor.userId) throw forbidden("Board user context required", { code: "inbox_target_user_unresolved" });
+      return {
+        userId: req.actor.userId,
+        targetResolvedFrom: "responsible_user" as const,
+        policyMode: null,
+      };
+    }
+    if (req.actor.type !== "agent") throw unauthorized("Authentication required");
+
+    const explicitUserId = typeof req.body?.userId === "string" ? req.body.userId.trim() || null : null;
+    const responsibleUserId = req.actor.onBehalfOfUserId?.trim() || null;
+    const userId = explicitUserId ?? responsibleUserId;
+    if (!userId) {
+      throw forbidden("Inbox target user could not be resolved", { code: "inbox_target_user_unresolved" });
+    }
+
+    const decision = await access.decide({
+      actor: req.actor,
+      action: "inbox:manage",
+      resource: { type: "issue", companyId: issue.companyId, issueId: issue.id },
+      scope: { userId },
+    });
+    if (!decision.allowed) {
+      const code = decision.reason === "inbox_management_disabled"
+        ? "inbox_management_disabled"
+        : decision.reason === "inbox_agent_not_allowed" || decision.reason === "deny_low_trust_boundary"
+          ? "inbox_agent_not_allowed"
+          : decision.reason === "inbox_target_user_unresolved"
+            ? "inbox_target_user_unresolved"
+            : userId !== responsibleUserId
+              ? "inbox_cross_user_grant_required"
+              : "inbox_agent_not_allowed";
+      throw forbidden(decision.explanation, { code, reason: decision.reason });
+    }
+
+    return {
+      userId,
+      targetResolvedFrom: explicitUserId ? "explicit" as const : "responsible_user" as const,
+      policyMode: decision.inboxPolicyMode ?? "open",
+    };
+  }
+
+  router.post("/issues/:id/inbox-archive", validate(inboxArchiveBodySchema), async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
-    if (req.actor.type !== "board") {
-      res.status(403).json({ error: "Board authentication required" });
-      return;
-    }
-    if (!req.actor.userId) {
-      res.status(403).json({ error: "Board user context required" });
-      return;
-    }
-    const archiveState = await svc.archiveInbox(issue.companyId, issue.id, req.actor.userId, new Date());
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    const target = await resolveInboxArchiveTarget(req, issue);
     const actor = getActorInfo(req);
+    const archiveState = await svc.archiveInbox(issue.companyId, issue.id, target.userId, new Date(), {
+      archivedByActorType: req.actor.type === "agent" ? "agent" : "user",
+      archivedByAgentId: actor.agentId,
+      archivedByRunId: actor.runId,
+    });
     await logActivity(db, {
       companyId: issue.companyId,
       actorType: actor.actorType,
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.inbox_archived",
       entityType: "issue",
       entityId: issue.id,
-      details: { userId: req.actor.userId, archivedAt: archiveState.archivedAt },
+      details: {
+        userId: target.userId,
+        archivedAt: archiveState.archivedAt,
+        targetResolvedFrom: target.targetResolvedFrom,
+        ...(target.policyMode ? { policyMode: target.policyMode } : {}),
+      },
     });
     res.json(archiveState);
   });
 
-  router.delete("/issues/:id/inbox-archive", async (req, res) => {
+  router.delete("/issues/:id/inbox-archive", validate(inboxArchiveBodySchema), async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
-    if (req.actor.type !== "board") {
-      res.status(403).json({ error: "Board authentication required" });
-      return;
-    }
-    if (!req.actor.userId) {
-      res.status(403).json({ error: "Board user context required" });
-      return;
-    }
-    const removed = await svc.unarchiveInbox(issue.companyId, issue.id, req.actor.userId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    const target = await resolveInboxArchiveTarget(req, issue);
+    const removed = await svc.unarchiveInbox(issue.companyId, issue.id, target.userId);
     const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: issue.companyId,
@@ -6579,35 +7262,33 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.inbox_unarchived",
       entityType: "issue",
       entityId: issue.id,
-      details: { userId: req.actor.userId },
+      details: {
+        userId: target.userId,
+        targetResolvedFrom: target.targetResolvedFrom,
+        ...(target.policyMode ? { policyMode: target.policyMode } : {}),
+      },
     });
-    res.json(removed ?? { ok: true });
+    res.json(removed ?? { ok: true, userId: target.userId });
   });
 
   router.get("/issues/:id/approvals", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const approvals = await issueApprovalsSvc.listApprovalsForIssue(id);
     res.json(approvals);
   });
 
   router.post("/issues/:id/approvals", validate(linkIssueApprovalSchema), async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (!(await assertApprovalMutationAllowedByRunContext(req, res, issue))) return;
     if (!(await assertCanManageIssueApprovalLinks(req, res, issue.companyId))) return;
@@ -6624,6 +7305,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.approval_linked",
       entityType: "issue",
       entityId: issue.id,
@@ -6637,12 +7319,8 @@ async function applyDefaultQaDispositionRouting(input: {
   router.delete("/issues/:id/approvals/:approvalId", async (req, res) => {
     const id = req.params.id as string;
     const approvalId = req.params.approvalId as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (!(await assertApprovalMutationAllowedByRunContext(req, res, issue))) return;
     if (!(await assertCanManageIssueApprovalLinks(req, res, issue.companyId))) return;
@@ -6656,6 +7334,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.approval_unlinked",
       entityType: "issue",
       entityId: issue.id,
@@ -6668,6 +7347,16 @@ async function applyDefaultQaDispositionRouting(input: {
   router.post("/companies/:companyId/issues", applyCreateIssueStatusDefault, validate(createIssueSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    if (isSkillTestScopedActor(req)) {
+      res.status(403).json({
+        error: "Skill-test run tokens cannot create issues.",
+        details: {
+          scopedIssueId: req.actor.keyScope?.kind === "skill_test" ? req.actor.keyScope.issueId : null,
+          securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+        },
+      });
+      return;
+    }
     if (await assertLowTrustControlPlaneDenied(req, res, companyId, null)) return;
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
     const sanitizedBody = await sanitizeIssueCreateAttribution(db, req, res, companyId, req.body, {
@@ -6788,10 +7477,12 @@ async function applyDefaultQaDispositionRouting(input: {
       projectId: createBody.projectId ?? null,
       executionPolicy,
     }, actor);
+    let deduplicationReason: "idempotency_key" | "recent_open_title" | null = null;
     const issue = await svc.create(companyId, {
       ...createBody,
       ...(taskBridgeOriginForActor(req) ?? {}),
       id: issueId,
+      originRunId: createBody.originRunId ?? actor.runId,
       executionPolicy,
       ...(sourceTrust ? { sourceTrust } : {}),
       createdByAgentId: actor.agentId,
@@ -6800,7 +7491,21 @@ async function applyDefaultQaDispositionRouting(input: {
       actorResponsibleUserId: authenticatedActorResponsibleUserId(req),
       trustExplicitResponsibleUserId: actor.actorType === "user",
       watchdogActorRunId: actor.runId,
+      onDeduplicated: (reason) => {
+        deduplicationReason = reason;
+      },
     });
+    if (deduplicationReason) {
+      const referenceSummary = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
+      res.status(200).json({
+        ...issue,
+        deduplicated: true,
+        deduplicationReason,
+        relatedWork: referenceSummary,
+        referencedIssueIdentifiers: referenceSummary.outbound.map((item) => item.issue.identifier ?? item.issue.id),
+      });
+      return;
+    }
     await issueReferencesSvc.syncIssue(issue.id);
     await externalObjectsSvc.syncIssueSafely(issue.id);
     const referenceSummary = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
@@ -6815,6 +7520,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.created",
       entityType: "issue",
       entityId: issue.id,
@@ -6850,6 +7556,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "issue.monitor_scheduled",
         entityType: "issue",
         entityId: issue.id,
@@ -6873,6 +7580,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "issue.watchdog_created",
         entityType: "issue",
         entityId: issue.id,
@@ -6905,12 +7613,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.post("/issues/:id/children", applyCreateIssueStatusDefault, validate(createChildIssueSchema), async (req, res) => {
     const parentId = req.params.id as string;
-    const parent = await svc.getById(parentId);
-    if (!parent) {
-      res.status(404).json({ error: "Parent issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, parent.companyId);
+    const parent = await getAccessibleResource(req, res, svc.getById(parentId), "Parent issue not found");
+    if (!parent) return;
     if (!isTaskBridgeKeyActor(req) && !(await assertIssueReadAllowed(req, res, parent))) return;
     if (!(await assertTaskWatchdogCreateIssueAllowed(req, res, parent.companyId, parent))) return;
     if (await assertLowTrustControlPlaneDenied(req, res, parent.companyId, parent)) return;
@@ -6987,6 +7691,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.child_created",
       entityType: "issue",
       entityId: issue.id,
@@ -7014,6 +7719,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "issue.monitor_scheduled",
         entityType: "issue",
         entityId: issue.id,
@@ -7038,6 +7744,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "issue.watchdog_created",
         entityType: "issue",
         entityId: issue.id,
@@ -7074,24 +7781,16 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.get("/issues/:id/accepted-plan-decompositions", async (req, res) => {
     const sourceIssueId = req.params.id as string;
-    const sourceIssue = await svc.getById(sourceIssueId);
-    if (!sourceIssue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, sourceIssue.companyId);
+    const sourceIssue = await getAccessibleResource(req, res, svc.getById(sourceIssueId), "Issue not found");
+    if (!sourceIssue) return;
     const decompositions = await svc.listAcceptedPlanDecompositions(sourceIssue.id);
     res.json(decompositions);
   });
 
   router.post("/issues/:id/accepted-plan-decompositions", validate(createAcceptedPlanDecompositionSchema), async (req, res) => {
     const sourceIssueId = req.params.id as string;
-    const sourceIssue = await svc.getById(sourceIssueId);
-    if (!sourceIssue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, sourceIssue.companyId);
+    const sourceIssue = await getAccessibleResource(req, res, svc.getById(sourceIssueId), "Issue not found");
+    if (!sourceIssue) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, sourceIssue))) return;
 
     const requestedChildren = [];
@@ -7186,6 +7885,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.accepted_plan_decomposition_updated",
       entityType: "issue",
       entityId: sourceIssue.id,
@@ -7214,6 +7914,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "issue.child_created",
         entityType: "issue",
         entityId: issue.id,
@@ -7241,6 +7942,7 @@ async function applyDefaultQaDispositionRouting(input: {
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
           action: "issue.monitor_scheduled",
           entityType: "issue",
           entityId: issue.id,
@@ -7287,12 +7989,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.post("/issues/:id/monitor/check-now", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     await assertCanManageIssueMonitor(access, req, issue.companyId, issue.assigneeAgentId, true);
 
     const actor = getActorInfo(req);
@@ -7309,12 +8007,8 @@ async function applyDefaultQaDispositionRouting(input: {
   router.post("/issues/:id/scheduled-retry/retry-now", async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
 
     const actor = getActorInfo(req);
     const result = await heartbeat.retryScheduledRetryNow({
@@ -7346,12 +8040,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.patch("/issues/:id", validate(updateIssueRouteSchema), async (req, res) => {
     const id = req.params.id as string;
-    const existing = await svc.getById(id);
-    if (!existing) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!existing) return;
     if (req.body.responsibleUserId !== undefined) {
       if (req.actor.type === "agent") {
         throw new HttpError(422, "Agents cannot change responsibleUserId", {
@@ -7522,9 +8212,11 @@ async function applyDefaultQaDispositionRouting(input: {
             actorId: actor.actorId,
             agentId: actor.agentId,
             runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
             action: "heartbeat.cancelled",
             entityType: "heartbeat_run",
             entityId: cancelled.id,
+            issueId: existing.id,
             details: {
               agentId: cancelled.agentId,
               source: "issue_comment_interrupt",
@@ -7766,9 +8458,11 @@ async function applyDefaultQaDispositionRouting(input: {
             actorId: actor.actorId,
             agentId: actor.agentId,
             runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
             action: "heartbeat.cancelled",
             entityType: "heartbeat_run",
             entityId: cancelled.id,
+            issueId: existing.id,
             details: { agentId: cancelled.agentId, source: "issue_status_cancelled", issueId: existing.id },
           });
         }
@@ -7780,9 +8474,11 @@ async function applyDefaultQaDispositionRouting(input: {
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
           action: "heartbeat.cancel_failed",
           entityType: "heartbeat_run",
           entityId: runToCancelForCancelledStatus.id,
+          issueId: existing.id,
           details: { source: "issue_status_cancelled", issueId: existing.id },
         });
       }
@@ -7890,6 +8586,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.updated",
       entityType: "issue",
       entityId: issue.id,
@@ -7923,7 +8620,7 @@ async function applyDefaultQaDispositionRouting(input: {
     });
 
     if (existing.status === "in_progress" && issue.status !== existing.status && issue.status !== "in_progress") {
-      await listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id])
+      await listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id], { hydrateLiveness: false })
         .then(async (handoffStates) => {
           const handoff = handoffStates.get(issue.id);
           if (handoff?.state !== "required") return;
@@ -7933,6 +8630,7 @@ async function applyDefaultQaDispositionRouting(input: {
             actorId: actor.actorId,
             agentId: actor.agentId,
             runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
             action: "issue.successful_run_handoff_resolved",
             entityType: "issue",
             entityId: issue.id,
@@ -7963,6 +8661,7 @@ async function applyDefaultQaDispositionRouting(input: {
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
           action: "issue.blockers_updated",
           entityType: "issue",
           entityId: issue.id,
@@ -7991,6 +8690,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "issue.reviewers_updated",
         entityType: "issue",
         entityId: issue.id,
@@ -8011,6 +8711,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "issue.approvers_updated",
         entityType: "issue",
         entityId: issue.id,
@@ -8034,6 +8735,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "issue.monitor_scheduled",
         entityType: "issue",
         entityId: issue.id,
@@ -8056,6 +8758,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "issue.monitor_cleared",
         entityType: "issue",
         entityId: issue.id,
@@ -8081,6 +8784,38 @@ async function applyDefaultQaDispositionRouting(input: {
             model,
           });
         }
+      }
+    }
+
+    if (
+      issue.harnessKind === "skill_test" &&
+      existing.status !== issue.status &&
+      (issue.status === "done" || issue.status === "cancelled")
+    ) {
+      const completedRun = await companySkillsSvc.completeTestRunForIssue({
+        companyId: issue.companyId,
+        issueId: issue.id,
+        outcome: issue.status === "done" ? "succeeded" : "cancelled",
+        error: issue.status === "cancelled" ? "Harness issue was cancelled" : null,
+      });
+      if (completedRun) {
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "company.skill_test_run_completed",
+          entityType: "company_skill_test_run",
+          entityId: completedRun.id,
+          issueId: issue.id,
+          details: {
+            issueId: issue.id,
+            status: completedRun.status,
+            outputDocumentKey: completedRun.outputDocumentKey,
+          },
+        });
       }
     }
 
@@ -8116,6 +8851,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "issue.comment_added",
         entityType: "issue",
         entityId: issue.id,
@@ -8472,6 +9208,7 @@ async function applyDefaultQaDispositionRouting(input: {
               actorId: "issue_update",
               agentId,
               runId: actor.runId,
+              agentApiKeyId: actor.agentApiKeyId,
               action: "issue.blockers_resolved_wake_emitted",
               entityType: "issue",
               entityId: dependentIssueId,
@@ -8496,12 +9233,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.delete("/issues/:id", async (req, res) => {
     const id = req.params.id as string;
-    const existing = await svc.getById(id);
-    if (!existing) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!existing) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
     const attachments = await svc.listAttachments(id);
 
@@ -8526,6 +9259,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.deleted",
       entityType: "issue",
       entityId: issue.id,
@@ -8537,12 +9271,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.post("/issues/:id/checkout", validate(checkoutIssueSchema), async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
 
     if (issue.projectId) {
       const project = await projectsSvc.getById(issue.projectId);
@@ -8582,6 +9312,9 @@ async function applyDefaultQaDispositionRouting(input: {
     if (req.actor.type === "agent" && !checkoutRunId) return;
     const updated = await svc.checkout(id, req.body.agentId, req.body.expectedStatuses, checkoutRunId);
     const actor = getActorInfo(req);
+    if (updated?.harnessKind === "skill_test") {
+      await companySkillsSvc.markTestRunRunning(updated.companyId, updated.id);
+    }
 
     await logActivity(db, {
       companyId: issue.companyId,
@@ -8589,6 +9322,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.checked_out",
       entityType: "issue",
       entityId: issue.id,
@@ -8621,12 +9355,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.post("/issues/:id/release", async (req, res) => {
     const id = req.params.id as string;
-    const existing = await svc.getById(id);
-    if (!existing) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!existing) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
     const actorRunId = requireAgentRunId(req, res);
     if (req.actor.type === "agent" && !actorRunId) return;
@@ -8666,6 +9396,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.released",
       entityType: "issue",
       entityId: released.id,
@@ -8684,12 +9415,8 @@ async function applyDefaultQaDispositionRouting(input: {
     }
 
     const id = req.params.id as string;
-    const existing = await svc.getById(id);
-    if (!existing) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!existing) return;
 
     const clearAssignee = req.query.clearAssignee === "true";
     const result = await svc.adminForceRelease(id, { clearAssignee });
@@ -8705,6 +9432,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.admin_force_release",
       entityType: "issue",
       entityId: result.issue.id,
@@ -8722,12 +9450,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.get("/issues/:id/comments", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const afterCommentId =
       typeof req.query.after === "string" && req.query.after.trim().length > 0
@@ -8757,12 +9481,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.get("/issues/:id/interactions", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const actor = getActorInfo(req);
     const interactionSvc = issueThreadInteractionService(db);
@@ -8780,12 +9500,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.post("/issues/:id/interactions", validate(createIssueThreadInteractionSchema), async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (req.actor.type === "agent") {
       if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
       if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
@@ -8796,6 +9512,9 @@ async function applyDefaultQaDispositionRouting(input: {
     const actor = getActorInfo(req);
     const agentSourceRunId = req.actor.type === "agent" ? requireAgentRunId(req, res) : null;
     if (req.actor.type === "agent" && !agentSourceRunId) return;
+    if (req.body.kind === "request_confirmation" && req.body.payload?.toolAction !== undefined) {
+      throw unprocessable("payload.toolAction is server-owned metadata and cannot be supplied when creating an interaction");
+    }
 
     const interaction = await issueThreadInteractionService(db).create(issue, {
       ...req.body,
@@ -8811,6 +9530,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.thread_interaction_created",
       entityType: "issue",
       entityId: issue.id,
@@ -8831,12 +9551,8 @@ async function applyDefaultQaDispositionRouting(input: {
     async (req, res) => {
       const id = req.params.id as string;
       const interactionId = req.params.interactionId as string;
-      const issue = await svc.getById(id);
-      if (!issue) {
-        res.status(404).json({ error: "Issue not found" });
-        return;
-      }
-      assertCompanyAccess(req, issue.companyId);
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
       if (await rejectAgentIssueThreadInteractionResolution(req, res, issue)) return;
       assertBoard(req);
 
@@ -8845,6 +9561,45 @@ async function applyDefaultQaDispositionRouting(input: {
         agentId: actor.agentId,
         userId: actor.actorType === "user" ? actor.actorId : null,
       });
+      const toolAction = interaction.payload && typeof interaction.payload === "object"
+        ? (interaction.payload as { toolAction?: { actionRequestId?: unknown } }).toolAction
+        : null;
+      let continuationInteraction = interaction;
+      if (
+        interaction.kind === "request_confirmation"
+        && interaction.status === "accepted"
+        && typeof toolAction?.actionRequestId === "string"
+        && opts.approveToolActionRequest
+      ) {
+        const approvalResult = await opts.approveToolActionRequest({
+          companyId: issue.companyId,
+          issueId: issue.id,
+          interactionId: interaction.id,
+          actionRequestId: toolAction.actionRequestId,
+          actor: {
+            agentId: actor.agentId,
+            userId: actor.actorType === "user" ? actor.actorId : null,
+          },
+        });
+        const approval = readObject(approvalResult);
+        const executionStatus = readToolActionExecutionStatus(approval.status);
+        if (executionStatus) {
+          const currentResult = readObject(interaction.result);
+          continuationInteraction = {
+            ...interaction,
+            result: {
+              ...currentResult,
+              toolAction: {
+                version: 1,
+                status: executionStatus,
+                errorMessage: readNonEmptyString(approval.error),
+                resultSummary: readNonEmptyString(approval.resultSummary),
+                updatedAt: new Date().toISOString(),
+              },
+            } as typeof interaction.result,
+          };
+        }
+      }
       let continuationWakeIssue = continuationIssue ?? issue;
 
       await logActivity(db, {
@@ -8853,6 +9608,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: interaction.status === "expired"
           ? "issue.thread_interaction_expired"
           : "issue.thread_interaction_accepted",
@@ -8880,6 +9636,7 @@ async function applyDefaultQaDispositionRouting(input: {
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
           action: "issue.updated",
           entityType: "issue",
           entityId: issue.id,
@@ -8949,14 +9706,14 @@ async function applyDefaultQaDispositionRouting(input: {
       queueResolvedInteractionContinuationWakeup({
         heartbeat,
         issue: continuationWakeIssue,
-        interaction,
+        interaction: continuationInteraction,
         actor,
         source: "issue.interaction.accept",
         forceFreshSession: acceptedPlanConfirmation,
         workspaceRefreshReason: acceptedPlanConfirmation ? "accepted_plan_confirmation" : null,
       });
 
-      res.json(interaction);
+      res.json(continuationInteraction);
     },
   );
 
@@ -8966,12 +9723,8 @@ async function applyDefaultQaDispositionRouting(input: {
     async (req, res) => {
       const id = req.params.id as string;
       const interactionId = req.params.interactionId as string;
-      const issue = await svc.getById(id);
-      if (!issue) {
-        res.status(404).json({ error: "Issue not found" });
-        return;
-      }
-      assertCompanyAccess(req, issue.companyId);
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
       if (await rejectAgentIssueThreadInteractionResolution(req, res, issue)) return;
       assertBoard(req);
 
@@ -8987,6 +9740,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: interaction.status === "expired"
           ? "issue.thread_interaction_expired"
           : "issue.thread_interaction_rejected",
@@ -9023,12 +9777,8 @@ async function applyDefaultQaDispositionRouting(input: {
     async (req, res) => {
       const id = req.params.id as string;
       const interactionId = req.params.interactionId as string;
-      const issue = await svc.getById(id);
-      if (!issue) {
-        res.status(404).json({ error: "Issue not found" });
-        return;
-      }
-      assertCompanyAccess(req, issue.companyId);
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
       if (await rejectAgentIssueThreadInteractionResolution(req, res, issue)) return;
       assertBoard(req);
 
@@ -9044,6 +9794,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "issue.thread_interaction_answered",
         entityType: "issue",
         entityId: issue.id,
@@ -9071,17 +9822,80 @@ async function applyDefaultQaDispositionRouting(input: {
   );
 
   router.post(
+    "/issues/:id/interactions/:interactionId/verdicts",
+    validate(submitIssueThreadInteractionVerdictsSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const interactionId = req.params.interactionId as string;
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
+      if (await rejectAgentIssueThreadInteractionResolution(req, res, issue)) return;
+      assertBoard(req);
+
+      const actor = getActorInfo(req);
+      const { interaction, newlyResolvedItemIds } = await issueThreadInteractionService(db).submitItemVerdicts(
+        issue,
+        interactionId,
+        req.body,
+        {
+          agentId: actor.agentId,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        },
+      );
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: interaction.status === "expired"
+          ? "issue.thread_interaction_expired"
+          : "issue.thread_interaction_item_verdicts_submitted",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          interactionId: interaction.id,
+          interactionKind: interaction.kind,
+          interactionStatus: interaction.status,
+          submittedVerdictCount: Array.isArray(req.body?.verdicts) ? req.body.verdicts.length : 0,
+          newlyResolvedItemCount: newlyResolvedItemIds.length,
+          newlyResolvedItemIds,
+          complete:
+            interaction.kind === "request_item_verdicts"
+              ? (interaction.result?.complete ?? false)
+              : false,
+        },
+      });
+
+      if (newlyResolvedItemIds.length > 0) {
+        queueResolvedInteractionContinuationWakeup({
+          heartbeat,
+          issue,
+          interaction,
+          actor,
+          source: "issue.interaction.verdicts",
+          newlyResolvedItemIds,
+          idempotencyKey: buildRequestItemVerdictsWakeIdempotencyKey({
+            issueId: issue.id,
+            interactionId: interaction.id,
+          }),
+        });
+      }
+
+      res.json(interaction);
+    },
+  );
+
+  router.post(
     "/issues/:id/interactions/:interactionId/cancel",
     validate(cancelIssueThreadInteractionSchema),
     async (req, res) => {
       const id = req.params.id as string;
       const interactionId = req.params.interactionId as string;
-      const issue = await svc.getById(id);
-      if (!issue) {
-        res.status(404).json({ error: "Issue not found" });
-        return;
-      }
-      assertCompanyAccess(req, issue.companyId);
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
       if (await rejectAgentIssueThreadInteractionResolution(req, res, issue)) return;
       assertBoard(req);
 
@@ -9097,6 +9911,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "issue.thread_interaction_cancelled",
         entityType: "issue",
         entityId: issue.id,
@@ -9126,12 +9941,8 @@ async function applyDefaultQaDispositionRouting(input: {
   router.get("/issues/:id/comments/:commentId", async (req, res) => {
     const id = req.params.id as string;
     const commentId = req.params.commentId as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const comment = await svc.getComment(commentId);
     if (!comment || comment.issueId !== id) {
@@ -9144,12 +9955,8 @@ async function applyDefaultQaDispositionRouting(input: {
   router.delete("/issues/:id/comments/:commentId", async (req, res) => {
     const id = req.params.id as string;
     const commentId = req.params.commentId as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
 
     const comment = await svc.getComment(commentId);
@@ -9195,6 +10002,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "issue.comment_cancelled",
         entityType: "issue",
         entityId: issue.id,
@@ -9250,6 +10058,12 @@ async function applyDefaultQaDispositionRouting(input: {
               ])
             ),
           );
+          await decisionTrainingSvc.scrubDeletedComments({
+            companyId: issue.companyId,
+            issueId: issue.id,
+            commentIds: [deletedComment.id, ...annotationCleanup.deletedCommentIds],
+            deletedAt: deletedComment.deletedAt ?? new Date(),
+          }, tx);
         },
       },
     );
@@ -9264,6 +10078,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.comment_deleted",
       entityType: "issue",
       entityId: issue.id,
@@ -9287,12 +10102,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.get("/issues/:id/feedback-votes", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (req.actor.type !== "board") {
       res.status(403).json({ error: "Only board users can view feedback votes" });
       return;
@@ -9304,12 +10115,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.get("/issues/:id/feedback-traces", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (req.actor.type !== "board") {
       res.status(403).json({ error: "Only board users can view feedback traces" });
       return;
@@ -9367,12 +10174,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.post("/issues/:id/comments", validate(addIssueCommentSchema), async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     const commentAccessDecision = await assertAgentIssueCommentAllowed(req, res, issue);
     if (!commentAccessDecision) return;
     if (!assertStructuredCommentFieldsAllowed(req, res, {
@@ -9493,6 +10296,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "issue.updated",
         entityType: "issue",
         entityId: currentIssue.id,
@@ -9534,9 +10338,11 @@ async function applyDefaultQaDispositionRouting(input: {
             actorId: actor.actorId,
             agentId: actor.agentId,
             runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
             action: "heartbeat.cancelled",
             entityType: "heartbeat_run",
             entityId: cancelled.id,
+            issueId: currentIssue.id,
             details: {
               agentId: cancelled.agentId,
               source: "issue_comment_interrupt",
@@ -9654,6 +10460,7 @@ async function applyDefaultQaDispositionRouting(input: {
           actorId: actor.actorId,
           agentId: actor.agentId,
           runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
           action: "issue.updated",
           entityType: "issue",
           entityId: currentIssue.id,
@@ -9705,6 +10512,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.comment_added",
       entityType: "issue",
       entityId: currentIssue.id,
@@ -9971,6 +10779,7 @@ async function applyDefaultQaDispositionRouting(input: {
               actorId: "issue_comment",
               agentId,
               runId: actor.runId,
+              agentApiKeyId: actor.agentApiKeyId,
               action: "issue.blockers_resolved_wake_emitted",
               entityType: "issue",
               entityId: dependentIssueId,
@@ -9995,12 +10804,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.post("/issues/:id/feedback-votes", validate(upsertIssueFeedbackVoteSchema), async (req, res) => {
     const id = req.params.id as string;
-    const issue = await svc.getById(id);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
     if (req.actor.type !== "board") {
       res.status(403).json({ error: "Only board users can vote on AI feedback" });
       return;
@@ -10023,6 +10828,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.feedback_vote_saved",
       entityType: "issue",
       entityId: issue.id,
@@ -10043,6 +10849,7 @@ async function applyDefaultQaDispositionRouting(input: {
         actorId: actor.actorId,
         agentId: actor.agentId,
         runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "company.feedback_data_sharing_updated",
         entityType: "company",
         entityId: issue.companyId,
@@ -10064,6 +10871,7 @@ async function applyDefaultQaDispositionRouting(input: {
             actorId: actor.actorId,
             agentId: actor.agentId,
             runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
             action: "instance.settings.general_updated",
             entityType: "instance_settings",
             entityId: settings.id,
@@ -10094,12 +10902,9 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.get("/issues/:id/attachments", async (req, res) => {
     const issueId = req.params.id as string;
-    const issue = await svc.getById(issueId);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    assertCompanyAccess(req, issue.companyId);
+    const issue = await getAccessibleResource(req, res, svc.getById(issueId), "Issue not found");
+    if (!issue) return;
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const attachments = await svc.listAttachments(issueId);
     res.json(attachments.map(withContentPath));
   });
@@ -10182,6 +10987,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.attachment_added",
       entityType: "issue",
       entityId: issueId,
@@ -10198,12 +11004,14 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.get("/attachments/:attachmentId/content", async (req, res, next) => {
     const attachmentId = req.params.attachmentId as string;
-    const attachment = await svc.getAttachmentById(attachmentId);
-    if (!attachment) {
-      res.status(404).json({ error: "Attachment not found" });
+    const attachment = await getAccessibleResource(req, res, svc.getAttachmentById(attachmentId), "Attachment not found");
+    if (!attachment) return;
+    const issue = await svc.getById(attachment.issueId);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
       return;
     }
-    assertCompanyAccess(req, attachment.companyId);
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
 
     const contentLength = attachment.byteSize;
     const range = parseAttachmentRangeHeader(
@@ -10257,12 +11065,8 @@ async function applyDefaultQaDispositionRouting(input: {
 
   router.delete("/attachments/:attachmentId", async (req, res) => {
     const attachmentId = req.params.attachmentId as string;
-    const attachment = await svc.getAttachmentById(attachmentId);
-    if (!attachment) {
-      res.status(404).json({ error: "Attachment not found" });
-      return;
-    }
-    assertCompanyAccess(req, attachment.companyId);
+    const attachment = await getAccessibleResource(req, res, svc.getAttachmentById(attachmentId), "Attachment not found");
+    if (!attachment) return;
     const issue = await svc.getById(attachment.issueId);
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
@@ -10290,6 +11094,7 @@ async function applyDefaultQaDispositionRouting(input: {
       actorId: actor.actorId,
       agentId: actor.agentId,
       runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "issue.attachment_removed",
       entityType: "issue",
       entityId: removed.issueId,

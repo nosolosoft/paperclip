@@ -1102,3 +1102,7 @@ export function applyIssueExecutionPolicyTransition(input: TransitionInput): Tra
   Object.assign(stageResult.patch, monitorPatch);
   return stageResult;
 }
+
+export function applyIssueMonitorPolicyTransition(input: TransitionInput): TransitionResult {
+  return { patch: applyMonitorTransition(input, {}) };
+}

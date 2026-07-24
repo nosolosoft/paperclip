@@ -157,6 +157,7 @@ export function projectRoutes(db: Db) {
     };
 
     const { workspace, ...projectData } = req.body as CreateProjectPayload;
+    await svc.validateQaPolicy(companyId, projectData.qaPolicy);
     await assertProjectEnvironmentSelection(
       companyId,
       readProjectPolicyEnvironmentId(projectData.executionWorkspacePolicy),
@@ -222,6 +223,9 @@ export function projectRoutes(db: Db) {
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
     if (!existing) return;
     const body = { ...req.body };
+    if (body.qaPolicy !== undefined) {
+      await svc.validateQaPolicy(existing.companyId, body.qaPolicy);
+    }
     assertNoAgentHostWorkspaceCommandMutation(
       req,
       collectProjectExecutionWorkspaceCommandPaths(body.executionWorkspacePolicy),

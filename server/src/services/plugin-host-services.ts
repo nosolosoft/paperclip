@@ -75,70 +75,15 @@ import { getTelemetryClient } from "../telemetry.js";
 import { accessService } from "./access.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { sanitizeRecord } from "../redaction.js";
-import { unprocessable } from "../errors.js";
-import { resolveQaFailureReturnEngineer } from "./issue-execution-policy.js";
-
-
-function normalizeAgentRoutingText(value: string | null | undefined) {
-  return value?.trim().toLowerCase().replace(/\s+/g, " ") ?? "";
-}
-
-function agentLooksLikeCodeQaRouting(agent: { name?: string | null; role?: string | null; capabilities?: string | null }) {
-  const haystack = normalizeAgentRoutingText([agent.name ?? "", agent.role ?? "", agent.capabilities ?? ""].join(" "));
-  return haystack.includes("qa") && (haystack.includes("code") || haystack.includes("api") || haystack.includes("backend"));
-}
-
-function agentLooksLikeBrowserQaRouting(agent: { name?: string | null; role?: string | null; capabilities?: string | null }) {
-  const haystack = normalizeAgentRoutingText([agent.name ?? "", agent.role ?? "", agent.capabilities ?? ""].join(" "));
-  return haystack.includes("qa") && (haystack.includes("browser") || haystack.includes("frontend") || haystack.includes("visual") || haystack.includes("ui"));
-}
-
-function agentLooksLikeSpecQaRouting(agent: { name?: string | null; role?: string | null; capabilities?: string | null }) {
-  const haystack = normalizeAgentRoutingText([agent.name ?? "", agent.role ?? "", agent.capabilities ?? ""].join(" "));
-  return haystack.includes("qa") && (haystack.includes("spec") || haystack.includes("requirements") || haystack.includes("acceptance"));
-}
-
-function getQaStageRoutingKind(agent: { name?: string | null; role?: string | null; capabilities?: string | null }) {
-  if (agentLooksLikeCodeQaRouting(agent)) return "code";
-  if (agentLooksLikeBrowserQaRouting(agent)) return "browser";
-  if (agentLooksLikeSpecQaRouting(agent)) return "spec";
-  return "unknown";
-}
-
-function selectNextQaRoutingAgent(
-  agents: Array<{ id: string; name?: string | null; role?: string | null; status?: string | null; capabilities?: string | null }>,
-  currentStage: "code" | "browser" | "spec" | null,
-) {
-  const assignableQaAgents = agents.filter((agent) =>
-    agent.role === "qa" && !["terminated", "pending_approval"].includes(agent.status ?? ""));
-  const codeQa = assignableQaAgents.find(agentLooksLikeCodeQaRouting);
-  const browserQa = assignableQaAgents.find(agentLooksLikeBrowserQaRouting);
-  const specQa = assignableQaAgents.find(agentLooksLikeSpecQaRouting);
-  const stages = currentStage === "code"
-    ? [browserQa, specQa]
-    : currentStage === "browser"
-      ? [specQa]
-      : currentStage === "spec"
-        ? []
-        : [codeQa, browserQa, specQa];
-  return stages.find((agent) => Boolean(agent)) ?? null;
-}
-
-function selectSpecQaRoutingAgent(
-  agents: Array<{ id: string; name?: string | null; role?: string | null; status?: string | null; capabilities?: string | null }>,
-) {
-  return agents
-    .filter((agent) => agent.role === "qa" && !["terminated", "pending_approval"].includes(agent.status ?? ""))
-    .find(agentLooksLikeSpecQaRouting) ?? null;
-}
-
-function selectBrowserQaRoutingAgent(
-  agents: Array<{ id: string; name?: string | null; role?: string | null; status?: string | null; capabilities?: string | null }>,
-) {
-  return agents
-    .filter((agent) => agent.role === "qa" && !["terminated", "pending_approval"].includes(agent.status ?? ""))
-    .find(agentLooksLikeBrowserQaRouting) ?? null;
-}
+import { HttpError, unprocessable } from "../errors.js";
+import {
+  applyIssueExecutionPolicyTransition,
+  buildFinalQaExecutionPolicy,
+  normalizeIssueExecutionPolicy,
+  parseIssueExecutionState,
+  resolveQaFailureReturnEngineer,
+} from "./issue-execution-policy.js";
+import { resolveQaRoutingFromProjectPolicy, type QaRoutingDecision } from "./qa-routing.js";
 
 // ---------------------------------------------------------------------------
 // SSRF protection for plugin HTTP fetch
@@ -608,6 +553,50 @@ export function buildHostServices(
   const budgets = budgetService(db);
   const issueApprovals = issueApprovalService(db);
   const scopedBus = eventBus.forPlugin(pluginKey);
+
+  const resolvePluginQaRoute = async (input: {
+    issue: {
+      companyId: string;
+      projectId?: string | null;
+      executionPolicy?: unknown;
+      executionState?: unknown;
+    };
+    currentAgentId: string | null;
+    browserScope: "required" | "not_applicable";
+  }): Promise<QaRoutingDecision> => {
+    const candidateAgents = await agents.list(input.issue.companyId);
+    let projectPolicy: unknown = null;
+    if (input.issue.projectId) {
+      try {
+        projectPolicy = (await projects.getById(input.issue.projectId))?.qaPolicy ?? null;
+      } catch (error) {
+        if (!(error instanceof HttpError) || error.details === null || typeof error.details !== "object" || Reflect.get(error.details, "code") !== "invalid_project_qa_policy") {
+          throw error;
+        }
+        projectPolicy = { mode: "final", finalQaAgentId: "malformed_project_policy" };
+      }
+    }
+    return resolveQaRoutingFromProjectPolicy({
+      companyId: input.issue.companyId,
+      projectPolicy,
+      issuePolicy: normalizeIssueExecutionPolicy(input.issue.executionPolicy),
+      issueState: parseIssueExecutionState(input.issue.executionState),
+      candidates: candidateAgents,
+      currentAgentId: input.currentAgentId,
+      browserScope: input.browserScope,
+    });
+  };
+
+  const requirePluginQaParticipant = (decision: QaRoutingDecision) => {
+    if (decision.kind === "final_qa_unavailable") {
+      throw unprocessable("Configured final QA agent is unavailable", {
+        code: "final_qa_unavailable",
+        finalQaAgentId: decision.finalQaAgentId,
+        reason: decision.reason,
+      });
+    }
+    return decision;
+  };
 
   // Track active session event subscriptions for cleanup
   const activeSubscriptions = new Set<{ unsubscribe: () => void; timer: ReturnType<typeof setTimeout> }>();
@@ -1659,6 +1648,7 @@ export function buildHostServices(
         delete patch.actorRunId;
         delete patch.qaVerdict;
         delete patch.qaBrowserScope;
+        delete patch.qaEvidence;
         if (patch.originKind !== undefined) {
           patch.originKind = normalizePluginOriginKind(patch.originKind);
         }
@@ -1666,9 +1656,33 @@ export function buildHostServices(
         const nextStatus = typeof patch.status === "string" ? patch.status : existing.status;
         const nextAssigneeAgentId = patch.assigneeAgentId === undefined ? existing.assigneeAgentId : patch.assigneeAgentId;
         const nextAssigneeUserId = patch.assigneeUserId === undefined ? existing.assigneeUserId : patch.assigneeUserId;
+        const sourceAgent = actorAgentId ? await agents.getById(actorAgentId) : null;
+        const finalQaDispositionRequested =
+          qaVerdict !== undefined ||
+          nextStatus === "done" ||
+          (sourceAgent?.role === "qa" && (nextStatus === "blocked" || nextStatus === "in_progress"));
+        if (finalQaDispositionRequested) {
+          const qaDecision = requirePluginQaParticipant(await resolvePluginQaRoute({
+            issue: existing,
+            currentAgentId: actorAgentId,
+            browserScope: qaBrowserScope ?? "required",
+          }));
+          if (
+            qaDecision.kind !== "staged_qa_unavailable" &&
+            qaDecision.kind !== "not_qa_routing" &&
+            qaDecision.stage === "final"
+          ) {
+            throw unprocessable("Final QA disposition requires an authenticated agent request with qaEvidence", {
+              code: "qa_review_evidence_authenticated_actor_required",
+            });
+          }
+        }
       if (actorAgentId) {
-        const sourceAgent = await agents.getById(actorAgentId);
-        if (sourceAgent?.role === "qa" && (qaVerdict === "fail" || nextStatus === "blocked" || nextStatus === "in_progress")) {
+        if (
+          sourceAgent?.role === "qa" &&
+          (qaVerdict === "fail" ||
+            (qaVerdict !== "pass" && (nextStatus === "blocked" || nextStatus === "in_progress")))
+        ) {
           const candidateAgents = await agents.list(companyId);
           const engineer = resolveQaFailureReturnEngineer({
             candidateAgents,
@@ -1682,70 +1696,79 @@ export function buildHostServices(
               patch.assigneeUserId = null;
             }
           } else if (sourceAgent?.role === "qa" && qaVerdict === "pass") {
-            const candidateAgents = await agents.list(companyId);
-            const currentStage = getQaStageRoutingKind(sourceAgent);
-            if (currentStage === "code" && qaBrowserScope === "not_applicable") {
-              const specQaAgent = selectSpecQaRoutingAgent(candidateAgents);
-              if (!specQaAgent) {
-                throw unprocessable("Backend-only QA pass requires a Spec QA agent before completion", {
-                  code: "invalid_qa_disposition",
-                  missing: "spec_qa_agent",
-                });
-              }
+            const decision = requirePluginQaParticipant(await resolvePluginQaRoute({
+              issue: {
+                ...existing,
+                executionPolicy: patch.executionPolicy === undefined ? existing.executionPolicy : patch.executionPolicy,
+                executionState: patch.executionState === undefined ? existing.executionState : patch.executionState,
+              },
+              currentAgentId: sourceAgent.id,
+              browserScope: qaBrowserScope ?? "required",
+            }));
+            if (decision.kind === "staged_qa_unavailable") {
+              throw unprocessable("Non-Spec QA pass requires a downstream QA stage before completion", {
+                code: "invalid_qa_disposition",
+                missing: decision.stage === "browser" ? "browser_qa_agent" : decision.stage === "spec" ? "spec_qa_agent" : "downstream_qa_agent",
+                ...(decision.stage === "browser" ? { required: "qaBrowserScope:not_applicable" } : {}),
+              });
+            } else if (decision.kind !== "not_qa_routing" && decision.allowedAction === "assign") {
               patch.status = "in_review";
-              patch.assigneeAgentId = specQaAgent.id;
+              patch.assigneeAgentId = decision.participant.id;
               patch.assigneeUserId = null;
-            } else if (currentStage === "code") {
-              const browserQaAgent = selectBrowserQaRoutingAgent(candidateAgents);
-              if (!browserQaAgent) {
-                throw unprocessable("Code QA pass requires a Browser QA agent unless browser QA is explicitly not applicable", {
-                  code: "invalid_qa_disposition",
-                  missing: "browser_qa_agent",
-                  required: "qaBrowserScope:not_applicable",
-                });
-              }
-              patch.status = "in_review";
-              patch.assigneeAgentId = browserQaAgent.id;
+            } else if (decision.kind !== "not_qa_routing") {
+              patch.status = "done";
+              patch.assigneeAgentId = null;
               patch.assigneeUserId = null;
-            } else {
-              const nextQaAgent = selectNextQaRoutingAgent(
-                candidateAgents,
-                currentStage === "unknown" ? "spec" : currentStage,
-              );
-              if (nextQaAgent) {
-                patch.status = "in_review";
-                patch.assigneeAgentId = nextQaAgent.id;
-                patch.assigneeUserId = null;
-              } else {
-                if (currentStage !== "spec") {
-                  throw unprocessable("Non-Spec QA pass requires a downstream QA stage before completion", {
-                    code: "invalid_qa_disposition",
-                    missing: currentStage === "browser" ? "spec_qa_agent" : "downstream_qa_agent",
-                  });
-                }
-                patch.status = "done";
-                patch.assigneeAgentId = null;
-                patch.assigneeUserId = null;
-              }
             }
           } else if (sourceAgent?.role === "qa" && nextStatus === "done") {
-            const currentStage = getQaStageRoutingKind(sourceAgent);
-            if (currentStage !== "spec") {
+            const decision = requirePluginQaParticipant(await resolvePluginQaRoute({
+              issue: existing,
+              currentAgentId: sourceAgent.id,
+              browserScope: qaBrowserScope ?? "required",
+            }));
+            if (decision.kind === "staged_qa_unavailable" || (
+              decision.kind !== "not_qa_routing" && decision.allowedAction !== "complete"
+            )) {
               throw unprocessable("Intermediate QA stages must submit qaVerdict=pass instead of moving the issue to done", {
                 code: "invalid_qa_disposition",
                 required: "qaVerdict",
                 allowedStatus: "in_review",
               });
             }
-            patch.assigneeAgentId = null;
-            patch.assigneeUserId = null;
-          } else if (existing.status !== "in_review" && nextStatus === "in_review" && !nextAssigneeAgentId) {
+            if (decision.kind !== "not_qa_routing") {
+              patch.assigneeAgentId = null;
+              patch.assigneeUserId = null;
+            }
+          } else if (existing.status !== "in_review" && nextStatus === "in_review") {
             if (sourceAgent?.role === "engineer") {
-              const candidateAgents = await agents.list(companyId);
-              const qaAgent = selectNextQaRoutingAgent(candidateAgents, null);
-              if (qaAgent) {
-                patch.assigneeAgentId = qaAgent.id;
-                patch.assigneeUserId = null;
+              if (!nextAssigneeAgentId || nextAssigneeAgentId === existing.assigneeAgentId) {
+                const decision = requirePluginQaParticipant(await resolvePluginQaRoute({
+                  issue: existing,
+                  currentAgentId: null,
+                  browserScope: "required",
+                }));
+                if (decision.kind === "project_final") {
+                  const executionPolicy = buildFinalQaExecutionPolicy(decision.participant.id);
+                  const transition = applyIssueExecutionPolicyTransition({
+                    issue: existing,
+                    policy: executionPolicy,
+                    previousPolicy: null,
+                    requestedStatus: nextStatus,
+                    requestedAssigneePatch: {
+                      assigneeAgentId: undefined,
+                      assigneeUserId: undefined,
+                    },
+                    actor: { agentId: sourceAgent.id, userId: null },
+                    commentBody: null,
+                    reviewRequest: undefined,
+                    monitorExplicitlyUpdated: false,
+                  });
+                  patch.executionPolicy = executionPolicy;
+                  Object.assign(patch, transition.patch);
+                } else if (decision.kind !== "staged_qa_unavailable" && decision.kind !== "not_qa_routing") {
+                  patch.assigneeAgentId = decision.participant.id;
+                  patch.assigneeUserId = null;
+                }
               }
             } else if ((sourceAgent?.role === "researcher" || sourceAgent?.role === "cmo") && !nextAssigneeUserId) {
               patch.assigneeAgentId = null;

@@ -70,6 +70,7 @@ import {
 import { conflict, HttpError, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { publishLiveEvent } from "./live-events.js";
+import { classifyStagedQaAgent } from "./qa-routing.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
 import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
@@ -379,9 +380,6 @@ const MAX_TURN_CONTINUATION_MAX_DELAY_MS = 5 * 60 * 1000;
 const MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES = ["scheduled_retry", "queued", "running"] as const;
 const CLOSED_OR_TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const REVIEW_ONLY_AGENT_NAME_RE = /\b(qa|review|reviewer|approver)\b/i;
-const BROWSER_QA_AGENT_NAME_RE = /\b(browser|e2e|playwright|visual)\b/i;
-const CODE_QA_AGENT_NAME_RE = /\b(code|static|lint|unit)\b/i;
-const SPEC_QA_AGENT_NAME_RE = /\b(spec|requirements|acceptance)\b/i;
 const ENGINEERING_AGENT_ROLE_RE = /\b(engineer|developer|coder|builder)\b/i;
 const ISSUE_WORKSPACE_REQUIRED_REASONS = new Set([
   "issue_assigned",
@@ -3223,9 +3221,10 @@ export function classifyIssueWakeAgent(agent: IssueWakeGuardAgent) {
   const role = lowerText(agent.role);
   const label = `${role} ${name}`;
   const isQaRole = role === "qa";
-  const isBrowserQa = isQaRole && BROWSER_QA_AGENT_NAME_RE.test(label);
-  const isCodeQa = isQaRole && CODE_QA_AGENT_NAME_RE.test(label);
-  const isSpecQa = isQaRole && SPEC_QA_AGENT_NAME_RE.test(label);
+  const stagedQaStage = classifyStagedQaAgent({ name: agent.name, role: agent.role });
+  const isBrowserQa = stagedQaStage === "browser";
+  const isCodeQa = stagedQaStage === "code";
+  const isSpecQa = stagedQaStage === "spec";
   const isReviewOnly = isQaRole || (REVIEW_ONLY_AGENT_NAME_RE.test(label) && !ENGINEERING_AGENT_ROLE_RE.test(role));
   const isEngineering = ENGINEERING_AGENT_ROLE_RE.test(role) || /\b(codex|claude|opencode|engineer)\b/i.test(label);
   return { isEngineering, isReviewOnly, isCodeQa, isBrowserQa, isSpecQa };

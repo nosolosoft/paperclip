@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { documents, issueDocuments, issues } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, type SourceTrustMetadata } from "@paperclipai/shared";
 import { documentService } from "./documents.js";
+import { extractExplicitAcceptanceCriteria, extractMarkdownSection } from "./acceptance-criteria.js";
 
 export { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY };
 export const ISSUE_CONTINUATION_SUMMARY_TITLE = "Continuation Summary";
@@ -67,15 +68,6 @@ function readResultSummary(resultJson: Record<string, unknown> | null | undefine
     asNonEmptyString(resultJson.error) ??
     null
   );
-}
-
-function extractMarkdownSection(markdown: string | null | undefined, heading: string) {
-  if (!markdown) return null;
-  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const re = new RegExp(`^##\\s+${escaped}\\s*$([\\s\\S]*?)(?=^##\\s+|(?![\\s\\S]))`, "im");
-  const match = re.exec(markdown);
-  const section = match?.[1]?.trim();
-  return section ? truncateText(section, SUMMARY_SECTION_MAX_CHARS) : null;
 }
 
 function extractPathCandidates(...texts: Array<string | null | undefined>) {
@@ -150,8 +142,17 @@ export function buildContinuationSummaryMarkdown(input: {
   }
 
   const paths = extractPathCandidates(resultSummary, run.stdoutExcerpt, run.stderrExcerpt, input.previousSummaryBody);
-  const objective = extractMarkdownSection(issue.description, "Objective") ?? issue.description?.trim() ?? "No objective captured.";
-  const acceptanceCriteria = extractMarkdownSection(issue.description, "Acceptance Criteria") ?? "No explicit acceptance criteria captured.";
+  const objective = truncateText(
+    extractMarkdownSection(issue.description, "Objective") ?? issue.description?.trim() ?? "No objective captured.",
+    SUMMARY_SECTION_MAX_CHARS,
+  );
+  const explicitAcceptanceCriteria = extractExplicitAcceptanceCriteria(issue.description);
+  const acceptanceCriteria = truncateText(
+    explicitAcceptanceCriteria.length > 0
+      ? explicitAcceptanceCriteria.map((criterion) => `- ${criterion}`).join("\n")
+      : "No explicit acceptance criteria captured.",
+    SUMMARY_SECTION_MAX_CHARS,
+  );
   const mode = inferMode(issue, run);
   const nextAction = inferNextAction(issue, run, extractPreviousNextAction(input.previousSummaryBody));
 

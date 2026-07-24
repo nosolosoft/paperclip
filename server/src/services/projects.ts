@@ -1,6 +1,7 @@
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  agents,
   projects,
   projectGoals,
   goals,
@@ -15,19 +16,23 @@ import {
   deriveProjectUrlKey,
   hasNonAsciiContent,
   isUuidLike,
+  isAgentStatusAssignableToWork,
   normalizeProjectUrlKey,
+  projectQaPolicySchema,
   type BudgetWindowKind,
   type ProjectBudgetSummary,
   type ProjectCodebase,
   type ProjectExecutionWorkspacePolicy,
   type ProjectGoalRef,
   type ProjectManagedByPlugin,
+  type ProjectQaPolicy,
   type ProjectWorkspaceRuntimeConfig,
   type ProjectWorkspace,
   type WorkspaceRuntimeService,
   type PluginManagedProjectDeclaration,
   type PluginManagedProjectResolution,
 } from "@paperclipai/shared";
+import { unprocessable } from "../errors.js";
 import { listCurrentRuntimeServicesForProjectWorkspaces } from "./workspace-runtime-read-model.js";
 import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
 import { mergeProjectWorkspaceRuntimeConfig, readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
@@ -56,11 +61,12 @@ type CreateWorkspaceInput = {
 };
 type UpdateWorkspaceInput = Partial<CreateWorkspaceInput>;
 
-interface ProjectWithGoals extends Omit<ProjectRow, "executionWorkspacePolicy"> {
+interface ProjectWithGoals extends Omit<ProjectRow, "executionWorkspacePolicy" | "qaPolicy"> {
   urlKey: string;
   goalIds: string[];
   goals: ProjectGoalRef[];
   executionWorkspacePolicy: ProjectExecutionWorkspacePolicy | null;
+  qaPolicy: ProjectQaPolicy;
   codebase: ProjectCodebase;
   workspaces: ProjectWorkspace[];
   primaryWorkspace: ProjectWorkspace | null;
@@ -76,6 +82,50 @@ interface ProjectShortnameRow {
 
 interface ResolveProjectNameOptions {
   excludeProjectId?: string | null;
+}
+
+export function normalizeProjectQaPolicy(value: unknown): ProjectQaPolicy {
+  if (value === null || value === undefined) return { mode: "staged" };
+  const parsed = projectQaPolicySchema.safeParse(value);
+  if (!parsed.success) {
+    throw unprocessable("Invalid project QA policy", {
+      code: "invalid_project_qa_policy",
+      issues: parsed.error.issues,
+    });
+  }
+  return parsed.data;
+}
+
+async function validateProjectQaPolicy(db: Db, companyId: string, value: unknown): Promise<void> {
+  const policy = normalizeProjectQaPolicy(value);
+  if (policy.mode === "staged") return;
+
+  const agent = await db
+    .select({ companyId: agents.companyId, role: agents.role, status: agents.status })
+    .from(agents)
+    .where(and(eq(agents.id, policy.finalQaAgentId), eq(agents.companyId, companyId)))
+    .then((rows) => rows[0] ?? null);
+  if (!agent) {
+    throw unprocessable("Final QA agent must belong to the project company", {
+      code: "project_qa_agent_company",
+      finalQaAgentId: policy.finalQaAgentId,
+      companyId,
+    });
+  }
+  if (agent.role !== "qa") {
+    throw unprocessable("Final QA agent must have role qa", {
+      code: "project_qa_agent_role",
+      finalQaAgentId: policy.finalQaAgentId,
+      role: agent.role,
+    });
+  }
+  if (!isAgentStatusAssignableToWork(agent.status)) {
+    throw unprocessable("Final QA agent is not assignable", {
+      code: "project_qa_agent_status",
+      finalQaAgentId: policy.finalQaAgentId,
+      status: agent.status,
+    });
+  }
 }
 
 /** Batch-load goal refs for a set of projects. */
@@ -113,6 +163,7 @@ async function attachGoals(db: Db, rows: ProjectRow[]): Promise<ProjectWithGoals
       goalIds: g.map((x) => x.id),
       goals: g,
       executionWorkspacePolicy: parseProjectExecutionWorkspacePolicy(r.executionWorkspacePolicy),
+      qaPolicy: normalizeProjectQaPolicy(r.qaPolicy),
     } as ProjectWithGoals;
   });
 }
@@ -546,6 +597,7 @@ export function projectService(db: Db) {
     data: Omit<typeof projects.$inferInsert, "companyId"> & { goalIds?: string[] },
   ): Promise<ProjectWithGoals> => {
     const { goalIds: inputGoalIds, ...projectData } = data;
+    await validateProjectQaPolicy(db, companyId, projectData.qaPolicy);
     const ids = resolveGoalIds({ goalIds: inputGoalIds, goalId: projectData.goalId });
 
     // Note: color is intentionally NOT auto-assigned. New projects default to
@@ -589,6 +641,7 @@ export function projectService(db: Db) {
   };
 
   return {
+    validateQaPolicy: (companyId: string, policy: unknown) => validateProjectQaPolicy(db, companyId, policy),
     list: async (companyId: string): Promise<ProjectWithGoals[]> => {
       const rows = await db.select().from(projects).where(eq(projects.companyId, companyId));
       const withGoals = await attachGoals(db, rows);
@@ -785,6 +838,9 @@ export function projectService(db: Db) {
         .where(eq(projects.id, id))
         .then((rows) => rows[0] ?? null);
       if (!existingProject) return null;
+      if (projectData.qaPolicy !== undefined) {
+        await validateProjectQaPolicy(db, existingProject.companyId, projectData.qaPolicy);
+      }
 
       if (projectData.name !== undefined) {
         const existingShortname = normalizeProjectUrlKey(existingProject.name);

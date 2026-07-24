@@ -115,6 +115,8 @@ function blankExecutionState(): IssueExecutionState {
     completedStageIds: [],
     lastDecisionId: null,
     lastDecisionOutcome: null,
+    qaVerdict: null,
+    qaEvidence: null,
     monitor: null,
   };
 }
@@ -402,6 +404,24 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
   };
 }
 
+export function buildFinalQaExecutionPolicy(finalQaAgentId: string): IssueExecutionPolicy {
+  return {
+    mode: "normal",
+    commentRequired: true,
+    stages: [{
+      id: randomUUID(),
+      type: "review",
+      approvalsNeeded: 1,
+      participants: [{
+        id: randomUUID(),
+        type: "agent",
+        agentId: finalQaAgentId,
+        userId: null,
+      }],
+    }],
+  };
+}
+
 export function parseIssueExecutionState(input: unknown): IssueExecutionState | null {
   if (input == null) return null;
   const parsed = issueExecutionStateSchema.safeParse(input);
@@ -597,6 +617,8 @@ function buildPendingState(input: {
     completedStageIds: input.previous?.completedStageIds ?? [],
     lastDecisionId: input.previous?.lastDecisionId ?? null,
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
+    qaVerdict: null,
+    qaEvidence: null,
     monitor: input.previous?.monitor ?? null,
   };
 }

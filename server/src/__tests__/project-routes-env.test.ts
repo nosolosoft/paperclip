@@ -1,12 +1,14 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { normalizeProjectQaPolicy } from "../services/projects.js";
 
 const mockProjectService = vi.hoisted(() => ({
   list: vi.fn(),
   getById: vi.fn(),
   create: vi.fn(),
   update: vi.fn(),
+  validateQaPolicy: vi.fn(),
   createWorkspace: vi.fn(),
   listWorkspaces: vi.fn(),
   updateWorkspace: vi.fn(),
@@ -121,6 +123,7 @@ function buildProject(overrides: Record<string, unknown> = {}) {
     pauseReason: null,
     pausedAt: null,
     executionWorkspacePolicy: null,
+    qaPolicy: { mode: "staged" },
     codebase: {
       workspaceId: null,
       repoUrl: null,
@@ -159,6 +162,7 @@ describe("project env routes", () => {
     });
     mockGetTelemetryClient.mockReturnValue({ track: vi.fn() });
     mockProjectService.resolveByReference.mockResolvedValue({ ambiguous: false, project: null });
+    mockProjectService.validateQaPolicy.mockResolvedValue(undefined);
     mockProjectService.createWorkspace.mockResolvedValue(null);
     mockProjectService.listWorkspaces.mockResolvedValue([]);
     mockEnvironmentService.getById.mockReset();
@@ -229,5 +233,75 @@ describe("project env routes", () => {
         },
       }),
     );
+  });
+
+  it("preserves project create and update response behavior with staged policy", async () => {
+    mockProjectService.create.mockResolvedValue(buildProject());
+    mockProjectService.getById.mockResolvedValue(buildProject());
+    mockProjectService.update.mockResolvedValue(buildProject({ name: "Renamed" }));
+
+    const app = await createApp();
+    const createResponse = await request(app)
+      .post("/api/companies/company-1/projects")
+      .send({ name: "Project" });
+    const updateResponse = await request(app)
+      .patch("/api/projects/project-1")
+      .send({ name: "Renamed" });
+
+    expect(createResponse.status).toBe(201);
+    expect(createResponse.body.qaPolicy).toEqual({ mode: "staged" });
+    expect(updateResponse.status).toBe(200);
+    expect(updateResponse.body.qaPolicy).toEqual({ mode: "staged" });
+  });
+
+  it("normalizes absent and nullable project policies to staged", () => {
+    expect(normalizeProjectQaPolicy(undefined)).toEqual({ mode: "staged" });
+    expect(normalizeProjectQaPolicy(null)).toEqual({ mode: "staged" });
+    expect(normalizeProjectQaPolicy({ mode: "staged" })).toEqual({ mode: "staged" });
+  });
+
+  it.each([
+    ["cross-company", "Final QA agent must belong to the project company"],
+    ["inactive", "Final QA agent is not assignable"],
+    ["non-QA", "Final QA agent must have role qa"],
+  ])("rejects %s final QA policy before project mutation", async (_kind, message) => {
+    const { unprocessable } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+    mockProjectService.validateQaPolicy.mockRejectedValueOnce(
+      unprocessable(message, { code: "invalid_project_qa_policy" }),
+    );
+
+    const res = await request(await createApp())
+      .post("/api/companies/company-1/projects")
+      .send({
+        name: "Project",
+        qaPolicy: {
+          mode: "final",
+          finalQaAgentId: "44444444-4444-4444-8444-444444444444",
+        },
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toBe(message);
+    expect(mockProjectService.create).not.toHaveBeenCalled();
+  });
+
+  it("passes the configured final QA UUID through project persistence", async () => {
+    const qaPolicy = {
+      mode: "final" as const,
+      finalQaAgentId: "44444444-4444-4444-8444-444444444444",
+    };
+    mockProjectService.create.mockResolvedValue(buildProject({ qaPolicy }));
+
+    const res = await request(await createApp())
+      .post("/api/companies/company-1/projects")
+      .send({ name: "Project", qaPolicy });
+
+    expect(res.status).toBe(201);
+    expect(mockProjectService.validateQaPolicy).toHaveBeenCalledWith("company-1", qaPolicy);
+    expect(mockProjectService.create).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({ qaPolicy }),
+    );
+    expect(res.body.qaPolicy).toEqual(qaPolicy);
   });
 });

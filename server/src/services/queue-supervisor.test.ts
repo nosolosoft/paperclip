@@ -7,6 +7,7 @@ import {
   evaluateQueueSupervisorIssue,
   evaluateQueueSupervisorSnapshot,
   parseClaudeQueueSupervisorCriticResponse,
+  resolveQueueSupervisorQaRouting,
   type QueueSupervisorAgentRef,
   type QueueSupervisorIssueSnapshot,
 } from "./queue-supervisor.js";
@@ -19,6 +20,7 @@ const engineer: QueueSupervisorAgentRef = { id: "agent-engineer", name: "Claude 
 const qaCode: QueueSupervisorAgentRef = { id: "agent-qa-code", name: "QA (Code)", role: "qa" };
 const qaBrowser: QueueSupervisorAgentRef = { id: "agent-qa-browser", name: "QA (Browser)", role: "qa" };
 const qaSpec: QueueSupervisorAgentRef = { id: "agent-qa-spec", name: "QA (Spec)", role: "qa" };
+const qaFinal: QueueSupervisorAgentRef = { id: "agent-qa-final", name: "QA (Code)", role: "qa", kind: "qa_final" };
 
 function issue(overrides: Partial<QueueSupervisorIssueSnapshot>): QueueSupervisorIssueSnapshot {
   return {
@@ -63,6 +65,335 @@ describe("queue supervisor policy", () => {
 
     expect(proposal.action).toBe("assign_qa_code");
     expect(proposal.targetAssigneeAgentId).toBe(qaCode.id);
+  });
+
+  it("routes final-policy review to the UUID-selected final QA without qa_code fallback", () => {
+    const snapshot = issue({
+      status: "in_review",
+      assigneeAgent: engineer,
+      qaFinalAgent: qaFinal,
+      qaRoutingDecision: {
+        kind: "project_final",
+        participant: {
+          id: qaFinal.id,
+          companyId: "company-1",
+          name: qaFinal.name,
+          role: qaFinal.role,
+          status: "idle",
+        },
+        stage: "final",
+        allowedAction: "assign",
+      },
+    });
+
+    const proposal = evaluateQueueSupervisorIssue(snapshot, defaultQueueSupervisorPolicyConfig, NOW);
+
+    expect(proposal.action).toBe("assign_qa_final");
+    expect(proposal.targetAssigneeAgentId).toBe(qaFinal.id);
+    expect(proposal.targetAssigneeKind).toBe("qa_final");
+    expect(assertQueueSupervisorProposalInvariants(proposal, snapshot).ok).toBe(true);
+  });
+
+  it("gives an explicit QA issue policy precedence over pinned and project-final routing", () => {
+    const decision = resolveQueueSupervisorQaRouting({
+      companyId: "company-1",
+      projectPolicy: { mode: "final", finalQaAgentId: qaFinal.id },
+      issuePolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: "88888888-8888-4888-8888-888888888888",
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: "99999999-9999-4999-8999-999999999999", type: "agent", agentId: qaCode.id, userId: null }],
+        }],
+      },
+      issueState: {
+        status: "pending",
+        currentStageId: "pinned-final",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: qaFinal.id, userId: null },
+        returnAssignee: { type: "agent", agentId: engineer.id, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+      },
+      candidates: [
+        { id: qaCode.id, companyId: "company-1", name: qaCode.name, role: qaCode.role, status: "idle" },
+        { id: qaFinal.id, companyId: "company-1", name: qaFinal.name, role: qaFinal.role, status: "idle" },
+      ],
+      currentAgentId: null,
+      browserScope: "required",
+    });
+
+    expect(decision).toMatchObject({
+      kind: "explicit_policy",
+      participant: { id: qaCode.id },
+      stage: "final",
+    });
+  });
+
+  it("moves a review-ready in_progress issue directly to the pinned final QA", () => {
+    const snapshot = issue({
+      status: "in_progress",
+      assigneeAgent: engineer,
+      qaFinalAgent: qaFinal,
+      qaRoutingDecision: {
+        kind: "pinned_final",
+        participant: {
+          id: qaFinal.id,
+          companyId: "company-1",
+          name: qaFinal.name,
+          role: qaFinal.role,
+          status: "idle",
+        },
+        stage: "final",
+        allowedAction: "assign",
+      },
+      pullRequests: [{ id: "pr-1", url: "https://example.test/pr/1", state: "open", checksStatus: "green" }],
+    });
+
+    const proposal = evaluateQueueSupervisorIssue(snapshot, defaultQueueSupervisorPolicyConfig, NOW);
+
+    expect(proposal.action).toBe("move_in_review_assign_qa_final");
+    expect(proposal.targetAssigneeAgentId).toBe(qaFinal.id);
+    expect(proposal.targetAssigneeKind).toBe("qa_final");
+    expect(assertQueueSupervisorProposalInvariants(proposal, snapshot).ok).toBe(true);
+  });
+
+  it("reports invalid final policy instead of falling back to staged QA", () => {
+    const snapshot = issue({
+      status: "in_review",
+      assigneeAgent: engineer,
+      qaRoutingDecision: {
+        kind: "final_qa_unavailable",
+        finalQaAgentId: "missing-final-qa",
+        reason: "missing",
+      },
+    });
+
+    const proposal = evaluateQueueSupervisorIssue(snapshot, defaultQueueSupervisorPolicyConfig, NOW);
+
+    expect(proposal.action).toBe("needs_human");
+    expect(proposal.action).not.toBe("assign_qa_code");
+    expect(proposal.targetAssigneeAgentId).toBeUndefined();
+    expect(proposal.evidence).toContain("final_qa_unavailable agent=missing-final-qa reason=missing");
+  });
+
+  it("requires human intervention when a pinned final participant becomes unavailable after rollback", () => {
+    const decision = resolveQueueSupervisorQaRouting({
+      companyId: "company-1",
+      projectPolicy: { mode: "staged" },
+      issuePolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: "final-review",
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: "final-qa", type: "agent", agentId: qaFinal.id, userId: null }],
+        }],
+      },
+      issueState: {
+        status: "pending",
+        currentStageId: "final-review",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: qaFinal.id, userId: null },
+        returnAssignee: { type: "agent", agentId: engineer.id, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+      },
+      candidates: [],
+      currentAgentId: null,
+      browserScope: "required",
+    });
+    const snapshot = issue({ status: "in_review", qaRoutingDecision: decision });
+
+    const proposal = evaluateQueueSupervisorIssue(snapshot, defaultQueueSupervisorPolicyConfig, NOW);
+
+    expect(decision).toEqual({ kind: "final_qa_unavailable", finalQaAgentId: qaFinal.id, reason: "missing" });
+    expect(proposal.action).toBe("needs_human");
+    expect(proposal.targetAssigneeAgentId).toBeUndefined();
+    expect(proposal.action).not.toBe("assign_qa_code");
+  });
+
+  it("keeps an available pinned final participant after project rollback to staged", () => {
+    const decision = resolveQueueSupervisorQaRouting({
+      companyId: "company-1",
+      projectPolicy: { mode: "staged" },
+      issuePolicy: null,
+      issueState: {
+        status: "pending",
+        currentStageId: "final-review",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: qaFinal.id, userId: null },
+        returnAssignee: { type: "agent", agentId: engineer.id, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+      },
+      candidates: [{
+        id: qaFinal.id,
+        companyId: "company-1",
+        name: qaFinal.name,
+        role: qaFinal.role,
+        status: "idle",
+      }],
+      currentAgentId: null,
+      browserScope: "required",
+    });
+    const snapshot = issue({
+      status: "in_review",
+      assigneeAgent: engineer,
+      qaFinalAgent: qaFinal,
+      qaRoutingDecision: decision,
+    });
+
+    expect(decision).toMatchObject({
+      kind: "pinned_final",
+      participant: { id: qaFinal.id },
+      stage: "final",
+    });
+    expect(evaluateQueueSupervisorIssue(snapshot, defaultQueueSupervisorPolicyConfig, NOW)).toMatchObject({
+      action: "assign_qa_final",
+      targetAssigneeAgentId: qaFinal.id,
+      targetAssigneeKind: "qa_final",
+    });
+  });
+
+  it("surfaces malformed final project policy instead of normalizing it to staged", () => {
+    const decision = resolveQueueSupervisorQaRouting({
+      companyId: "company-1",
+      projectPolicy: { mode: "final", finalQaAgentId: "not-a-uuid" },
+      issuePolicy: null,
+      issueState: null,
+      candidates: [],
+      currentAgentId: null,
+      browserScope: "required",
+    });
+
+    expect(decision).toEqual({
+      kind: "final_qa_unavailable",
+      finalQaAgentId: "not-a-uuid",
+      reason: "malformed_policy",
+    });
+  });
+
+  it("keeps ordinary explicit execution policy outside supervisor QA routing", () => {
+    const decision = resolveQueueSupervisorQaRouting({
+      companyId: "company-1",
+      projectPolicy: { mode: "final", finalQaAgentId: "malformed-project-final" },
+      issuePolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: "engineering-review",
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: "engineer", type: "agent", agentId: engineer.id, userId: null }],
+        }],
+      },
+      issueState: null,
+      candidates: [{
+        id: engineer.id,
+        companyId: "company-1",
+        name: engineer.name,
+        role: engineer.role,
+        status: "idle",
+      }],
+      currentAgentId: null,
+      browserScope: "required",
+    });
+    const snapshot = issue({ status: "in_review", qaRoutingDecision: decision });
+
+    const proposal = evaluateQueueSupervisorIssue(snapshot, defaultQueueSupervisorPolicyConfig, NOW);
+
+    expect(proposal.action).toBe("noop");
+    expect(proposal.targetAssigneeAgentId).toBeUndefined();
+    expect(proposal.requiresHuman).toBe(false);
+  });
+
+  it("keeps a generically-named QA candidate out of staged routing and never targets it for final wakeups", () => {
+    const genericQa: QueueSupervisorAgentRef = { id: "agent-qa-generic", name: "QA", role: "qa" };
+    const decision = resolveQueueSupervisorQaRouting({
+      companyId: "company-1",
+      projectPolicy: null,
+      issuePolicy: null,
+      issueState: null,
+      candidates: [
+        { id: genericQa.id, companyId: "company-1", name: genericQa.name, role: "qa", status: "idle" },
+        { id: qaCode.id, companyId: "company-1", name: qaCode.name, role: "qa", status: "idle" },
+        { id: qaBrowser.id, companyId: "company-1", name: qaBrowser.name, role: "qa", status: "idle" },
+        { id: qaSpec.id, companyId: "company-1", name: qaSpec.name, role: "qa", status: "idle" },
+      ],
+      currentAgentId: null,
+      browserScope: "required",
+    });
+
+    expect(decision.kind).toBe("project_staged");
+    expect(decision).toMatchObject({ kind: "project_staged", stage: "code", participant: { id: qaCode.id } });
+
+    const snapshot = issue({ status: "in_review", assigneeAgent: engineer, qaRoutingDecision: decision });
+    const proposal = evaluateQueueSupervisorIssue(snapshot, defaultQueueSupervisorPolicyConfig, NOW);
+
+    expect(proposal.action).toBe("assign_qa_code");
+    expect(proposal.targetAssigneeAgentId).toBe(qaCode.id);
+    expect(proposal.targetAssigneeAgentId).not.toBe(genericQa.id);
+  });
+
+  it("does not accept misleading QA PASS when final QA is unavailable", () => {
+    const snapshot = issue({
+      status: "in_review",
+      assigneeAgent: qaCode,
+      qaRoutingDecision: {
+        kind: "final_qa_unavailable",
+        finalQaAgentId: "missing-final-qa",
+        reason: "missing",
+      },
+      comments: [{
+        id: "misleading-pass",
+        body: "QA PASS",
+        createdAt: OLD,
+        authorKind: "agent",
+        authorAgentKind: "qa_code",
+      }],
+    });
+
+    const proposal = evaluateQueueSupervisorIssue(snapshot, defaultQueueSupervisorPolicyConfig, NOW);
+
+    expect(proposal.action).toBe("needs_human");
+    expect(proposal.action).not.toBe("mark_done");
+  });
+
+  it("rejects a staged assignment proposal when final QA is unavailable", () => {
+    const snapshot = issue({
+      status: "in_review",
+      qaRoutingDecision: {
+        kind: "final_qa_unavailable",
+        finalQaAgentId: "missing-final-qa",
+        reason: "missing",
+      },
+    });
+    const proposal = evaluateQueueSupervisorIssue(
+      issue({ status: "in_review", assigneeAgent: engineer }),
+      defaultQueueSupervisorPolicyConfig,
+      NOW,
+    );
+
+    const validation = assertQueueSupervisorProposalInvariants(proposal, snapshot);
+
+    expect(validation.ok).toBe(false);
+    expect(validation.violations).toContain("invalid final QA routing cannot produce a staged QA action");
   });
 
   it("classifies QA and Engineer assignees through the heartbeat classifier", () => {
@@ -203,6 +534,40 @@ describe("queue supervisor policy", () => {
     expect(proposal.targetAssigneeAgentId).toBeNull();
     expect(proposal.requiresHuman).toBe(false);
     expect(assertQueueSupervisorProposalInvariants(proposal, snapshot).ok).toBe(true);
+  });
+
+  it("does not infer final QA PASS from free-text comments", () => {
+    const snapshot = issue({
+      status: "in_review",
+      assigneeAgent: qaFinal,
+      qaFinalAgent: qaFinal,
+      qaRoutingDecision: {
+        kind: "project_final",
+        participant: {
+          id: qaFinal.id,
+          companyId: "company-1",
+          name: "QA",
+          role: "qa",
+          status: "idle",
+        },
+        stage: "final",
+        allowedAction: "complete",
+      },
+      comments: [{
+        id: "comment-final-pass",
+        body: "QA PASS",
+        createdAt: OLD,
+        authorKind: "agent",
+        authorAgentKind: "qa_final",
+      }],
+    });
+
+    const proposal = evaluateQueueSupervisorIssue(snapshot, defaultQueueSupervisorPolicyConfig, NOW);
+
+    expect(proposal.classification).toBe("qa_pass_needs_done_closeout");
+    expect(proposal.action).toBe("needs_human");
+    expect(proposal.targetStatus).toBeUndefined();
+    expect(proposal.evidence).toContain("final QA PASS requires authenticated qaEvidence and a durable execution decision");
   });
 
   it("routes blocked review-ready issues to in_review with QA Code", () => {

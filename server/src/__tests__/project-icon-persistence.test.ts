@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { companies, createDb, projects as projectsTable } from "@paperclipai/db";
+import { agents, companies, createDb, projects as projectsTable } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -31,6 +31,7 @@ describeEmbeddedPostgres("project icon persistence", () => {
 
   afterEach(async () => {
     await db.delete(projectsTable);
+    await db.delete(agents);
     await db.delete(companies);
   });
 
@@ -67,6 +68,68 @@ describeEmbeddedPostgres("project icon persistence", () => {
 
     const fetched = await projects.getById(created.id);
     expect(fetched?.icon).toBeNull();
+  });
+
+  it("normalizes a nullable project QA policy to staged", async () => {
+    companyId = await seedCompany();
+    const projects = projectService(db);
+
+    const created = await projects.create(companyId, { name: "Policy default" });
+    expect(created.qaPolicy).toEqual({ mode: "staged" });
+
+    const fetched = await projects.getById(created.id);
+    expect(fetched?.qaPolicy).toEqual({ mode: "staged" });
+  });
+
+  it("persists a valid same-company active QA final policy", async () => {
+    companyId = await seedCompany();
+    const [qaAgent] = await db
+      .insert(agents)
+      .values({ companyId, name: "QA", role: "qa", status: "idle" })
+      .returning({ id: agents.id });
+    const projects = projectService(db);
+
+    const created = await projects.create(companyId, {
+      name: "Final policy",
+      qaPolicy: { mode: "final", finalQaAgentId: qaAgent.id },
+    });
+
+    expect(created.qaPolicy).toEqual({ mode: "final", finalQaAgentId: qaAgent.id });
+  });
+
+  it("rejects a final policy that points to another company", async () => {
+    companyId = await seedCompany();
+    const otherCompanyId = await seedCompany();
+    const [qaAgent] = await db
+      .insert(agents)
+      .values({ companyId: otherCompanyId, name: "Other QA", role: "qa", status: "idle" })
+      .returning({ id: agents.id });
+    const projects = projectService(db);
+
+    await expect(projects.create(companyId, {
+      name: "Cross-company policy",
+      qaPolicy: { mode: "final", finalQaAgentId: qaAgent.id },
+    })).rejects.toMatchObject({ status: 422 });
+    expect(await db.select({ id: projectsTable.id }).from(projectsTable)).toHaveLength(0);
+  });
+
+  it.each([
+    ["pending_approval", "qa"],
+    ["terminated", "qa"],
+    ["idle", "engineer"],
+  ] as const)("rejects %s or non-QA final policy without project mutation", async (status, role) => {
+    companyId = await seedCompany();
+    const [agent] = await db
+      .insert(agents)
+      .values({ companyId, name: "Candidate", role, status })
+      .returning({ id: agents.id });
+    const projects = projectService(db);
+
+    await expect(projects.create(companyId, {
+      name: `Invalid ${status} ${role}`,
+      qaPolicy: { mode: "final", finalQaAgentId: agent.id },
+    })).rejects.toMatchObject({ status: 422 });
+    expect(await db.select({ id: projectsTable.id }).from(projectsTable)).toHaveLength(0);
   });
 
   // PAP-71: new projects must NOT auto-assign a color — they stay neutral gray

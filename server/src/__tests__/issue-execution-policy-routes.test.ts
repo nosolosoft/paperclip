@@ -40,8 +40,12 @@ const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
 })));
 const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
+const mockDbInsertValues = vi.hoisted(() => vi.fn(async () => undefined));
+const mockDbInsert = vi.hoisted(() => vi.fn(() => ({ values: mockDbInsertValues })));
+const mockDbTransaction = vi.hoisted(() => vi.fn(async (callback: (tx: unknown) => Promise<unknown>) => callback({ insert: mockDbInsert })));
 const mockDb = vi.hoisted(() => ({
   select: mockDbSelect,
+  transaction: mockDbTransaction,
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
@@ -72,6 +76,9 @@ const mockAgentService = vi.hoisted(() => ({
       orgChainHealth: { status: "healthy" },
     },
   })),
+}));
+const mockProjectService = vi.hoisted(() => ({
+  getById: vi.fn(async () => null),
 }));
 const mockWorkProductService = vi.hoisted(() => ({
   listForIssue: vi.fn(async () => []),
@@ -130,7 +137,7 @@ function registerModuleMocks() {
     issueService: () => mockIssueService,
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
     logActivity: mockLogActivity,
-    projectService: () => ({}),
+    projectService: () => mockProjectService,
     routineService: () => ({
       syncRunStatusForIssue: vi.fn(async () => undefined),
     }),
@@ -211,6 +218,7 @@ describe("issue execution policy routes", () => {
     });
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockResolvedValue([]);
     mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([]);
+    mockProjectService.getById.mockResolvedValue(null);
     mockWorkProductService.listForIssue.mockResolvedValue([]);
     mockAgentService.getById.mockImplementation(async (agentId: string) => ({
       id: agentId,
@@ -222,6 +230,8 @@ describe("issue execution policy routes", () => {
     }));
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
+    mockDbInsertValues.mockResolvedValue(undefined);
+    mockDbTransaction.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) => callback({ insert: mockDbInsert }));
     mockDbSelectWhere.mockImplementation(() => ({
       then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
         Promise.resolve([{
@@ -326,6 +336,7 @@ describe("issue execution policy routes", () => {
     };
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch }));
+    mockIssueService.addComment.mockResolvedValue({ id: "comment-1", body: "Final QA passed" });
     mockAgentService.getById.mockImplementation(async (agentId: string) => ({
       id: agentId,
       companyId: "company-1",
@@ -363,6 +374,222 @@ describe("issue execution policy routes", () => {
         assigneeUserId: null,
       }),
     );
+  });
+
+  it("routes final project policy by UUID even when the selected agent is named QA Code", async () => {
+    const engineerId = "33333333-3333-4333-8333-333333333333";
+    const stagedCodeQaId = "44444444-4444-4444-8444-444444444444";
+    const finalQaId = "55555555-5555-4555-8555-555555555555";
+    const projectId = "77777777-7777-4777-8777-777777777777";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      projectId,
+      status: "in_progress",
+      assigneeAgentId: engineerId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "NSS-449",
+      title: "Final QA route",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch }));
+    mockAgentService.getById.mockImplementation(async (agentId: string) => ({
+      id: agentId,
+      companyId: "company-1",
+      role: agentId === engineerId ? "engineer" : "qa",
+      name: agentId === engineerId ? "Engineer" : "QA (Code)",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    }));
+    mockDbSelectWhere.mockImplementation(() => ({
+      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve([
+          { id: stagedCodeQaId, companyId: "company-1", role: "qa", name: "QA (Code)", status: "idle" },
+          { id: finalQaId, companyId: "company-1", role: "qa", name: "QA (Code)", status: "idle" },
+        ]).then(onFulfilled, onRejected),
+    }));
+    mockProjectService.getById.mockResolvedValue({
+      id: projectId,
+      companyId: "company-1",
+      qaPolicy: { mode: "final", finalQaAgentId: finalQaId },
+    });
+    mockWorkProductService.listForIssue.mockResolvedValue([{
+      id: "99999999-9999-4999-8999-999999999999",
+      type: "pull_request",
+      status: "ready_for_review",
+      healthStatus: "healthy",
+      isPrimary: true,
+    }]);
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: engineerId,
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "in_review" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issue.id,
+      expect.objectContaining({
+        status: "in_review",
+        assigneeAgentId: finalQaId,
+        assigneeUserId: null,
+        executionPolicy: expect.objectContaining({
+          stages: [expect.objectContaining({
+            type: "review",
+            participants: [expect.objectContaining({ type: "agent", agentId: finalQaId })],
+          })],
+        }),
+        executionState: expect.objectContaining({
+          status: "pending",
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: finalQaId, userId: null },
+          returnAssignee: { type: "agent", agentId: engineerId, userId: null },
+        }),
+      }),
+    );
+  });
+
+  it("gives an explicit QA issue policy precedence over a project-final policy", async () => {
+    const engineerId = "33333333-3333-4333-8333-333333333333";
+    const projectFinalQaId = "55555555-5555-4555-8555-555555555555";
+    const explicitQaId = "66666666-6666-4666-8666-666666666666";
+    const projectId = "77777777-7777-4777-8777-777777777777";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      projectId,
+      status: "in_progress",
+      assigneeAgentId: engineerId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "NSS-451",
+      title: "Explicit QA policy route",
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ type: "agent", agentId: explicitQaId, userId: null }],
+        }],
+      },
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch }));
+    mockAgentService.getById.mockImplementation(async (agentId: string) => ({
+      id: agentId,
+      companyId: "company-1",
+      role: agentId === engineerId ? "engineer" : "qa",
+      name: agentId === engineerId ? "Engineer" : "QA (Code)",
+      status: "idle",
+      orgChainHealth: { status: "healthy" },
+    }));
+    mockDbSelectWhere.mockImplementation(() => ({
+      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve([
+          { id: projectFinalQaId, companyId: "company-1", role: "qa", name: "QA (Code)", status: "idle" },
+          { id: explicitQaId, companyId: "company-1", role: "qa", name: "QA (Code)", status: "idle" },
+        ]).then(onFulfilled, onRejected),
+    }));
+    mockProjectService.getById.mockResolvedValue({
+      id: projectId,
+      companyId: "company-1",
+      qaPolicy: { mode: "final", finalQaAgentId: projectFinalQaId },
+    });
+    mockWorkProductService.listForIssue.mockResolvedValue([{
+      id: "99999999-9999-4999-8999-999999999999",
+      type: "pull_request",
+      status: "ready_for_review",
+      healthStatus: "healthy",
+      isPrimary: true,
+    }]);
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: engineerId,
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "in_review" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issue.id,
+      expect.objectContaining({
+        status: "in_review",
+        assigneeAgentId: explicitQaId,
+        assigneeUserId: null,
+      }),
+    );
+  });
+
+  it("fails closed through HTTP when persisted final project policy is malformed", async () => {
+    const engineerId = "33333333-3333-4333-8333-333333333333";
+    const stagedCodeQaId = "44444444-4444-4444-8444-444444444444";
+    const projectId = "77777777-7777-4777-8777-777777777777";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      projectId,
+      status: "in_progress",
+      assigneeAgentId: engineerId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "NSS-450",
+      title: "Malformed final QA route",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockAgentService.getById.mockImplementation(async (agentId: string) => ({
+      id: agentId,
+      companyId: "company-1",
+      role: agentId === stagedCodeQaId ? "qa" : "engineer",
+      name: agentId === stagedCodeQaId ? "QA (Code)" : "Engineer",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    }));
+    mockDbSelectWhere.mockImplementation(() => ({
+      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve([
+          { id: stagedCodeQaId, companyId: "company-1", role: "qa", name: "QA (Code)", status: "idle" },
+        ]).then(onFulfilled, onRejected),
+    }));
+    mockAccessService.hasPermission.mockResolvedValue(true);
+    const app = await createApp({
+      type: "agent",
+      agentId: engineerId,
+      companyId: "company-1",
+      runId: "run-1",
+    });
+    const { unprocessable } = await import("../errors.js");
+    mockProjectService.getById.mockRejectedValue(unprocessable("Invalid project QA policy", {
+      code: "invalid_project_qa_policy",
+    }));
+
+    const res = await request(app)
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "in_review" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({
+      code: "final_qa_unavailable",
+      reason: "malformed_policy",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   it("routes an engineer-owned in_review issue to Code QA after accepting its resolved confirmation", async () => {
@@ -591,6 +818,61 @@ describe("issue execution policy routes", () => {
     );
   });
 
+  it("routes backend-only Code QA PASS to Spec QA when status remains in_progress", async () => {
+    const codeQaId = "44444444-4444-4444-8444-444444444444";
+    const engineerId = "33333333-3333-4333-8333-333333333333";
+    const specQaId = "66666666-6666-4666-8666-666666666666";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: codeQaId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "NSS-272",
+      title: "Backend-only issue",
+      executionPolicy: null,
+      executionState: null,
+      originalEngineerAssigneeAgentId: engineerId,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch }));
+    mockAgentService.getById.mockImplementation(async (agentId: string) => ({
+      id: agentId,
+      companyId: "company-1",
+      role: agentId === codeQaId ? "qa" : "engineer",
+      name: agentId === codeQaId ? "QA (Code)" : "Engineer",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    }));
+    mockAgentService.list.mockResolvedValue([
+      { id: engineerId, companyId: "company-1", role: "engineer", name: "Engineer", status: "idle" },
+    ]);
+    mockDbSelectWhere.mockImplementation(() => ({
+      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve([
+          { id: codeQaId, companyId: "company-1", role: "qa", name: "QA (Code)", status: "idle" },
+          { id: specQaId, companyId: "company-1", role: "qa", name: "QA (Spec)", status: "idle" },
+        ]).then(onFulfilled, onRejected),
+    }));
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const res = await request(await createApp({ type: "agent", agentId: codeQaId, companyId: "company-1", runId: "run-1" }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "in_progress", qaVerdict: "pass", qaBrowserScope: "not_applicable" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expect.objectContaining({
+        status: "in_review",
+        assigneeAgentId: specQaId,
+        assigneeUserId: null,
+      }),
+    );
+  });
+
   it("rejects backend-only Code QA PASS when no Spec QA agent exists", async () => {
     const codeQaId = "44444444-4444-4444-8444-444444444444";
     const browserQaId = "55555555-5555-4555-8555-555555555555";
@@ -681,6 +963,55 @@ describe("issue execution policy routes", () => {
       missing: "browser_qa_agent",
       required: "qaBrowserScope:not_applicable",
     });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects direct project-final PASS before the final policy is pinned", async () => {
+    const codeQaId = "44444444-4444-4444-8444-444444444444";
+    const projectId = "77777777-7777-4777-8777-777777777777";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      projectId,
+      status: "in_review",
+      assigneeAgentId: codeQaId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "NSS-453",
+      title: "Final review by legacy-named agent",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch }));
+    mockProjectService.getById.mockResolvedValue({
+      id: projectId,
+      companyId: "company-1",
+      qaPolicy: { mode: "final", finalQaAgentId: codeQaId },
+    });
+    mockAgentService.getById.mockResolvedValue({
+      id: codeQaId,
+      companyId: "company-1",
+      role: "qa",
+      name: "QA (Code)",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    });
+    mockDbSelectWhere.mockImplementation(() => ({
+      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve([
+          { id: codeQaId, companyId: "company-1", role: "qa", name: "QA (Code)", status: "idle" },
+        ]).then(onFulfilled, onRejected),
+    }));
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const res = await request(await createApp({ type: "agent", agentId: codeQaId, companyId: "company-1", runId: "run-1" }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ qaVerdict: "pass" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({ code: "qa_review_evidence_required" });
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
@@ -1532,5 +1863,596 @@ describe("issue execution policy routes", () => {
         details: expect.not.objectContaining({ externalRef: expect.anything() }),
       }),
     );
+  });
+
+  it("rejects final QA evidence from staged QA before mutating issue or decisions", async () => {
+    const qaAgentId = "55555555-5555-4555-8555-555555555555";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      projectId: "77777777-7777-4777-8777-777777777777",
+      status: "in_review",
+      assigneeAgentId: qaAgentId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1018",
+      title: "Staged QA evidence must not complete",
+      executionPolicy: null,
+      executionState: null,
+    };
+    const evidence = {
+      version: 1,
+      mode: "final",
+      projectId: issue.projectId,
+      reviewerAgentId: qaAgentId,
+      phases: {
+        code: { outcome: "pass", checks: [{ kind: "test", evidence: "focused tests pass" }] },
+        browser: {
+          outcome: "pass",
+          reason: "UI flow changed",
+          evidence: [{ kind: "url", value: "https://preview.example.test/final-qa" }],
+        },
+        spec: { outcome: "pass", criteria: [{ criterion: "staged evidence is rejected", evidence: "guarded before update" }] },
+      },
+      handoff: { kind: "pull_request", id: "125", url: null },
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch }));
+    mockIssueService.addComment.mockResolvedValue({ id: "comment-1", body: "Final QA passed" });
+    mockAgentService.getById.mockResolvedValue({
+      id: qaAgentId,
+      companyId: "company-1",
+      role: "qa",
+      name: "QA (Spec)",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    });
+    mockDbSelectWhere.mockImplementation(() => ({
+      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve([{ id: qaAgentId, companyId: "company-1", role: "qa", name: "QA (Spec)", status: "idle" }])
+          .then(onFulfilled, onRejected),
+    }));
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const res = await request(await createApp({ type: "agent", agentId: qaAgentId, companyId: "company-1", runId: "run-1" }))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "done", comment: "Final QA passed", qaVerdict: "pass", qaEvidence: evidence });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({ code: "qa_review_evidence_final_participant_required" });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockDbTransaction).not.toHaveBeenCalled();
+    expect(mockDbInsertValues).not.toHaveBeenCalled();
+  });
+
+  it("persists final QA evidence after project rollback because the in-flight policy stays authoritative", async () => {
+    const qaAgentId = "55555555-5555-4555-8555-555555555555";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      projectId: "77777777-7777-4777-8777-777777777777",
+      status: "in_review",
+      assigneeAgentId: qaAgentId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1016",
+      title: "Final QA evidence",
+      executionPolicy: normalizeIssueExecutionPolicy({
+        stages: [{
+          id: "11111111-1111-4111-8111-111111111111",
+          type: "review",
+          participants: [{ type: "agent", agentId: qaAgentId }],
+        }],
+      }),
+      executionState: {
+        status: "pending",
+        currentStageId: "11111111-1111-4111-8111-111111111111",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: qaAgentId, userId: null },
+        returnAssignee: { type: "agent", agentId: "33333333-3333-4333-8333-333333333333", userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+      },
+    };
+    const evidence = {
+      version: 1,
+      mode: "final",
+      projectId: issue.projectId,
+      reviewerAgentId: qaAgentId,
+      phases: {
+        code: { outcome: "pass", checks: [{ kind: "test", evidence: "focused tests pass" }] },
+        browser: {
+          outcome: "pass",
+          reason: "UI flow changed",
+          evidence: [{ kind: "screenshot", value: "artifact://final-qa/screenshot.png" }],
+        },
+        spec: { outcome: "pass", criteria: [{ criterion: "API persists policy", evidence: "DB row verified" }] },
+      },
+      handoff: { kind: "pull_request", id: "123", url: "https://github.com/example/pull/123" },
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch }));
+    mockIssueService.addComment.mockResolvedValue({ id: "comment-1", body: "Final QA passed" });
+    mockProjectService.getById.mockResolvedValue({
+      id: issue.projectId,
+      companyId: "company-1",
+      qaPolicy: { mode: "staged" },
+    });
+    mockAgentService.getById.mockResolvedValue({
+      id: qaAgentId,
+      companyId: "company-1",
+      role: "qa",
+      name: "QA (Spec)",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    });
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const res = await request(await createApp({ type: "agent", agentId: qaAgentId, companyId: "company-1", runId: "run-1" }))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "done", comment: "Final QA passed", qaVerdict: "pass", qaEvidence: evidence });
+
+    expect(res.status).toBe(200);
+    expect(mockDbTransaction).toHaveBeenCalled();
+    expect(mockDbInsertValues).toHaveBeenCalledWith(
+      expect.objectContaining({
+        issueId: issue.id,
+        actorAgentId: qaAgentId,
+        evidence,
+      }),
+    );
+  });
+
+  it("rejects final QA done without a verdict before mutating the issue or decisions", async () => {
+    const qaAgentId = "55555555-5555-4555-8555-555555555555";
+    const engineerId = "33333333-3333-4333-8333-333333333333";
+    const stageId = "11111111-1111-4111-8111-111111111111";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      projectId: "77777777-7777-4777-8777-777777777777",
+      status: "in_review",
+      assigneeAgentId: qaAgentId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1022",
+      title: "Final QA verdict is mandatory",
+      executionPolicy: normalizeIssueExecutionPolicy({
+        stages: [{ id: stageId, type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+      }),
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: qaAgentId, userId: null },
+        returnAssignee: { type: "agent", agentId: engineerId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch }));
+    mockIssueService.addComment.mockResolvedValue({ id: "comment-1", body: "Final QA passed" });
+    mockAgentService.getById.mockResolvedValue({
+      id: qaAgentId,
+      companyId: "company-1",
+      role: "qa",
+      name: "QA",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    });
+    mockDbSelectWhere.mockImplementation(() => ({
+      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve([{ id: qaAgentId, companyId: "company-1", role: "qa", name: "QA", status: "idle" }])
+          .then(onFulfilled, onRejected),
+    }));
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const res = await request(await createApp({ type: "agent", agentId: qaAgentId, companyId: "company-1", runId: "run-1" }))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "done", comment: "Final QA passed" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({ code: "qa_review_evidence_required" });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockDbTransaction).not.toHaveBeenCalled();
+    expect(mockDbInsertValues).not.toHaveBeenCalled();
+  });
+
+  it("rejects final QA PASS without evidence before mutating the issue or decisions", async () => {
+    const qaAgentId = "55555555-5555-4555-8555-555555555555";
+    const engineerId = "33333333-3333-4333-8333-333333333333";
+    const stageId = "11111111-1111-4111-8111-111111111111";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      projectId: "77777777-7777-4777-8777-777777777777",
+      status: "in_review",
+      assigneeAgentId: qaAgentId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1020",
+      title: "Final QA evidence is mandatory",
+      executionPolicy: normalizeIssueExecutionPolicy({
+        stages: [{ id: stageId, type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+      }),
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: qaAgentId, userId: null },
+        returnAssignee: { type: "agent", agentId: engineerId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockAgentService.getById.mockResolvedValue({
+      id: qaAgentId,
+      companyId: "company-1",
+      role: "qa",
+      name: "QA",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    });
+    mockDbSelectWhere.mockImplementation(() => ({
+      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve([{ id: qaAgentId, companyId: "company-1", role: "qa", name: "QA", status: "idle" }])
+          .then(onFulfilled, onRejected),
+    }));
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const res = await request(await createApp({ type: "agent", agentId: qaAgentId, companyId: "company-1", runId: "run-1" }))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ qaVerdict: "pass", comment: "All final checks passed" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({ code: "qa_review_evidence_required" });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockDbTransaction).not.toHaveBeenCalled();
+    expect(mockDbInsertValues).not.toHaveBeenCalled();
+  });
+
+  it("persists final QA FAIL as changes_requested and restores the original engineer", async () => {
+    const qaAgentId = "55555555-5555-4555-8555-555555555555";
+    const engineerId = "33333333-3333-4333-8333-333333333333";
+    const stageId = "11111111-1111-4111-8111-111111111111";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      projectId: "77777777-7777-4777-8777-777777777777",
+      status: "in_review",
+      assigneeAgentId: qaAgentId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1021",
+      title: "Final QA requests rework",
+      executionPolicy: normalizeIssueExecutionPolicy({
+        stages: [{ id: stageId, type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+      }),
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: qaAgentId, userId: null },
+        returnAssignee: { type: "agent", agentId: engineerId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+      },
+      originalEngineerAssigneeAgentId: engineerId,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch }));
+    mockIssueService.addComment.mockResolvedValue({ id: "comment-fail", body: "Contract mismatch in API response" });
+    mockAgentService.getById.mockResolvedValue({
+      id: qaAgentId,
+      companyId: "company-1",
+      role: "qa",
+      name: "QA",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    });
+    mockAgentService.list.mockResolvedValue([
+      { id: engineerId, companyId: "company-1", role: "engineer", name: "Engineer", status: "idle" },
+      { id: qaAgentId, companyId: "company-1", role: "qa", name: "QA", status: "idle" },
+    ]);
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const res = await request(await createApp({ type: "agent", agentId: qaAgentId, companyId: "company-1", runId: "run-1" }))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ qaVerdict: "fail", comment: "Contract mismatch in API response" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockDbTransaction).toHaveBeenCalled();
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issue.id,
+      expect.objectContaining({
+        status: "in_progress",
+        assigneeAgentId: engineerId,
+        assigneeUserId: null,
+        executionState: expect.objectContaining({
+          status: "changes_requested",
+          lastDecisionOutcome: "changes_requested",
+          returnAssignee: { type: "agent", agentId: engineerId, userId: null },
+          qaVerdict: "fail",
+          qaEvidence: null,
+        }),
+      }),
+      expect.anything(),
+    );
+    expect(mockDbInsertValues).toHaveBeenCalledWith(expect.objectContaining({
+      issueId: issue.id,
+      actorAgentId: qaAgentId,
+      outcome: "changes_requested",
+      body: "Contract mismatch in API response",
+      evidence: null,
+    }));
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      issue.id,
+      "Contract mismatch in API response",
+      expect.objectContaining({ agentId: qaAgentId, runId: "run-1" }),
+      expect.anything(),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.comment_added",
+        entityId: issue.id,
+        agentId: qaAgentId,
+      }),
+    );
+  });
+
+  it("clears the prior QA result when the engineer re-handoffs after final QA FAIL", async () => {
+    const qaAgentId = "55555555-5555-4555-8555-555555555555";
+    const engineerId = "33333333-3333-4333-8333-333333333333";
+    const stageId = "11111111-1111-4111-8111-111111111111";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: engineerId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1023",
+      title: "Final QA re-handoff clears prior result",
+      executionPolicy: normalizeIssueExecutionPolicy({
+        stages: [{ id: stageId, type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+      }),
+      executionState: {
+        status: "changes_requested",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: qaAgentId, userId: null },
+        returnAssignee: { type: "agent", agentId: engineerId, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: "22222222-2222-4222-8222-222222222222",
+        lastDecisionOutcome: "changes_requested",
+        qaVerdict: "fail",
+        qaEvidence: null,
+        monitor: null,
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch }));
+    mockIssueService.addComment.mockResolvedValue({ id: "comment-1", body: "Fixed final QA feedback" });
+    mockAgentService.getById.mockResolvedValue({
+      id: engineerId,
+      companyId: "company-1",
+      role: "engineer",
+      name: "Engineer",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    });
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const res = await request(await createApp({ type: "agent", agentId: engineerId, companyId: "company-1", runId: "run-1" }))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "done", comment: "Fixed final QA feedback" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issue.id,
+      expect.objectContaining({
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionState: expect.objectContaining({
+          status: "pending",
+          currentStageId: stageId,
+          qaVerdict: null,
+          qaEvidence: null,
+        }),
+      }),
+    );
+  });
+
+  it("lets valid final evidence drive the terminal decision without client-supplied status", async () => {
+    const qaAgentId = "55555555-5555-4555-8555-555555555555";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      projectId: "77777777-7777-4777-8777-777777777777",
+      status: "in_review",
+      assigneeAgentId: qaAgentId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1019",
+      title: "Final evidence requires terminal decision",
+      executionPolicy: normalizeIssueExecutionPolicy({
+        stages: [{
+          id: "11111111-1111-4111-8111-111111111111",
+          type: "review",
+          participants: [{ type: "agent", agentId: qaAgentId }],
+        }],
+      }),
+      executionState: {
+        status: "pending",
+        currentStageId: "11111111-1111-4111-8111-111111111111",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: qaAgentId, userId: null },
+        returnAssignee: { type: "agent", agentId: "33333333-3333-4333-8333-333333333333", userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: null,
+      },
+    };
+    const evidence = {
+      version: 1,
+      mode: "final",
+      projectId: issue.projectId,
+      reviewerAgentId: qaAgentId,
+      phases: {
+        code: { outcome: "pass", checks: [{ kind: "test", evidence: "focused tests pass" }] },
+        browser: { outcome: "not_applicable", reason: "backend-only change", evidence: [] },
+        spec: { outcome: "pass", criteria: [{ criterion: "terminal decision required", evidence: "route guard" }] },
+      },
+      handoff: { kind: "pull_request", id: "126", url: null },
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch }));
+    mockAgentService.getById.mockResolvedValue({
+      id: qaAgentId,
+      companyId: "company-1",
+      role: "qa",
+      name: "QA (Spec)",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    });
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const res = await request(await createApp({ type: "agent", agentId: qaAgentId, companyId: "company-1", runId: "run-1" }))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ comment: "Final QA passed", qaVerdict: "pass", qaEvidence: evidence });
+
+    expect(res.status).toBe(200);
+    expect(mockDbTransaction).toHaveBeenCalled();
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issue.id,
+      expect.objectContaining({
+        status: "done",
+        assigneeAgentId: null,
+        assigneeUserId: null,
+        executionState: expect.objectContaining({
+          status: "completed",
+          qaVerdict: "pass",
+          qaEvidence: evidence,
+        }),
+      }),
+      expect.anything(),
+    );
+    expect(mockDbInsertValues).toHaveBeenCalledWith(expect.objectContaining({
+      issueId: issue.id,
+      actorAgentId: qaAgentId,
+      outcome: "approved",
+      evidence,
+    }));
+  });
+
+  it("rejects QA evidence whose identity does not match the issue and actor", async () => {
+    const qaAgentId = "55555555-5555-4555-8555-555555555555";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      projectId: "77777777-7777-4777-8777-777777777777",
+      status: "in_review",
+      assigneeAgentId: qaAgentId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1017",
+      title: "Forged QA evidence",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockAgentService.getById.mockResolvedValue({
+      id: qaAgentId,
+      companyId: "company-1",
+      role: "qa",
+      name: "QA",
+      status: "idle",
+      permissions: null,
+      orgChainHealth: { status: "healthy" },
+    });
+
+    const res = await request(await createApp({ type: "agent", agentId: qaAgentId, companyId: "company-1", runId: "run-1" }))
+      .patch(`/api/issues/${issue.id}`)
+      .send({
+        qaVerdict: "pass",
+        qaEvidence: {
+          version: 1,
+          mode: "final",
+          projectId: "88888888-8888-4888-8888-888888888888",
+          reviewerAgentId: "99999999-9999-4999-8999-999999999999",
+          phases: {
+            code: { outcome: "pass", checks: [{ kind: "test", evidence: "tests pass" }] },
+            browser: { outcome: "not_applicable", reason: "backend-only", evidence: [] },
+            spec: { outcome: "pass", criteria: [{ criterion: "works", evidence: "verified" }] },
+          },
+          handoff: { kind: "pull_request", id: "124", url: null },
+        },
+      });
+
+    expect(res.status).toBe(422);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockDbInsertValues).not.toHaveBeenCalled();
+  });
+
+  it("returns 422 for malformed final QA evidence without loading or mutating the issue", async () => {
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "55555555-5555-4555-8555-555555555555",
+      companyId: "company-1",
+      runId: "run-1",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({
+        qaVerdict: "pass",
+        qaEvidence: {
+          version: 1,
+          mode: "final",
+          projectId: "77777777-7777-4777-8777-777777777777",
+          reviewerAgentId: "55555555-5555-4555-8555-555555555555",
+          phases: {
+            code: { outcome: "pass", checks: [] },
+            browser: { outcome: "pass", reason: "UI changed", evidence: [] },
+            spec: { outcome: "pass", criteria: [] },
+          },
+          handoff: { kind: "pull_request", id: "", url: null },
+        },
+      });
+
+    expect(res.status).toBe(422);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockDbTransaction).not.toHaveBeenCalled();
+    expect(mockDbInsertValues).not.toHaveBeenCalled();
   });
 });

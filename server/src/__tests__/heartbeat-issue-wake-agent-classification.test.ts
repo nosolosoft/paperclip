@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { agentOwnsIssueDispositionContract, classifyIssueWakeAgent } from "../services/heartbeat.ts";
+import { resolveQaRouting } from "../services/qa-routing.ts";
 
 describe("classifyIssueWakeAgent", () => {
   it("treats every qa role as review-only, even with a generic name", () => {
@@ -31,6 +32,34 @@ describe("classifyIssueWakeAgent", () => {
       name: "QA (Spec)",
       role: "qa",
     })).toMatchObject({ isReviewOnly: true, isBrowserQa: false, isCodeQa: false, isSpecQa: true });
+  });
+
+  it("keeps legacy classification without changing UUID-authoritative final routing", () => {
+    const finalQa = {
+      id: "final-qa",
+      companyId: "company-1",
+      name: "QA (Code)",
+      role: "qa",
+      status: "idle",
+    };
+
+    expect(classifyIssueWakeAgent(finalQa)).toMatchObject({
+      isReviewOnly: true,
+      isCodeQa: true,
+    });
+    expect(resolveQaRouting({
+      companyId: "company-1",
+      projectPolicy: { mode: "final", finalQaAgentId: finalQa.id },
+      issuePolicy: null,
+      issueState: null,
+      candidates: [finalQa],
+      currentAgentId: null,
+      browserScope: "required",
+    })).toMatchObject({
+      kind: "project_final",
+      participant: { id: finalQa.id },
+      stage: "final",
+    });
   });
 
   it("classifies engineer agents as engineering, not review-only", () => {

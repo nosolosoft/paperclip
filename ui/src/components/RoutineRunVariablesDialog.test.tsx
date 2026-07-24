@@ -86,6 +86,7 @@ function createProject(): Project {
     pauseReason: null,
     pausedAt: null,
     archivedAt: null,
+    qaPolicy: { mode: "staged" },
     executionWorkspacePolicy: {
       enabled: true,
       defaultMode: "shared_workspace",

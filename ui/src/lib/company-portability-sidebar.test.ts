@@ -51,6 +51,7 @@ function makeProject(id: string, name: string): Project {
     pauseReason: null,
     pausedAt: null,
     executionWorkspacePolicy: null,
+    qaPolicy: { mode: "staged" },
     archivedAt: null,
     goalIds: [],
     goals: [],

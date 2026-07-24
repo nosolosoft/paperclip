@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link } from "@/lib/router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { Project } from "@paperclipai/shared";
+import { agentsApi } from "../api/agents";
 import { StatusBadge } from "./StatusBadge";
 import { cn, formatDate } from "../lib/utils";
 import { environmentsApi } from "../api/environments";
@@ -23,6 +24,7 @@ import { DraftInput } from "./agent-config-primitives";
 import { InlineEditor } from "./InlineEditor";
 import { EnvironmentVariablesEditor } from "./environment-variables-editor";
 import { Badge } from "@/components/ui/badge";
+import { ProjectQaPolicyControl } from "./ProjectQaPolicyControl";
 
 const PROJECT_STATUSES = [
   { value: "backlog", label: "Backlog" },
@@ -48,6 +50,7 @@ export type ProjectConfigFieldKey =
   | "status"
   | "goals"
   | "env"
+  | "qa_policy"
   | "execution_workspace_enabled"
   | "execution_workspace_default_mode"
   | "execution_workspace_environment"
@@ -245,6 +248,11 @@ export function ProjectProperties({ project, onUpdate, onFieldUpdate, getFieldSa
     queryKey: queryKeys.goals.list(selectedCompanyId!),
     queryFn: () => goalsApi.list(selectedCompanyId!),
     enabled: !!selectedCompanyId,
+  });
+  const { data: allAgents = [] } = useQuery({
+    queryKey: selectedCompanyId ? queryKeys.agents.list(selectedCompanyId) : ["agents", "none"],
+    queryFn: () => agentsApi.list(selectedCompanyId!),
+    enabled: Boolean(selectedCompanyId),
   });
   const { data: experimentalSettings } = useQuery({
     queryKey: queryKeys.instance.experimentalSettings,
@@ -652,6 +660,15 @@ export function ProjectProperties({ project, onUpdate, onFieldUpdate, getFieldSa
         </PropertyRow>
         <PropertyRow label={<FieldLabel label="Updated" state="idle" />}>
           <span className="text-sm">{formatDate(project.updatedAt)}</span>
+        </PropertyRow>
+        <PropertyRow label={<FieldLabel label="QA" state={fieldState("qa_policy")} />} alignStart>
+          <ProjectQaPolicyControl
+            policy={project.qaPolicy ?? { mode: "staged" }}
+            agents={allAgents}
+            onChange={(data) => commitField("qa_policy", data)}
+            saveState={fieldState("qa_policy")}
+            editable={Boolean(onUpdate || onFieldUpdate)}
+          />
         </PropertyRow>
         {project.targetDate && (
           <PropertyRow label={<FieldLabel label="Target Date" state="idle" />}>

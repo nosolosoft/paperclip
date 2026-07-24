@@ -597,6 +597,7 @@ function createProject(overrides: Partial<Project> = {}): Project {
     env: null,
     pauseReason: null,
     pausedAt: null,
+    qaPolicy: { mode: "staged" },
     executionWorkspacePolicy: {
       enabled: true,
       defaultMode: "isolated_workspace",

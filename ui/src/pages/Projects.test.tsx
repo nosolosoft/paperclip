@@ -81,6 +81,7 @@ function makeProject(overrides: Partial<Project>): Project {
     pauseReason: null,
     pausedAt: null,
     executionWorkspacePolicy: null,
+    qaPolicy: { mode: "staged" },
     codebase: {
       workspaceId: null,
       repoUrl: null,

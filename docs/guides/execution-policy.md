@@ -260,6 +260,80 @@ Selections build the `executionPolicy.stages` array automatically.
 
 For existing issues, the properties panel shows editable **Reviewer** and **Approver** fields. Multiple participants can be added per stage. Changes persist to the issue's `executionPolicy` via the API.
 
+## Project QA Policy: Staged vs Final
+
+Separate from the generic reviewer/approver `executionPolicy` above, every project has a `qaPolicy` that decides how Engineer→QA handoffs are routed once an issue reaches `in_review`. `qaPolicy` lives on the project (`projects.qa_policy`, nullable JSONB) and normalizes to staged when absent:
+
+```ts
+type ProjectQaPolicy =
+  | { mode: "staged" }
+  | { mode: "final"; finalQaAgentId: string };
+```
+
+### Staged (default, legacy)
+
+`{ "mode": "staged" }`, or no `qaPolicy` at all. The runtime routes an in-review issue through separate QA agents by role and name, one stage at a time:
+
+```
+Engineer → QA (Code) → QA (Browser) [skipped when qaBrowserScope="not_applicable"] → QA (Spec) → done
+```
+
+Each stage PASS advances to the next; only a **QA (Spec) PASS** closes the issue. A FAIL at any stage returns the issue to the original engineer with `changes_requested`. This is the flow every project uses until it is explicitly switched to `final`.
+
+### Final (single-gate, opt-in per project)
+
+`{ "mode": "final", "finalQaAgentId": "<uuid>" }`. The engineer handoff is routed to exactly one fixed final QA agent, identified **only by UUID**, never by agent name or role heuristics, even if that agent happens to be named `QA (Code)` or anything else. That authenticated QA reads every explicit acceptance criterion before review, then performs Code, Browser PASS or explicit Browser `"not_applicable"`, and Spec in that order. For each explicit criterion, QA must execute at least one command, test, or observable check, record concrete evidence in `phases.code.checks`, and add one `phases.spec.criteria` entry naming that check. Generic `reviewed` or `looks good` evidence is invalid:
+
+```
+Engineer → final QA (fixed UUID) → done | changes_requested
+```
+
+PASS requires an authenticated PATCH carrying `qaVerdict: "pass"` and complete `qaEvidence`, followed immediately by an authenticated GET. QA must verify `status: "done"`, `executionState.qaVerdict: "pass"`, and matching `executionState.qaEvidence`; if GET fails or any value mismatches, do not report PASS. The durable audit copy is `issue_execution_decisions.evidence`. A direct `status: "done"`, free-text "QA PASS" comment, or unverified verdict never closes the issue. Browser `"not_applicable"` requires a non-empty reason and empty evidence. A final FAIL uses an authenticated PATCH and actionable comment naming the phase, failed check or criterion, expected, observed, and reproducible evidence, then returns the issue to the original Engineer. After re-handoff, the same final QA agent must rerun Code, Browser PASS or explicit `"not_applicable"`, and Spec from scratch, with no stale evidence reuse.
+
+### Precedence
+
+When an issue reaches `in_review`, QA routing resolves in this order, highest first:
+
+1. **Explicit issue `executionPolicy`** — an issue-level reviewer/approval policy (as documented above) always wins over both the pinned in-flight state and the project's `qaPolicy`.
+2. **Pinned execution state** — once an issue has already been handed to a specific QA participant (staged or final), that participant stays fixed for this issue even if the project's `qaPolicy` changes afterward.
+3. **Project `qaPolicy`** — `staged` or `final`, applied to new handoffs that have no explicit policy or pinned state yet.
+4. **Staged default** — `null`/absent project policy behaves exactly like `{ "mode": "staged" }`.
+
+### Rollout and rollback (in-flight issues are never rewritten)
+
+Switching a project's `qaPolicy` only affects **future** Engineer→QA handoffs. An issue that already entered review under the previous mode keeps its pinned participant and stage until it resolves:
+
+- Switching `staged → final` does not retroactively move issues that are mid-way through Code/Browser/Spec; they keep finishing the staged chain.
+- Switching `final → staged` (rollback) does not strip an issue that is already pinned to the final reviewer; it finishes (or fails) with that fixed final participant. Only the *next* handoff on that project uses staged routing again.
+- If a pinned final participant becomes unavailable (paused, terminated, cross-company, non-QA) after rollback, routing fails closed to `final_qa_unavailable` / `needs_human` — the runtime never silently reassigns to a different reviewer or falls back to staged Code/Browser/Spec for that issue.
+
+### No name-based final fallback
+
+`finalQaAgentId` is a UUID, checked for company/role/status validity. An agent literally named `QA`, `QA (Code)`, or anything else is **never** selected for the final lane by name matching — only an exact UUID match against the pinned or project-configured `finalQaAgentId` counts. Conversely, a generically-named QA agent with no `code`/`browser`/`spec` keyword in its name is simply excluded from staged stage classification; it is not treated as a fallback for any stage.
+
+### Durable final evidence (`QaReviewEvidenceV1`)
+
+```json
+{
+  "version": 1,
+  "mode": "final",
+  "projectId": "uuid",
+  "reviewerAgentId": "uuid-derived-from-authenticated-actor",
+  "phases": {
+    "code": { "outcome": "pass", "checks": [{ "kind": "test", "evidence": "vitest run ... 12/12 passed" }] },
+    "browser": { "outcome": "not_applicable", "reason": "backend-only change, no UI surface", "evidence": [] },
+    "spec": { "outcome": "pass", "criteria": [{ "criterion": "returns 422 on invalid UUID", "evidence": "route test line 461" }] }
+  },
+  "handoff": { "kind": "pull_request", "id": "PR-123", "url": "https://github.com/org/repo/pull/123" }
+}
+```
+
+`browser.outcome = "pass"` requires at least one evidence entry; `"not_applicable"` requires a non-empty `reason` and an empty evidence array. The server derives `projectId` from the issue and `reviewerAgentId` from the authenticated actor — client-supplied identity is ignored, and a mismatch is rejected with `422`. Only the pinned final participant can produce a `mode: "final"` evidence payload; staged QA never needs this envelope.
+
+### Coexistence and legacy agent scope
+
+Both flows run side by side per project. A company can keep some projects on staged (with the legacy `QA (Code)` / `QA (Browser)` / `QA (Spec)` agents) while one or more other projects run `final` with a dedicated single QA agent, without cross-contamination: staged routing never selects the final UUID, and final routing never falls back to Code/Browser/Spec. Retiring the legacy staged agents (pausing them so they stop receiving new staged handoffs) is a reversible per-agent operation independent of any project's `qaPolicy` — pausing them does not change routing for projects still on staged; it only removes them as assignable QA candidates.
+
 ## Design Principles
 
 1. **Runtime-enforced, not prompt-dependent.** Agents don't need to remember to hand off work. The runtime intercepts status transitions and routes accordingly.

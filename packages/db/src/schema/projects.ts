@@ -1,5 +1,5 @@
 import { pgTable, uuid, text, timestamp, date, index, jsonb } from "drizzle-orm/pg-core";
-import type { AgentEnvConfig } from "@paperclipai/shared";
+import type { AgentEnvConfig, ProjectQaPolicy } from "@paperclipai/shared";
 import { companies } from "./companies.js";
 import { goals } from "./goals.js";
 import { agents } from "./agents.js";
@@ -18,6 +18,7 @@ export const projects = pgTable(
     color: text("color"),
     icon: text("icon"),
     env: jsonb("env").$type<AgentEnvConfig>(),
+    qaPolicy: jsonb("qa_policy").$type<ProjectQaPolicy>(),
     pauseReason: text("pause_reason"),
     pausedAt: timestamp("paused_at", { withTimezone: true }),
     executionWorkspacePolicy: jsonb("execution_workspace_policy").$type<Record<string, unknown>>(),

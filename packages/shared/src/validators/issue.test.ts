@@ -8,9 +8,11 @@ import {
   respondIssueThreadInteractionSchema,
   suggestedTaskDraftSchema,
   updateIssueSchema,
+  updateIssueQaEvidenceSchema,
   upsertIssueDocumentSchema,
 } from "./issue.js";
 import { createAgentSchema } from "./agent.js";
+import { qaReviewEvidenceV1Schema } from "./project.js";
 
 describe("issue validators", () => {
   it("passes real line breaks through unchanged", () => {
@@ -416,5 +418,41 @@ describe("issue validators", () => {
     });
 
     expect(parsed.success).toBe(false);
+  });
+
+  it("accepts final QA evidence only with a passing QA verdict", () => {
+    const evidence = qaReviewEvidenceV1Schema.parse({
+      version: 1,
+      mode: "final",
+      projectId: "22222222-2222-4222-8222-222222222222",
+      reviewerAgentId: "33333333-3333-4333-8333-333333333333",
+      phases: {
+        code: {
+          outcome: "pass",
+          checks: [{ kind: "test", evidence: "Focused validator tests passed" }],
+        },
+        browser: {
+          outcome: "not_applicable",
+          reason: "No browser surface",
+          evidence: [],
+        },
+        spec: {
+          outcome: "pass",
+          criteria: [{ criterion: "V1 contract", evidence: "Schema matches plan" }],
+        },
+      },
+      handoff: { kind: "work_product", id: "work-product-1", url: null },
+    });
+
+    const parsed = updateIssueQaEvidenceSchema.parse({ qaVerdict: "pass", qaEvidence: evidence });
+    expect(parsed.qaVerdict).toBe("pass");
+    expect(parsed.qaEvidence).toEqual(evidence);
+    expect(updateIssueQaEvidenceSchema.safeParse({ qaEvidence: evidence }).success).toBe(false);
+    expect(updateIssueQaEvidenceSchema.safeParse({ qaVerdict: "fail", qaEvidence: evidence }).success).toBe(false);
+  });
+
+  it("keeps legacy QA verdict values valid without evidence", () => {
+    expect(updateIssueSchema.parse({ qaVerdict: "pass" }).qaVerdict).toBe("pass");
+    expect(updateIssueSchema.parse({ qaVerdict: "fail" }).qaVerdict).toBe("fail");
   });
 });

@@ -32,6 +32,7 @@ import {
 } from "../constants.js";
 import { multilineTextSchema } from "./text.js";
 import { lowTrustReviewPresetPolicySchema, trustAuthorizationPolicySchema } from "./trust-policy.js";
+import { qaReviewEvidenceV1Schema } from "./project.js";
 
 export const issueBlockedInboxStateSchema = z.enum([
   "needs_attention",
@@ -238,6 +239,8 @@ export const issueExecutionStateSchema = z.object({
   completedStageIds: z.array(z.string().uuid()).default([]),
   lastDecisionId: z.string().uuid().nullable(),
   lastDecisionOutcome: z.enum(ISSUE_EXECUTION_DECISION_OUTCOMES).nullable(),
+  qaVerdict: z.enum(["pass", "fail"]).nullable().optional().default(null),
+  qaEvidence: qaReviewEvidenceV1Schema.nullable().optional().default(null),
   monitor: issueExecutionMonitorStateSchema.optional().nullable(),
 });
 
@@ -475,11 +478,23 @@ export const updateIssueSchema = createIssueBaseSchema.omit({
   assigneeAgentId: z.string().trim().min(1).optional().nullable(),
   comment: multilineTextSchema.pipe(z.string().min(1)).optional(),
   reviewRequest: issueReviewRequestSchema.optional().nullable(),
+  qaVerdict: z.enum(["pass", "fail"]).optional(),
   qaBrowserScope: z.enum(["required", "not_applicable"]).optional(),
+  qaEvidence: qaReviewEvidenceV1Schema.optional(),
   reopen: z.boolean().optional(),
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),
   hiddenAt: z.string().datetime().nullable().optional(),
+});
+
+export const updateIssueQaEvidenceSchema = updateIssueSchema.superRefine((value, ctx) => {
+  if (value.qaEvidence !== undefined && value.qaVerdict !== "pass") {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "qaEvidence requires qaVerdict=pass",
+      path: ["qaEvidence"],
+    });
+  }
 });
 
 export type UpdateIssue = z.infer<typeof updateIssueSchema>;

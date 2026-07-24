@@ -40,6 +40,76 @@ export const projectWorkspaceRuntimeConfigSchema = z.object({
 const projectWorkspaceSourceTypeSchema = z.enum(["local_path", "git_repo", "remote_managed", "non_git_path"]);
 const projectWorkspaceVisibilitySchema = z.enum(["default", "advanced"]);
 
+export const projectQaPolicySchema = z.discriminatedUnion("mode", [
+  z.object({ mode: z.literal("staged") }).strict(),
+  z.object({ mode: z.literal("final"), finalQaAgentId: z.string().uuid() }).strict(),
+]);
+
+const qaNonEmptyTextSchema = z.string().trim().min(1);
+
+const qaCodeCheckSchema = z.object({
+  kind: z.enum(["diff", "test", "security", "migration", "contract"]),
+  evidence: qaNonEmptyTextSchema,
+}).strict();
+
+const qaCodePhaseEvidenceSchema = z.object({
+  outcome: z.literal("pass"),
+  checks: z.array(qaCodeCheckSchema).min(1),
+}).strict();
+
+const qaBrowserEvidenceSchema = z.object({
+  kind: z.enum(["url", "screenshot", "console", "network"]),
+  value: qaNonEmptyTextSchema,
+}).strict();
+
+const qaBrowserPassPhaseEvidenceSchema = z.object({
+  outcome: z.literal("pass"),
+  reason: qaNonEmptyTextSchema,
+  evidence: z.array(qaBrowserEvidenceSchema).min(1),
+}).strict();
+
+const qaBrowserNotApplicablePhaseEvidenceSchema = z.object({
+  outcome: z.literal("not_applicable"),
+  reason: qaNonEmptyTextSchema,
+  evidence: z.tuple([]),
+}).strict();
+
+const qaBrowserPhaseEvidenceSchema = z.discriminatedUnion("outcome", [
+  qaBrowserPassPhaseEvidenceSchema,
+  qaBrowserNotApplicablePhaseEvidenceSchema,
+]);
+
+const qaSpecCriterionSchema = z.object({
+  criterion: qaNonEmptyTextSchema,
+  evidence: qaNonEmptyTextSchema,
+}).strict();
+
+const qaSpecPhaseEvidenceSchema = z.object({
+  outcome: z.literal("pass"),
+  criteria: z.array(qaSpecCriterionSchema).min(1),
+}).strict();
+
+const qaPhaseEvidenceSchema = z.object({
+  code: qaCodePhaseEvidenceSchema,
+  browser: qaBrowserPhaseEvidenceSchema,
+  spec: qaSpecPhaseEvidenceSchema,
+}).strict();
+
+const qaReviewHandoffSchema = z.object({
+  kind: z.enum(["pull_request", "work_product"]),
+  id: qaNonEmptyTextSchema,
+  url: z.string().url().nullable(),
+}).strict();
+
+export const qaReviewEvidenceV1Schema = z.object({
+  version: z.literal(1),
+  mode: z.literal("final"),
+  projectId: z.string().uuid(),
+  reviewerAgentId: z.string().uuid(),
+  phases: qaPhaseEvidenceSchema,
+  handoff: qaReviewHandoffSchema,
+}).strict();
+
 const projectWorkspaceFields = {
   name: z.string().min(1).optional(),
   sourceType: projectWorkspaceSourceTypeSchema.optional(),
@@ -109,6 +179,7 @@ const projectFields = {
   color: z.string().optional().nullable(),
   icon: z.enum(PROJECT_ICON_NAMES).optional().nullable(),
   env: envConfigSchema.optional().nullable(),
+  qaPolicy: projectQaPolicySchema.optional().nullable(),
   executionWorkspacePolicy: projectExecutionWorkspacePolicySchema.optional().nullable(),
   archivedAt: z.string().datetime().optional().nullable(),
 };

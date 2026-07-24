@@ -281,7 +281,28 @@ export type {
   DocumentTextRange,
   UpdateDocumentAnnotationThreadRequest,
 } from "./document-annotation.js";
-export type { Project, ProjectBudgetSummary, ProjectCodebase, ProjectCodebaseOrigin, ProjectGoalRef, ProjectManagedByPlugin, ProjectWorkspace } from "./project.js";
+export type {
+  Project,
+  ProjectBudgetSummary,
+  ProjectCodebase,
+  ProjectCodebaseOrigin,
+  ProjectGoalRef,
+  ProjectManagedByPlugin,
+  ProjectWorkspace,
+  ProjectQaPolicy,
+  QaCodeCheckKind,
+  QaCodeCheck,
+  QaCodePhaseEvidence,
+  QaBrowserEvidenceKind,
+  QaBrowserEvidence,
+  QaBrowserPhaseEvidence,
+  QaSpecCriterion,
+  QaSpecPhaseEvidence,
+  QaPhaseEvidence,
+  QaHandoffKind,
+  QaReviewHandoff,
+  QaReviewEvidenceV1,
+} from "./project.js";
 export type {
   CompanySearchCountType,
   CompanySearchExtractIssueResult,

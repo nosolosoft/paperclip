@@ -27,6 +27,7 @@ import type {
   IssueThreadInteractionStatus,
   IssueStatus,
 } from "../constants.js";
+import type { QaReviewEvidenceV1 } from "./project.js";
 import type { Goal } from "./goal.js";
 import type { Project, ProjectWorkspace } from "./project.js";
 import type { ExecutionWorkspace, IssueExecutionWorkspaceSettings } from "./workspace-runtime.js";
@@ -659,6 +660,8 @@ export interface IssueExecutionState {
   completedStageIds: string[];
   lastDecisionId: string | null;
   lastDecisionOutcome: IssueExecutionDecisionOutcome | null;
+  qaVerdict?: "pass" | "fail" | null;
+  qaEvidence?: QaReviewEvidenceV1 | null;
   monitor?: IssueExecutionMonitorState | null;
 }
 
@@ -672,6 +675,7 @@ export interface IssueExecutionDecision {
   actorUserId: string | null;
   outcome: IssueExecutionDecisionOutcome;
   body: string;
+  evidence: QaReviewEvidenceV1 | null;
   createdByRunId: string | null;
   createdAt: Date;
   updatedAt: Date;

@@ -43,7 +43,7 @@ Do not commit.
 The state is safe.
 `;
 
-const MODEL = "anthropic/claude-sonnet-5";
+const MODEL = "openai/gpt-5.6-sol";
 const PRIMARY_AGENTS = ["Sisyphus - ultraworker", "Hephaestus - Deep Agent", "Prometheus - Plan Builder", "Atlas - Plan Executor"] as const;
 
 export type FakeRunner = { readonly calls: ChildInvocation[]; run: (input: ChildInvocation) => Promise<ChildProcessResult> };

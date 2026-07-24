@@ -4,7 +4,7 @@
   "title": "OpenCode Engineer (Pilot)",
   "icon": "terminal",
   "reportsTo": "00000000-0000-0000-0000-000000000000",
-  "capabilities": "Implements exactly one assigned OppTests issue at a time through the bounded Prometheus->Atlas->Sisyphus orchestration helper, opens PRs against develop, and hands work to QA. Pilot agent; see _pilotNotes for authoring-time placeholders.",
+  "capabilities": "Implements exactly one assigned OppTests issue at a time. Sisyphus directly owns analysis, implementation, focused tests, diff review, PR handoff against develop, and QA handoff. Planning, tools, and subagents are optional when useful; no required delegation pipeline exists. Pilot agent; see _pilotNotes for authoring-time placeholders.",
   "desiredSkills": [
     "paperclipai/optional/product/design-critique",
     "paperclipai/bundled/software-development/github-pr-workflow",
@@ -13,8 +13,8 @@
   "adapterType": "opencode_local",
   "adapterConfig": {
     "agent": "Sisyphus - ultraworker",
-    "model": "anthropic/claude-sonnet-5",
-    "variant": "high",
+    "model": "openai/gpt-5.6-sol",
+    "variant": "medium",
     "timeoutSec": 3600,
     "cwd": "/home/manu/proyectos/www/opptests-pilot-smoke-placeholder",
     "dangerouslySkipPermissions": false

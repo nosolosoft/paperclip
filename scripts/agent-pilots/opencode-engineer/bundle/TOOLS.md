@@ -6,9 +6,9 @@
 - Agent worktrees live under each affected repo at `.paperclip/worktrees/`.
 - Never use the OppTests container folder as a git repo directly; always work inside an issue worktree.
 
-## Orchestration helper
+## Execution support
 
-Every task run is driven by the pilot's bounded orchestration helper (Prometheus -> Atlas -> Sisyphus fallback), not by hand-written OpenCode invocations. See [HEARTBEAT.md](./HEARTBEAT.md) for exact sequencing and fail-closed rules. Invoke only the helper command provisioned by the current task runtime; its location and task environment are runtime-supplied and must never be hardcoded in managed instructions.
+Sisyphus runs the task directly and owns analysis, implementation, focused tests, diff review, PR handoff, and QA handoff. Planning, tools, and subagents are optional support choices when useful. They impose no required sequence, review stage, or retry condition. Task worktree paths come from the current runtime; never hardcode a host filesystem path in managed instructions.
 
 ## Paperclip DB
 
@@ -31,6 +31,5 @@ This agent installs exactly three skills shared by active engineers -- do not ad
 - Never print secrets or API keys.
 - Do not restart production services or mutate production DBs unless the issue explicitly says so and a human approved it.
 - Do not merge PRs or deploy; hand off to QA/board by moving the issue to `in_review`.
-- Do not bypass the orchestration helper's fail-closed gates or attempt cap for any reason.
 
 See [AGENTS.md](./AGENTS.md) for the full mission and boundaries.

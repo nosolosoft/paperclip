@@ -7,10 +7,39 @@ import {
   extractMarkdownReferences,
   lintAgentConfig,
   lintBundle,
+  REQUIRED_BUNDLE_PHRASES,
   REQUIRED_SKILL_KEYS,
 } from "./bundle-linter.js";
 
 const REAL_BUNDLE_DIR = path.join(import.meta.dirname, "bundle");
+const REQUIRED_DIRECT_OWNERSHIP_PHRASES = [
+  "sisyphus directly owns analysis, implementation, focused tests, diff review",
+  "planning and delegation are optional choices",
+  "planning, tools, and subagents are optional",
+  "no required delegation pipeline exists",
+  "independent review of the final diff and verification output",
+  "move the issue to `blocked`",
+  "do not fabricate success",
+] as const;
+const FORBIDDEN_RETIRED_GUIDANCE_PHRASES = [
+  "mandatory orchestration helper",
+  "prometheus - plan builder",
+  "atlas - plan executor",
+  "state-resume behavior",
+  "attempt-exhaustion disposition",
+  'task(subagent_type="plan")',
+  "mandatory plan stage",
+  "mandatory momus stage",
+  "mandatory general stage",
+  "mandatory reviewer stage",
+  "bounded revision",
+  "bounded remediation",
+  "session-id continuation",
+  "session id recovery",
+  "empty continuation output",
+  "empty remediation output",
+  "no bypass for delegation",
+] as const;
 
 async function makeTempBundle(overrides: {
   agentsMd?: string;
@@ -91,15 +120,15 @@ describe("lintAgentConfig", () => {
         adapterConfig: {
           agent: "Sisyphus - ultraworker",
           model: "openai/gpt-5.4",
-          variant: "medium",
+          variant: "high",
           timeoutSec: 60,
         },
         runtimeConfig: { heartbeat: { maxTurnContinuation: { maxAttempts: 5 } } },
       }),
     );
     const result = lintAgentConfig(raw);
-    expect(result.errors).toContain('adapterConfig.model must be "anthropic/claude-sonnet-5"');
-    expect(result.errors).toContain('adapterConfig.variant must be "high"');
+    expect(result.errors).toContain('adapterConfig.model must be "openai/gpt-5.6-sol"');
+    expect(result.errors).toContain('adapterConfig.variant must be "medium"');
     expect(result.errors).toContain("adapterConfig.timeoutSec must be 3600");
     expect(result.errors).toContain("runtimeConfig.heartbeat.maxTurnContinuation.maxAttempts must be 2");
   });
@@ -113,8 +142,8 @@ describe("lintAgentConfig", () => {
         desiredSkills: REQUIRED_SKILL_KEYS,
         adapterConfig: {
           agent: "Sisyphus - ultraworker",
-          model: "anthropic/claude-sonnet-5",
-          variant: "high",
+          model: "openai/gpt-5.6-sol",
+          variant: "medium",
           timeoutSec: 3600,
           [field]: "forbidden-value",
         },
@@ -125,6 +154,15 @@ describe("lintAgentConfig", () => {
     }
   });
 
+  it("rejects a retired orchestration capability summary", async () => {
+    const raw = JSON.parse(await fs.readFile(path.join(REAL_BUNDLE_DIR, "agent-config.json"), "utf8"));
+    raw.capabilities = "Uses the Prometheus->Atlas->Sisyphus orchestration helper.";
+
+    const result = lintAgentConfig(raw);
+
+    expect(result.errors.some((message) => message.includes("capabilities"))).toBe(true);
+  });
+
   it("rejects secret-like fields anywhere in the config", () => {
     const raw = {
       name: "OpenCode Engineer",
@@ -133,8 +171,8 @@ describe("lintAgentConfig", () => {
       desiredSkills: REQUIRED_SKILL_KEYS,
       adapterConfig: {
         agent: "Sisyphus - ultraworker",
-        model: "anthropic/claude-sonnet-5",
-        variant: "high",
+        model: "openai/gpt-5.6-sol",
+        variant: "medium",
         timeoutSec: 3600,
         apiKey: "sk-live-not-a-real-secret-but-should-be-rejected",
       },
@@ -152,8 +190,8 @@ describe("lintAgentConfig", () => {
       desiredSkills: [REQUIRED_SKILL_KEYS[0], "paperclipai/bundled/some-other/unexpected-skill"],
       adapterConfig: {
         agent: "Sisyphus - ultraworker",
-        model: "anthropic/claude-sonnet-5",
-        variant: "high",
+        model: "openai/gpt-5.6-sol",
+        variant: "medium",
         timeoutSec: 3600,
       },
       runtimeConfig: { heartbeat: { maxTurnContinuation: { maxAttempts: 2 } } },
@@ -181,9 +219,79 @@ describe("lintBundle - happy path (real source-controlled bundle)", () => {
     expect(result.configSnapshot).not.toBeNull();
     expect(result.configSnapshot?.adapterType).toBe("opencode_local");
     const adapterConfig = result.configSnapshot?.adapterConfig as Record<string, unknown>;
-    expect(adapterConfig.model).toBe("anthropic/claude-sonnet-5");
-    expect(adapterConfig.variant).toBe("high");
+    expect(adapterConfig.model).toBe("openai/gpt-5.6-sol");
+    expect(adapterConfig.variant).toBe("medium");
     expect(adapterConfig.timeoutSec).toBe(3600);
+  });
+
+  it("contains direct ownership guidance without retired pipeline instructions", async () => {
+    const [agentsMd, heartbeatMd, soulMd, toolsMd] = await Promise.all(
+      ["AGENTS.md", "HEARTBEAT.md", "SOUL.md", "TOOLS.md"].map((fileName) => (
+        fs.readFile(path.join(REAL_BUNDLE_DIR, fileName), "utf8")
+      )),
+    );
+    const combined = [agentsMd, heartbeatMd, soulMd, toolsMd].join("\n").toLowerCase();
+    const workflowMarkdown = [agentsMd, heartbeatMd, soulMd, toolsMd].join("\n").toLowerCase();
+
+    for (const phrase of REQUIRED_DIRECT_OWNERSHIP_PHRASES) {
+      expect(combined).toContain(phrase);
+    }
+    for (const phrase of FORBIDDEN_RETIRED_GUIDANCE_PHRASES) {
+      expect(workflowMarkdown).not.toContain(phrase);
+    }
+  });
+
+  it("keeps SOUL and the config capability summary aligned with direct ownership", async () => {
+    const soul = await fs.readFile(path.join(REAL_BUNDLE_DIR, "SOUL.md"), "utf8");
+    const config = JSON.parse(await fs.readFile(path.join(REAL_BUNDLE_DIR, "agent-config.json"), "utf8")) as {
+      capabilities?: unknown;
+    };
+    const retiredGuidance = ["orchestration helper", "prometheus", "atlas"];
+
+    expect(soul.toLowerCase()).toContain("own the decision to analyze");
+    expect(config.capabilities).toEqual(expect.any(String));
+    expect(String(config.capabilities).toLowerCase()).toContain("sisyphus directly owns");
+    expect(String(config.capabilities).toLowerCase()).toContain("planning, tools, and subagents are optional");
+    for (const phrase of retiredGuidance) {
+      expect(soul.toLowerCase()).not.toContain(phrase);
+      expect(String(config.capabilities).toLowerCase()).not.toContain(phrase);
+    }
+  });
+
+  it("requires direct ownership, optional support, independent verification, and blocked safety guidance", () => {
+    for (const phrase of REQUIRED_DIRECT_OWNERSHIP_PHRASES) {
+      expect(REQUIRED_BUNDLE_PHRASES).toContain(phrase);
+    }
+  });
+
+  it("contains direct ownership and optional support guidance", async () => {
+    const [agentsMd, heartbeatMd, soulMd, toolsMd] = await Promise.all(
+      ["AGENTS.md", "HEARTBEAT.md", "SOUL.md", "TOOLS.md"].map((fileName) => (
+        fs.readFile(path.join(REAL_BUNDLE_DIR, fileName), "utf8")
+      )),
+    );
+    const combined = [agentsMd, heartbeatMd, soulMd, toolsMd].join("\n").toLowerCase();
+
+    for (const phrase of REQUIRED_DIRECT_OWNERSHIP_PHRASES) {
+      expect(combined).toContain(phrase);
+    }
+  });
+
+  it("accepts explicit optional planning, delegation, and subagent support", async () => {
+    const dir = await makeTempBundle({
+      agentsMd: [
+        "# AGENTS.md",
+        "",
+        "Sisyphus directly owns analysis, implementation, focused tests, diff review, PR handoff against `develop`, and QA handoff.",
+        "Planning and delegation are optional choices. Planning, tools, and subagents are optional support when useful.",
+        "No required delegation pipeline exists; delegated work never replaces independent review of the final diff and verification output.",
+        "If verification evidence is insufficient, move the issue to `blocked`; do not fabricate success.",
+      ].join("\n"),
+    });
+    const result = await lintBundle(dir);
+
+    expect(result.ok).toBe(true);
+    expect(result.errors).toEqual([]);
   });
 });
 
@@ -230,7 +338,7 @@ describe("lintBundle - failure paths", () => {
     expect(result.errors).toContain("TOOLS.md: absolute filesystem path is forbidden in managed instructions");
   });
 
-  it("fails when the mandatory orchestration helper guidance is removed from the bundle", async () => {
+  it("fails when direct ownership and blocked safety guidance is removed from the bundle", async () => {
     const dir = await makeTempBundle({
       agentsMd: "# AGENTS.md\n\nYou are OpenCode Engineer. Just implement issues directly.\n",
       heartbeatMd: "# HEARTBEAT.md\n\nDo the work.\n",
@@ -239,11 +347,25 @@ describe("lintBundle - failure paths", () => {
     });
     const result = await lintBundle(dir);
     expect(result.ok).toBe(false);
-    expect(result.errors.some((message) => message.includes('"orchestration helper"'))).toBe(true);
-    expect(result.errors.some((message) => message.includes('"fail-closed"'))).toBe(true);
-    expect(result.errors.some((message) => message.includes('"state-resume"'))).toBe(true);
-    expect(result.errors.some((message) => message.includes('"attempt-exhaustion"'))).toBe(true);
-    expect(result.errors.some((message) => message.includes('"no bypass"'))).toBe(true);
+    for (const phrase of REQUIRED_DIRECT_OWNERSHIP_PHRASES) {
+      expect(result.errors.some((message) => message.includes(`"${phrase}"`))).toBe(true);
+    }
+  });
+
+  it("fails when retired mandatory pipeline and recovery guidance is added", async () => {
+    const dir = await makeTempBundle({
+      toolsMd: [
+        "# TOOLS.md",
+        "",
+        ...FORBIDDEN_RETIRED_GUIDANCE_PHRASES,
+      ].join("\n"),
+    });
+    const result = await lintBundle(dir);
+
+    expect(result.ok).toBe(false);
+    for (const phrase of FORBIDDEN_RETIRED_GUIDANCE_PHRASES) {
+      expect(result.errors).toContain(`bundle contains forbidden retired guidance phrase: "${phrase}"`);
+    }
   });
 
   it("fails when agent-config.json adds a forbidden legacy field", async () => {

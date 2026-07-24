@@ -20,18 +20,57 @@ const INLINE_CREDENTIAL_ASSIGNMENT_PATTERN = /\b(?:[A-Z][A-Z0-9_]*(?:PASSWORD|TO
 const ABSOLUTE_FILESYSTEM_PATH_PATTERN = /(?:^|[\s`"'(])\/(?:home|etc|usr|var|opt|tmp|root|mnt|srv|Users)\//;
 
 export const REQUIRED_BUNDLE_PHRASES = [
-  "orchestration helper",
-  "fail-closed",
-  "state-resume",
-  "attempt-exhaustion",
+  "sisyphus directly owns analysis, implementation, focused tests, diff review",
+  "planning and delegation are optional choices",
+  "planning, tools, and subagents are optional",
+  "no required delegation pipeline exists",
+  "independent review of the final diff and verification output",
+  "move the issue to `blocked`",
+  "do not fabricate success",
+] as const;
+
+export const FORBIDDEN_BUNDLE_PHRASES = [
+  "mandatory orchestration helper",
+  "prometheus - plan builder",
+  "atlas - plan executor",
+  "state-resume behavior",
+  "attempt-exhaustion disposition",
+  'task(subagent_type="plan")',
+  "mandatory plan",
+  "mandatory plan stage",
+  "mandatory momus",
+  "mandatory momus stage",
+  "mandatory general",
+  "mandatory general stage",
+  "mandatory reviewer",
+  "mandatory reviewer stage",
+  "plan -> momus -> general",
+  "plan → momus → general",
+  "bounded revision",
+  "bounded remediation",
+  "plan session",
+  "session-id continuation",
+  "session id continuation",
+  "session-id recovery",
+  "session id recovery",
+  "session recovery",
+  "empty continuation output",
+  "empty remediation output",
+  "empty plan output",
+  "empty subagent output",
+  "no usable plan evidence",
+  "no bypass for delegation",
   "no bypass",
 ] as const;
+
+const REQUIRED_CAPABILITIES_PHRASE = "sisyphus directly owns";
+const FORBIDDEN_CAPABILITIES_PHRASES = ["orchestration helper", "prometheus", "atlas"] as const;
 
 export const REQUIRED_CONFIG_VALUES = {
   adapterType: "opencode_local",
   agent: "Sisyphus - ultraworker",
-  model: "anthropic/claude-sonnet-5",
-  variant: "high",
+  model: "openai/gpt-5.6-sol",
+  variant: "medium",
   timeoutSec: 3600,
   maxTurnContinuationMaxAttempts: 2,
 } as const;
@@ -143,6 +182,22 @@ function lintRequiredPhrases(markdownByFile: Record<string, string>): string[] {
   return errors;
 }
 
+function lintForbiddenPhrases(markdownByFile: Record<string, string>): string[] {
+  const errors: string[] = [];
+  const workflowMarkdown = [
+    markdownByFile["AGENTS.md"],
+    markdownByFile["HEARTBEAT.md"],
+    markdownByFile["SOUL.md"],
+    markdownByFile["TOOLS.md"],
+  ].join("\n").toLowerCase();
+  for (const phrase of FORBIDDEN_BUNDLE_PHRASES) {
+    if (workflowMarkdown.includes(phrase.toLowerCase())) {
+      errors.push(`bundle contains forbidden retired guidance phrase: "${phrase}"`);
+    }
+  }
+  return errors;
+}
+
 function collectSecretLikeFields(value: unknown, keyPath: string, hits: string[]): void {
   if (isRecord(value)) {
     for (const [key, nested] of Object.entries(value)) {
@@ -163,6 +218,16 @@ export function lintAgentConfig(raw: unknown): { errors: string[] } {
   const errors: string[] = [];
   if (!isRecord(raw)) {
     return { errors: ["agent-config.json must be a JSON object"] };
+  }
+
+  const capabilities = typeof raw.capabilities === "string" ? raw.capabilities.toLowerCase() : "";
+  if (!capabilities.includes(REQUIRED_CAPABILITIES_PHRASE)) {
+    errors.push(`capabilities must include "${REQUIRED_CAPABILITIES_PHRASE}"`);
+  }
+  for (const phrase of FORBIDDEN_CAPABILITIES_PHRASES) {
+    if (capabilities.includes(phrase)) {
+      errors.push(`capabilities contains retired guidance phrase: "${phrase}"`);
+    }
   }
 
   const schemaResult = createAgentSchema.safeParse(raw);
@@ -247,6 +312,7 @@ export async function lintBundle(bundleDir: string): Promise<LintResult> {
   }
 
   errors.push(...lintRequiredPhrases(markdownByFile));
+  errors.push(...lintForbiddenPhrases(markdownByFile));
 
   const configPath = path.join(bundleDir, BUNDLE_CONFIG_FILE);
   const configText = await fs.readFile(configPath, "utf8").catch(() => null);

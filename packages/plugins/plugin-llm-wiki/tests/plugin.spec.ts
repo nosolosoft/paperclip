@@ -537,6 +537,7 @@ function existingProject(): Project {
     pauseReason: null,
     pausedAt: null,
     executionWorkspacePolicy: null,
+    qaPolicy: { mode: "staged" },
     codebase: {
       workspaceId: null,
       repoUrl: null,

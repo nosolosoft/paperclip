@@ -1259,6 +1259,7 @@ export const PLUGIN_CAPABILITIES = [
   "issues.checkout",
   "issues.wakeup",
   "issue.comments.create",
+  "issue.comments.create_human_attributed",
   "issue.interactions.create",
   "issue.documents.write",
   "projects.managed",

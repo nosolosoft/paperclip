@@ -2395,7 +2395,7 @@ describe("IssueProperties", () => {
       inline: true,
       externalObjects: [
         {
-          mentionCount: 1,
+          mentionCount: 2,
           sourceLabels: ["Description"],
           pill: {
             providerKey: "github",
@@ -2412,7 +2412,7 @@ describe("IssueProperties", () => {
           group: {
             object: null,
             mentions: [],
-            mentionCount: 1,
+            mentionCount: 2,
             sourceLabels: ["Description"],
           },
         },
@@ -2464,7 +2464,9 @@ describe("IssueProperties", () => {
     });
     await flush();
 
-    expect(container.textContent).toContain("Github Pull Request");
+    expect(container.textContent).toContain("Github PR");
+    expect(container.textContent).not.toContain("Github Pull Request");
+    expect(container.textContent).not.toContain("×2");
     expect(container.textContent).toContain("Github Issue");
     expect(container.textContent).toContain("URL");
     expect(container.textContent).not.toContain("URL link");
@@ -2473,13 +2475,13 @@ describe("IssueProperties", () => {
     expect(container.textContent).toContain("Open");
     expect(container.textContent).not.toContain("External objects");
     const label = Array.from(container.querySelectorAll("span"))
-      .find((span) => span.textContent === "Github Pull Request");
+      .find((span) => span.textContent === "Github PR");
     expect(label?.querySelector("svg")).toBeTruthy();
     const pullRequestLink = Array.from(container.querySelectorAll("a"))
       .find((anchor) => anchor.getAttribute("href") === "https://github.com/acme/web/pull/241");
     expect(pullRequestLink?.textContent).toContain("PR 241 - Merged");
     expect(pullRequestLink?.textContent).not.toContain("acme/web#241");
-    expect(pullRequestLink?.textContent).not.toContain("Github Pull Request");
+    expect(pullRequestLink?.textContent).not.toContain("Github PR");
     expect(pullRequestLink?.querySelectorAll("svg")).toHaveLength(1);
     expect(pullRequestLink?.className).not.toContain("paperclip-mention-chip");
     expect(pullRequestLink?.className).not.toContain("rounded-full");

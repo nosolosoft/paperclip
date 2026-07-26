@@ -1228,7 +1228,7 @@
       "breakpoints": true
     },
     {
-      "idx": 177,
+      "idx": 178,
       "version": "7",
       "when": 1784241826832,
       "tag": "0177_activity_log_responsible_user",
@@ -1288,6 +1288,20 @@
       "version": "7",
       "when": 1784795405882,
       "tag": "0185_project_qa_policy",
+      "breakpoints": true
+    },
+    {
+      "idx": 186,
+      "version": "7",
+      "when": 1784592000000,
+      "tag": "0186_connections_v3_schema_core",
+      "breakpoints": true
+    },
+    {
+      "idx": 187,
+      "version": "7",
+      "when": 1784653200000,
+      "tag": "0187_connection_user_authorization_state",
       "breakpoints": true
     }
   ]

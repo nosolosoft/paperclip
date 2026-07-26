@@ -421,17 +421,29 @@ export type {
   ToolConnectionInstallSnapshot,
   ToolConnectionInstallTargetType,
   ConnectionTokenAttribution,
+  ConnectionRecoverableErrorCode,
+  ConnectionRecoverableErrorPayload,
   ConnectionTokenIssuance,
   ConnectionTokenMintedResponse,
   ConnectionTokenRequest,
   ConnectionTokenResponse,
   ConnectionTokenScope,
+  ConnectionTokenSubject,
   ConnectionTokenUseEnvLeaseResponse,
+  ConnectionUsageDailyBucket,
+  ConnectionUsageResponse,
+  StartConnectionAuthorizationRequest,
+  StartConnectionAuthorizationResponse,
   ToolConnection,
   ToolConnectionHealthStatus,
+  ToolConnectionAuthKind,
+  ToolConnectionOwnership,
   ToolConnectionTransport,
   ToolConnectionStatus,
   ToolConnectionKind,
+  ConnectionGrant,
+  ConnectionGrantKind,
+  ConnectionGrantStatus,
   ToolCredentialSecretRef,
   ToolInvocation,
   ToolInvocationApprovalState,
@@ -514,6 +526,7 @@ export type {
   ToolConnectionTestCallStatus,
   ToolConnectionTestCallStatusPhase,
 } from "./tool-access.js";
+export { CONNECTION_RECOVERABLE_ERROR_CODES } from "./tool-access.js";
 export type {
   IssueWorkProduct,
   IssueWorkProductType,
@@ -890,3 +903,4 @@ export type {
   PluginDatabaseNamespaceMode,
   PluginDatabaseNamespaceStatus,
 } from "./plugin.js";
+export * from "./app-definition.js";

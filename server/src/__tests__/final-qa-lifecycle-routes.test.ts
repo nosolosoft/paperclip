@@ -607,4 +607,71 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
       qaEvidence: freshEvidence,
     });
   });
+
+  it("does not auto-approve a final QA review from comment prose", async () => {
+    const seeded = await seedScenario();
+    const app = authenticatedApp();
+    const { qaToken } = await handoffToFinalQa(app, seeded);
+
+    const commented = await request(app)
+      .post(`/api/issues/${seeded.issueId}/comments`)
+      .set("Authorization", `Bearer ${qaToken}`)
+      .set("X-Paperclip-Run-Id", seeded.qaRunId)
+      .send({ body: "## Review: APPROVED\n\nEverything looks good to me." });
+    expect(commented.status, JSON.stringify(commented.body)).toBe(201);
+
+    const decisions = await db
+      .select()
+      .from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, seeded.issueId));
+    expect(decisions).toHaveLength(0);
+
+    const afterComment = await request(app)
+      .get(`/api/issues/${seeded.issueId}`)
+      .set("Authorization", `Bearer ${qaToken}`)
+      .set("X-Paperclip-Run-Id", seeded.qaRunId)
+      .expect(200);
+    expect(afterComment.body.status).toBe("in_review");
+    expect(afterComment.body.executionState).toMatchObject({
+      status: "pending",
+      currentParticipant: { type: "agent", agentId: seeded.qaAgentId, userId: null },
+      lastDecisionOutcome: null,
+    });
+  });
+
+  it("rejects an agent opening a review stage that names itself as participant", async () => {
+    const seeded = await seedScenario();
+    const app = authenticatedApp();
+    const qaToken = token(seeded.qaAgentId, seeded.companyId, seeded.qaRunId, seeded.responsibleUserId);
+    await db
+      .update(issues)
+      .set({ status: "in_progress", assigneeAgentId: seeded.qaAgentId })
+      .where(eq(issues.id, seeded.issueId));
+
+    const selfStage = await request(app)
+      .patch(`/api/issues/${seeded.issueId}`)
+      .set("Authorization", `Bearer ${qaToken}`)
+      .set("X-Paperclip-Run-Id", seeded.qaRunId)
+      .send({
+        status: "in_review",
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [
+            {
+              type: "review",
+              approvalsNeeded: 1,
+              participants: [{ type: "agent", agentId: seeded.qaAgentId }],
+            },
+          ],
+        },
+      });
+    expect(selfStage.status, JSON.stringify(selfStage.body)).toBe(422);
+    expect(selfStage.body).toMatchObject({ code: "self_assigned_execution_stage" });
+
+    const [storedIssue] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    if (!storedIssue) throw new Error("Expected issue row after rejected self-assigned stage");
+    expect(storedIssue.executionPolicy).toBeNull();
+    expect(storedIssue.executionState).toBeNull();
+  });
 });

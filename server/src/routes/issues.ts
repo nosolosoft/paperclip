@@ -3407,6 +3407,25 @@ export function issueRoutes(
     input.updateFields.executionPolicy = buildFinalQaExecutionPolicy(decision.participant.id);
   }
 
+  async function issueUsesFinalQaPolicy(issue: { projectId?: string | null }): Promise<boolean> {
+    if (!issue.projectId) return false;
+    try {
+      return (await projectsSvc.getById(issue.projectId))?.qaPolicy?.mode === "final";
+    } catch (error) {
+      if (
+        error instanceof HttpError
+        && error.details !== null
+        && typeof error.details === "object"
+        && Reflect.get(error.details, "code") === "invalid_project_qa_policy"
+      ) {
+        // A policy we cannot parse is treated as final: the restrictive branch keeps the
+        // structured-evidence requirement in place instead of silently allowing a shortcut.
+        return true;
+      }
+      throw error;
+    }
+  }
+
 async function applyDefaultQaDispositionRouting(input: {
   existing: {
     id: string;
@@ -8439,6 +8458,24 @@ async function applyDefaultQaDispositionRouting(input: {
         normalizeIssueExecutionPolicy(req.body.executionPolicy),
         actor.actorType,
       );
+      const requestedPolicy = updateFields.executionPolicy as NormalizedExecutionPolicy | null;
+      const existingExecutionStateForPolicy = parseIssueExecutionState(existing.executionState);
+      if (
+        actor.actorType === "agent"
+        && actor.agentId
+        && existingExecutionStateForPolicy?.status !== "pending"
+        && requestedPolicy?.stages.some((stage) =>
+          stage.participants.some(
+            (participant) => participant.type === "agent" && participant.agentId === actor.agentId,
+          ),
+        )
+      ) {
+        res.status(422).json({
+          error: "An agent cannot open a review stage naming itself as participant",
+          code: "self_assigned_execution_stage",
+        });
+        return;
+      }
     }
     await materializeFinalQaHandoff({
       existing,
@@ -10586,7 +10623,10 @@ async function applyDefaultQaDispositionRouting(input: {
       currentIssue.status === "in_review" &&
       currentExecutionState?.status === "pending" &&
       actorMatchesExecutionParticipant(actor, currentExecutionState.currentParticipant ?? null) &&
-      isApprovalReviewComment(req.body.body);
+      isApprovalReviewComment(req.body.body) &&
+      // Final QA closes only through the structured PATCH that carries qaVerdict/qaEvidence.
+      // Approving from comment prose here would record the decision with no evidence at all.
+      !(await issueUsesFinalQaPolicy(currentIssue));
 
     // Persist the comment and the auto-approval state transition atomically when both apply.
     // Without a single transaction, a 422 (or any error) thrown by the status update after the

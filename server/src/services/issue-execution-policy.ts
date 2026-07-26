@@ -554,6 +554,10 @@ function buildCompletedState(previous: IssueExecutionState | null, currentStage:
     completedStageIds,
     lastDecisionId: previous?.lastDecisionId ?? null,
     lastDecisionOutcome: "approved",
+    // Unlike buildPendingState, completing a stage must carry the QA disposition forward:
+    // callers that do not re-apply it would leave a `done` issue with no record of the verdict.
+    qaVerdict: previous?.qaVerdict ?? null,
+    qaEvidence: previous?.qaEvidence ?? null,
     monitor: previous?.monitor ?? null,
   };
 }

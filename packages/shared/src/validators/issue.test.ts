@@ -4,6 +4,7 @@ import {
   addIssueCommentSchema,
   createIssueSchema,
   issueBlockedInboxAttentionSchema,
+  issueRecoveryActionReadModelSchema,
   resolveIssueRecoveryActionSchema,
   respondIssueThreadInteractionSchema,
   suggestedTaskDraftSchema,
@@ -15,6 +16,42 @@ import { createAgentSchema } from "./agent.js";
 import { qaReviewEvidenceV1Schema } from "./project.js";
 
 describe("issue validators", () => {
+  it("accepts GitHub CI failure recovery actions in the read model", () => {
+    const parsed = issueRecoveryActionReadModelSchema.parse({
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "22222222-2222-4222-8222-222222222222",
+      sourceIssueId: "33333333-3333-4333-8333-333333333333",
+      recoveryIssueId: null,
+      kind: "github_ci_failure",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: "44444444-4444-4444-8444-444444444444",
+      ownerUserId: null,
+      previousOwnerAgentId: null,
+      returnOwnerAgentId: null,
+      cause: "github_ci_failure",
+      fingerprint: "ci-failure:1",
+      evidence: { headSha: "abc123" },
+      nextAction: "Inspect the failing check.",
+      wakePolicy: null,
+      monitorPolicy: null,
+      attemptCount: 1,
+      maxAttempts: null,
+      revision: 0,
+      lastOperationId: null,
+      nextRetryAt: null,
+      timeoutAt: null,
+      lastAttemptAt: null,
+      outcome: null,
+      resolutionNote: null,
+      resolvedAt: null,
+      createdAt: "2026-07-27T10:00:00.000Z",
+      updatedAt: "2026-07-27T10:00:00.000Z",
+    });
+
+    expect(parsed.kind).toBe("github_ci_failure");
+  });
+
   it("passes real line breaks through unchanged", () => {
     const parsed = createIssueSchema.parse({
       title: "Follow up PR",

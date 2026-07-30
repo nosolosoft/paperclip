@@ -121,6 +121,7 @@ const KIND_LABEL: Record<IssueRecoveryActionKind, string> = {
   configuration_validation: "Configuration Validation",
   active_run_watchdog: "Active Watchdog",
   issue_graph_liveness: "Graph Liveness",
+  github_ci_failure: "GitHub CI Failure",
 };
 
 const KIND_HEADLINE: Record<IssueRecoveryActionKind, string> = {
@@ -135,6 +136,8 @@ const KIND_HEADLINE: Record<IssueRecoveryActionKind, string> = {
     "The active run has been silent. Recovery is observing without interrupting it.",
   issue_graph_liveness:
     "Paperclip detected this task lost a live action path. A recovery owner needs to act.",
+  github_ci_failure:
+    "GitHub CI failed for the linked PR head. A recovery owner needs to act.",
 };
 
 const STATE_TONE: Record<RecoveryCardCardState, {

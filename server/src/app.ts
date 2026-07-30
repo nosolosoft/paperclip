@@ -23,6 +23,7 @@ import { teamsCatalogRoutes } from "./routes/teams-catalog.js";
 import { agentRoutes } from "./routes/agents.js";
 import { projectRoutes } from "./routes/projects.js";
 import { issueRoutes } from "./routes/issues.js";
+import { githubCiRecoveryRoutes } from "./routes/github-ci-recovery.js";
 import { issueTreeControlRoutes } from "./routes/issue-tree-control.js";
 import { caseRoutes } from "./routes/cases.js";
 import { fileResourceRoutes } from "./routes/file-resources.js";
@@ -307,6 +308,7 @@ export async function createApp(
     pluginWorkerManager: workerManager,
     approveToolActionRequest: (input) => toolGateway.approveActionRequest(input),
   }));
+  api.use(githubCiRecoveryRoutes(db, { pluginWorkerManager: workerManager }));
   app.use(mcpGatewayProtocolRoutes(toolGateway));
   api.use(toolAccessRoutes(db, {
     deploymentMode: opts.deploymentMode,

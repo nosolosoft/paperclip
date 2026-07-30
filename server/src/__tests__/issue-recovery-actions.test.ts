@@ -310,6 +310,242 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(await svc.getActiveForIssue(randomUUID(), sourceIssueId)).toBeNull();
   });
 
+  it("creates and idempotently refreshes one GitHub CI recovery action for the same head and fingerprint", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+
+    const first = await svc.upsertGithubCiRecovery({
+      companyId,
+      sourceIssueId,
+      ownerAgentId: managerId,
+      headSha: "head-1",
+      fingerprint: "failure-1",
+      disposition: "failed",
+      evidence: { runId: "run-1" },
+      nextAction: "Inspect the failing check.",
+    });
+    const refreshed = await svc.upsertGithubCiRecovery({
+      companyId,
+      sourceIssueId,
+      ownerAgentId: managerId,
+      headSha: "head-1",
+      fingerprint: "failure-1",
+      disposition: "failed",
+      evidence: { runId: "run-2" },
+      nextAction: "Inspect the failing check.",
+    });
+
+    expect(first.kind).toBe("created");
+    expect(refreshed.kind).toBe("refreshed");
+    if (first.kind !== "created" || refreshed.kind !== "refreshed") {
+      throw new Error("Expected first report to create and second report to refresh GitHub CI action");
+    }
+    expect(refreshed.action.id).toBe(first.action.id);
+    expect(refreshed.action).toMatchObject({
+      kind: "github_ci_failure",
+      cause: "github_ci_failure",
+      fingerprint: "failure-1",
+      evidence: { headSha: "head-1", runId: "run-2" },
+      attemptCount: 2,
+      revision: 1,
+    });
+    expect((await db.select().from(issueRecoveryActions))).toHaveLength(1);
+  });
+
+  it("supersedes stale GitHub CI heads without overwriting the old audit row", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const first = await svc.upsertGithubCiRecovery({
+      companyId,
+      sourceIssueId,
+      ownerAgentId: managerId,
+      headSha: "head-1",
+      fingerprint: "failure-1",
+      disposition: "failed",
+      evidence: { check: "lint" },
+      nextAction: "Inspect the failing check.",
+    });
+    expect(first.kind, JSON.stringify(first)).toBe("created");
+    if (first.kind !== "created") throw new Error("Expected initial GitHub CI action to be created");
+
+    const changedHead = await svc.upsertGithubCiRecovery({
+      companyId,
+      sourceIssueId,
+      ownerAgentId: managerId,
+      headSha: "head-2",
+      fingerprint: "failure-1",
+      disposition: "failed",
+      evidence: { check: "lint" },
+      nextAction: "Inspect the failing check.",
+    });
+    expect(changedHead.kind, JSON.stringify(changedHead)).toBe("superseded");
+    if (changedHead.kind !== "superseded") throw new Error("Expected changed GitHub CI head to supersede prior action");
+
+    const changedFingerprint = await svc.upsertGithubCiRecovery({
+      companyId,
+      sourceIssueId,
+      ownerAgentId: managerId,
+      headSha: "head-2",
+      fingerprint: "failure-2",
+      disposition: "failed",
+      evidence: { check: "tests" },
+      nextAction: "Inspect the failing check.",
+    });
+    expect(changedFingerprint.kind).toBe("superseded");
+
+    const rows = await db.select().from(issueRecoveryActions);
+    expect(rows).toHaveLength(3);
+    expect(rows.find((row) => row.id === first.action.id)).toMatchObject({
+      status: "cancelled",
+      outcome: "cancelled",
+      cause: "github_ci_failure",
+      fingerprint: "failure-1",
+      evidence: { headSha: "head-1", check: "lint" },
+      resolutionNote: expect.stringContaining("head-2"),
+    });
+    expect(rows.filter((row) => row.status === "active")).toHaveLength(1);
+    expect(rows.find((row) => row.status === "active")).toMatchObject({
+      fingerprint: "failure-2",
+      evidence: { headSha: "head-2", check: "tests" },
+    });
+  });
+
+  it("resolves only a matching green GitHub CI report with the restored outcome", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const failed = await svc.upsertGithubCiRecovery({
+      companyId,
+      sourceIssueId,
+      ownerAgentId: managerId,
+      headSha: "head-green",
+      fingerprint: "failure-green",
+      disposition: "failed",
+      evidence: { check: "tests" },
+      nextAction: "Inspect the failing check.",
+    });
+    expect(failed.kind, JSON.stringify(failed)).toBe("created");
+    if (failed.kind !== "created") throw new Error("Expected initial GitHub CI action to be created");
+
+    const resolved = await svc.upsertGithubCiRecovery({
+      companyId,
+      sourceIssueId,
+      ownerAgentId: managerId,
+      headSha: "head-green",
+      fingerprint: "failure-green",
+      disposition: "passed",
+      evidence: { check: "tests" },
+      nextAction: "Inspect the failing check.",
+    });
+
+    expect(resolved).toMatchObject({
+      kind: "resolved",
+      action: {
+        id: failed.action.id,
+        status: "resolved",
+        outcome: "restored",
+      },
+    });
+    expect(await svc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+  });
+
+  it("rolls back stale-head cancellation when replacement creation fails", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const first = await svc.upsertGithubCiRecovery({
+      companyId,
+      sourceIssueId,
+      ownerAgentId: managerId,
+      headSha: "head-rollback-1",
+      fingerprint: "failure-rollback-1",
+      disposition: "failed",
+      evidence: { check: "tests" },
+      nextAction: "Inspect the failing check.",
+    });
+    expect(first.kind, JSON.stringify(first)).toBe("created");
+    if (first.kind !== "created") throw new Error("Expected rollback fixture action to be created");
+
+    await expect(svc.upsertGithubCiRecovery({
+      companyId,
+      sourceIssueId,
+      ownerAgentId: "not-a-uuid",
+      headSha: "head-rollback-2",
+      fingerprint: "failure-rollback-2",
+      disposition: "failed",
+      evidence: { check: "tests" },
+      nextAction: "Inspect the failing check.",
+    })).rejects.toThrow();
+
+    await expect(svc.getActiveForIssue(companyId, sourceIssueId)).resolves.toMatchObject({
+      id: first.action.id,
+      status: "active",
+      fingerprint: "failure-rollback-1",
+      evidence: { headSha: "head-rollback-1" },
+    });
+  });
+
+  it("coalesces same-head reports across service instances", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const firstService = issueRecoveryActionService(db);
+    const secondService = issueRecoveryActionService(db);
+    const input = {
+      companyId,
+      sourceIssueId,
+      ownerAgentId: managerId,
+      headSha: "head-concurrent",
+      fingerprint: "failure-concurrent",
+      disposition: "failed" as const,
+      evidence: { check: "tests" },
+      nextAction: "Inspect the failing check.",
+    };
+
+    const [first, second] = await Promise.all([
+      firstService.upsertGithubCiRecovery(input),
+      secondService.upsertGithubCiRecovery(input),
+    ]);
+
+    expect([first.kind, second.kind].sort()).toEqual(["created", "refreshed"]);
+    expect(await db.select().from(issueRecoveryActions)).toHaveLength(1);
+    expect(await firstService.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
+      kind: "github_ci_failure",
+      fingerprint: "failure-concurrent",
+      attemptCount: 2,
+    });
+  });
+
+  it("refuses to overwrite an unrelated active recovery kind", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const existing = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "stranded-1",
+      evidence: { source: "existing" },
+      nextAction: "Restore the live path.",
+    });
+
+    const rejected = await svc.upsertGithubCiRecovery({
+      companyId,
+      sourceIssueId,
+      ownerAgentId: managerId,
+      headSha: "head-1",
+      fingerprint: "failure-1",
+      disposition: "failed",
+      evidence: { source: "github" },
+      nextAction: "Inspect the failing check.",
+    });
+
+    expect(rejected).toMatchObject({ kind: "conflict", action: { id: existing.id } });
+    expect(await svc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
+      id: existing.id,
+      kind: "stranded_assigned_issue",
+      fingerprint: "stranded-1",
+      evidence: { source: "existing" },
+    });
+  });
+
   it("escalates stranded assigned work into a source action instead of a recovery issue", async () => {
     const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
     const enqueueWakeup = vi.fn(async () => null);

@@ -63,6 +63,37 @@ export type TransitionRecoveryResult =
   | { kind: "transitioned" | "idempotent"; action: IssueRecoveryAction }
   | { kind: "conflict" | "not_due"; action: IssueRecoveryAction | null };
 
+export type GithubCiRecoveryInput = {
+  companyId: string;
+  sourceIssueId: string;
+  disposition: "failed" | "passed";
+  headSha: string;
+  fingerprint: string;
+  ownerType?: IssueRecoveryActionOwnerType;
+  ownerAgentId?: string | null;
+  ownerUserId?: string | null;
+  previousOwnerAgentId?: string | null;
+  returnOwnerAgentId?: string | null;
+  evidence?: Record<string, unknown>;
+  nextAction?: string;
+  wakePolicy?: Record<string, unknown> | null;
+  monitorPolicy?: Record<string, unknown> | null;
+  maxAttempts?: number | null;
+  timeoutAt?: Date | null;
+  lastAttemptAt?: Date | null;
+  resolutionNote?: string | null;
+};
+
+export type GithubCiRecoveryResult =
+  | { kind: "created" | "refreshed" | "resolved"; action: IssueRecoveryAction }
+  | {
+      kind: "superseded";
+      action: IssueRecoveryAction;
+      supersededAction: IssueRecoveryAction;
+    }
+  | { kind: "unmatched"; action: null }
+  | { kind: "conflict"; action: IssueRecoveryAction };
+
 function toReadModel(row: IssueRecoveryActionRow): IssueRecoveryAction {
   return {
     id: row.id,
@@ -140,8 +171,12 @@ export function issueRecoveryActionService(db: Db) {
     }
   }
 
-  async function getActiveForIssue(companyId: string, sourceIssueId: string): Promise<IssueRecoveryAction | null> {
-    const row = await db
+  async function getActiveForIssue(
+    companyId: string,
+    sourceIssueId: string,
+    dbOrTx: DbOrTransaction = db,
+  ): Promise<IssueRecoveryAction | null> {
+    const row = await dbOrTx
       .select()
       .from(issueRecoveryActions)
       .where(
@@ -181,6 +216,7 @@ export function issueRecoveryActionService(db: Db) {
     input: UpsertIssueRecoveryActionInput,
     retryCount: number,
     error?: unknown,
+    dbOrTx: DbOrTransaction = db,
   ): Promise<IssueRecoveryAction> {
     if (retryCount >= MAX_UPSERT_RETRIES) {
       if (error) throw error;
@@ -188,18 +224,19 @@ export function issueRecoveryActionService(db: Db) {
         `Failed to upsert active recovery action for issue ${input.sourceIssueId} after ${MAX_UPSERT_RETRIES} retries`,
       );
     }
-    return upsertSourceScopedUnlocked(input, retryCount + 1);
+    return upsertSourceScopedUnlocked(input, retryCount + 1, dbOrTx);
   }
 
   async function upsertSourceScopedUnlocked(
     input: UpsertIssueRecoveryActionInput,
     retryCount = 0,
+    dbOrTx: DbOrTransaction = db,
   ): Promise<IssueRecoveryAction> {
-    const existing = await getActiveForIssue(input.companyId, input.sourceIssueId);
+    const existing = await getActiveForIssue(input.companyId, input.sourceIssueId, dbOrTx);
     const now = new Date();
     const ownerType = input.ownerType ?? (input.ownerAgentId ? "agent" : "board");
     if (existing) {
-      const [updated] = await db
+      const [updated] = await dbOrTx
         .update(issueRecoveryActions)
         .set({
           recoveryIssueId: input.recoveryIssueId ?? null,
@@ -236,13 +273,13 @@ export function issueRecoveryActionService(db: Db) {
         )
         .returning();
       if (!updated) {
-        return retryUpsertSourceScoped(input, retryCount);
+        return retryUpsertSourceScoped(input, retryCount, undefined, dbOrTx);
       }
       return toReadModel(updated!);
     }
 
     try {
-      const [created] = await db
+      const [created] = await dbOrTx
         .insert(issueRecoveryActions)
         .values({
           companyId: input.companyId,
@@ -268,11 +305,12 @@ export function issueRecoveryActionService(db: Db) {
           revision: 0,
           lastOperationId: null,
           nextRetryAt: null,
-        })
+      })
         .returning();
       return toReadModel(created!);
     } catch (error) {
       if (!isUniqueRecoveryActionConflict(error)) throw error;
+      if (dbOrTx !== db) throw error;
       return retryUpsertSourceScoped(input, retryCount, error);
     }
   }
@@ -281,6 +319,103 @@ export function issueRecoveryActionService(db: Db) {
     input: UpsertIssueRecoveryActionInput,
   ): Promise<IssueRecoveryAction> {
     return runExclusiveUpsert(input, () => upsertSourceScopedUnlocked(input));
+  }
+
+  async function upsertGithubCiRecoveryInTransaction(
+    input: GithubCiRecoveryInput,
+    actionInput: UpsertIssueRecoveryActionInput,
+    retryCount = 0,
+  ): Promise<GithubCiRecoveryResult> {
+    try {
+      return await db.transaction(async (tx) => {
+        const existing = await getActiveForIssue(input.companyId, input.sourceIssueId, tx);
+        if (existing && existing.kind !== "github_ci_failure") {
+          return { kind: "conflict", action: existing };
+        }
+
+        const sameReport = existing &&
+          existing.fingerprint === input.fingerprint &&
+          existing.evidence.headSha === input.headSha;
+        if (input.disposition === "passed") {
+          if (!sameReport || !existing) return { kind: "unmatched", action: null };
+          const resolved = await resolveActiveForIssue({
+            companyId: input.companyId,
+            sourceIssueId: input.sourceIssueId,
+            actionId: existing.id,
+            kind: "github_ci_failure",
+            cause: "github_ci_failure",
+            fingerprint: input.fingerprint,
+            status: "resolved",
+            outcome: "restored",
+            resolutionNote: input.resolutionNote ?? `GitHub CI passed for head ${input.headSha}.`,
+          }, tx);
+          return resolved ? { kind: "resolved", action: resolved } : { kind: "unmatched", action: null };
+        }
+
+        if (sameReport) {
+          return { kind: "refreshed", action: await upsertSourceScopedUnlocked(actionInput, 0, tx) };
+        }
+
+        if (!existing) {
+          return { kind: "created", action: await upsertSourceScopedUnlocked(actionInput, 0, tx) };
+        }
+
+        const supersededAction = await resolveActiveForIssue({
+          companyId: input.companyId,
+          sourceIssueId: input.sourceIssueId,
+          actionId: existing.id,
+          kind: "github_ci_failure",
+          cause: "github_ci_failure",
+          status: "cancelled",
+          outcome: "cancelled",
+          resolutionNote: `GitHub CI recovery action superseded by head ${input.headSha} and fingerprint ${input.fingerprint}.`,
+        }, tx);
+        if (!supersededAction) {
+          const latest = await getActiveForIssue(input.companyId, input.sourceIssueId, tx);
+          if (latest?.kind === "github_ci_failure" &&
+            latest.fingerprint === input.fingerprint &&
+            latest.evidence.headSha === input.headSha) {
+            return { kind: "refreshed", action: latest };
+          }
+          return { kind: "conflict", action: latest ?? existing };
+        }
+        return {
+          kind: "superseded",
+          action: await upsertSourceScopedUnlocked(actionInput, 0, tx),
+          supersededAction,
+        };
+      });
+    } catch (error) {
+      if (!isUniqueRecoveryActionConflict(error) || retryCount >= MAX_UPSERT_RETRIES) throw error;
+      return upsertGithubCiRecoveryInTransaction(input, actionInput, retryCount + 1);
+    }
+  }
+
+  async function upsertGithubCiRecovery(input: GithubCiRecoveryInput): Promise<GithubCiRecoveryResult> {
+    const actionInput: UpsertIssueRecoveryActionInput = {
+      companyId: input.companyId,
+      sourceIssueId: input.sourceIssueId,
+      kind: "github_ci_failure",
+      ownerType: input.ownerType,
+      ownerAgentId: input.ownerAgentId,
+      ownerUserId: input.ownerUserId,
+      previousOwnerAgentId: input.previousOwnerAgentId,
+      returnOwnerAgentId: input.returnOwnerAgentId,
+      cause: "github_ci_failure",
+      fingerprint: input.fingerprint,
+      evidence: {
+        ...(input.evidence ?? {}),
+        headSha: input.headSha,
+      },
+      nextAction: input.nextAction ?? "Inspect the failing GitHub CI check and repair the reported head.",
+      wakePolicy: input.wakePolicy,
+      monitorPolicy: input.monitorPolicy,
+      maxAttempts: input.maxAttempts,
+      timeoutAt: input.timeoutAt,
+      lastAttemptAt: input.lastAttemptAt,
+    };
+
+    return runExclusiveUpsert(actionInput, () => upsertGithubCiRecoveryInTransaction(input, actionInput));
   }
 
   async function resolveActiveForIssue(
@@ -369,6 +504,7 @@ export function issueRecoveryActionService(db: Db) {
     listActiveForIssues,
     resolveActiveForIssue,
     transitionRecovery,
+    upsertGithubCiRecovery,
     upsertSourceScoped,
   };
 }

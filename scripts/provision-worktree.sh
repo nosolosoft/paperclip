@@ -43,7 +43,7 @@ run_isolated_worktree_init() {
     return 0
   fi
 
-  if command -v pnpm >/dev/null 2>&1 && pnpm paperclipai --help >/dev/null 2>&1; then
+  if command -v pnpm >/dev/null 2>&1 && (cd "$base_cwd" && pnpm paperclipai --help >/dev/null 2>&1); then
     (
       cd "$worktree_cwd"
       pnpm paperclipai worktree init --force --seed-mode minimal --name "$worktree_name" --from-config "$source_config_path"
@@ -63,7 +63,7 @@ run_isolated_worktree_init() {
 }
 
 paperclipai_command_available() {
-  if command -v pnpm >/dev/null 2>&1 && pnpm paperclipai --help >/dev/null 2>&1; then
+  if command -v pnpm >/dev/null 2>&1 && (cd "$base_cwd" && pnpm paperclipai --help >/dev/null 2>&1); then
     return 0
   fi
 
@@ -493,7 +493,59 @@ process.stdout.write(hash.digest("hex"));
 EOF
 }
 
+python_provision_failure() {
+  local step="$1"
+  echo "Python provisioning failed for worktree $worktree_cwd during $step. Check network access, package index configuration, and dependency constraints." >&2
+}
+
+python_dependency_declared() {
+  local package_name="$1"
+  local declaration_pattern="^[[:space:]]*${package_name}([[:space:]]|$|\\[|[<>=!~;#@])"
+  local dependency_file
+
+  for dependency_file in "$worktree_cwd/requirements.txt" "$worktree_cwd/constraints.txt"; do
+    [[ -f "$dependency_file" ]] || continue
+    if grep -Eiq "$declaration_pattern" "$dependency_file"; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+compute_python_install_fingerprint() {
+  WORKTREE_CWD="$worktree_cwd" INTERPRETER_VERSION="$1" node <<'EOF'
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const root = process.env.WORKTREE_CWD;
+const files = ["requirements.txt"];
+if (fs.existsSync(path.join(root, "constraints.txt"))) files.push("constraints.txt");
+
+const hash = crypto.createHash("sha256");
+hash.update("interpreter-version\0");
+hash.update(process.env.INTERPRETER_VERSION || "");
+hash.update("\0");
+for (const relativePath of files) {
+  hash.update(relativePath);
+  hash.update("\0");
+  hash.update(fs.readFileSync(path.join(root, relativePath)));
+  hash.update("\0");
+}
+
+process.stdout.write(hash.digest("hex"));
+EOF
+}
+
+if [[ -f "$worktree_cwd/constraints.txt" && ! -f "$worktree_cwd/requirements.txt" ]]; then
+  echo "Python provisioning requires requirements.txt when constraints.txt is present in worktree $worktree_cwd." >&2
+  exit 1
+fi
+
+node_dependencies_provisioned=0
 if [[ -f "$worktree_cwd/package.json" && -f "$worktree_cwd/pnpm-lock.yaml" ]]; then
+  node_dependencies_provisioned=1
   needs_install=0
   install_fingerprint_path="$paperclip_dir/pnpm-install-fingerprint"
   current_install_fingerprint="$(compute_pnpm_install_fingerprint)"
@@ -600,20 +652,97 @@ if [[ -f "$worktree_cwd/package.json" && -f "$worktree_cwd/pnpm-lock.yaml" ]]; t
     current_install_fingerprint="$(compute_pnpm_install_fingerprint)"
     printf '%s\n' "$current_install_fingerprint" >"$install_fingerprint_path"
   fi
-
-  exit 0
 fi
 
-while IFS= read -r relative_path; do
-  [[ -n "$relative_path" ]] || continue
-  source_path="$base_cwd/$relative_path"
-  target_path="$worktree_cwd/$relative_path"
+if [[ -f "$worktree_cwd/requirements.txt" ]]; then
+  python3_command="$(command -v python3 || true)"
+  if [[ -z "$python3_command" ]]; then
+    python_provision_failure "python3 lookup"
+    exit 1
+  fi
 
-  [[ -d "$source_path" ]] || continue
-  [[ -e "$target_path" || -L "$target_path" ]] && continue
+  venv_dir="$worktree_cwd/.venv"
+  venv_python="$venv_dir/bin/python"
+  venv_created=0
+  if [[ ! -x "$venv_python" ]]; then
+    if ! (cd "$worktree_cwd" && "$python3_command" -m venv "$venv_dir"); then
+      python_provision_failure "venv creation"
+      exit 1
+    fi
+    venv_created=1
+  fi
 
-  mkdir -p "$(dirname "$target_path")"
-  ln -s "$source_path" "$target_path"
-done < <(
-  list_base_node_modules_paths
-)
+  if [[ ! -x "$venv_python" ]]; then
+    python_provision_failure "venv creation"
+    exit 1
+  fi
+
+  if ! "$venv_python" -m pip --version; then
+    python_provision_failure "pip bootstrap"
+    exit 1
+  fi
+
+  interpreter_version=""
+  if ! interpreter_version="$("$venv_python" --version 2>&1)"; then
+    python_provision_failure "interpreter validation"
+    exit 1
+  fi
+
+  python_install_fingerprint_path="$paperclip_dir/python-install-fingerprint"
+  current_python_install_fingerprint="$(compute_python_install_fingerprint "$interpreter_version")"
+  previous_python_install_fingerprint=""
+  if [[ -f "$python_install_fingerprint_path" ]]; then
+    previous_python_install_fingerprint="$(cat "$python_install_fingerprint_path")"
+  fi
+
+  if [[ "$venv_created" -eq 1 || "$current_python_install_fingerprint" != "$previous_python_install_fingerprint" ]]; then
+    python_install_args=(-r "$worktree_cwd/requirements.txt")
+    if [[ -f "$worktree_cwd/constraints.txt" ]]; then
+      python_install_args+=(-c "$worktree_cwd/constraints.txt")
+    fi
+
+    if ! (cd "$worktree_cwd" && "$venv_python" -m pip install "${python_install_args[@]}"); then
+      python_provision_failure "pip install"
+      exit 1
+    fi
+  else
+    echo "Skipping unchanged Python dependency install for worktree $worktree_cwd." >&2
+  fi
+
+  if ! (cd "$worktree_cwd" && "$venv_python" -m pip check); then
+    python_provision_failure "pip check"
+    exit 1
+  fi
+
+  if python_dependency_declared Django; then
+    if ! (cd "$worktree_cwd" && "$venv_python" -c 'import django'); then
+      python_provision_failure "Django import validation"
+      exit 1
+    fi
+  fi
+
+  if python_dependency_declared pytest; then
+    if ! (cd "$worktree_cwd" && "$venv_python" -c 'import pytest'); then
+      python_provision_failure "pytest import validation"
+      exit 1
+    fi
+  fi
+
+  printf '%s\n' "$current_python_install_fingerprint" >"$python_install_fingerprint_path"
+fi
+
+if [[ "$node_dependencies_provisioned" -eq 0 ]]; then
+  while IFS= read -r relative_path; do
+    [[ -n "$relative_path" ]] || continue
+    source_path="$base_cwd/$relative_path"
+    target_path="$worktree_cwd/$relative_path"
+
+    [[ -d "$source_path" ]] || continue
+    [[ -e "$target_path" || -L "$target_path" ]] && continue
+
+    mkdir -p "$(dirname "$target_path")"
+    ln -s "$source_path" "$target_path"
+  done < <(
+    list_base_node_modules_paths
+  )
+fi

@@ -5732,7 +5732,6 @@ export interface HeartbeatServiceOptions {
   runtimeEnv?: Record<string, string | undefined>;
 }
 
-type HeartbeatDbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
 function isTruthyRuntimeEnvValue(value: string | undefined) {
   return value === "true" || value === "1" || value === "yes" || value === "on";
@@ -6061,18 +6060,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agentId: string;
     reason: string | null;
     contextSnapshot: Record<string, unknown> | null | undefined;
-    tx: HeartbeatDbTransaction;
+    tx: Pick<Db, "select">;
   }) {
     if (input.issue.status !== "blocked") return false;
     const wakeReason = readNonEmptyString(input.contextSnapshot?.wakeReason) ?? input.reason;
     if (wakeReason !== "source_scoped_recovery_action") return false;
 
-    const recoveryActionId = readNonEmptyString(input.contextSnapshot?.recoveryActionId);
+    const recoveryActionId =
+      readNonEmptyString(input.contextSnapshot?.recoveryActionId) ??
+      readNonEmptyString(input.contextSnapshot?.action);
     const sourceIssueId = readNonEmptyString(input.contextSnapshot?.sourceIssueId);
     if (!recoveryActionId || sourceIssueId !== input.issue.id) return false;
 
     const matchingAction = await input.tx
-      .select({ id: issueRecoveryActions.id })
+      .select({
+        id: issueRecoveryActions.id,
+        kind: issueRecoveryActions.kind,
+        cause: issueRecoveryActions.cause,
+        fingerprint: issueRecoveryActions.fingerprint,
+        evidence: issueRecoveryActions.evidence,
+      })
       .from(issueRecoveryActions)
       .where(
         and(
@@ -6086,7 +6093,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .limit(1)
       .then((rows) => rows[0] ?? null);
 
-    return Boolean(matchingAction);
+    if (!matchingAction) return false;
+
+    if (matchingAction.kind !== "github_ci_failure") return true;
+
+    if (matchingAction.cause !== "github_ci_failure" || input.contextSnapshot?.recoveryActionKind !== "github_ci_failure" ||
+      input.contextSnapshot?.recoveryCause !== "github_ci_failure") {
+      return false;
+    }
+
+    const contextHeadSha = readNonEmptyString(input.contextSnapshot?.headSha);
+    const contextFingerprint = readNonEmptyString(input.contextSnapshot?.fingerprint);
+    const evidence = parseObject(matchingAction.evidence);
+    if (!contextHeadSha || evidence.headSha !== contextHeadSha || !contextFingerprint || matchingAction.fingerprint !== contextFingerprint) {
+      return false;
+    }
+
+    for (const key of ["prUrl", "repository", "prNumber"] as const) {
+      if (key in evidence && evidence[key] !== input.contextSnapshot?.[key]) return false;
+    }
+    return true;
   }
 
   async function completeSkillTestRunForHeartbeatOutcome(input: {
@@ -16421,6 +16447,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return true;
         };
 
+        const allowBlockedSourceScopedRecoveryWake = await isVerifiedBlockedSourceScopedRecoveryWake({
+          issue,
+          agentId,
+          reason,
+          contextSnapshot: enrichedContextSnapshot,
+          tx,
+        });
+
         let activeExecutionRun = issue.executionRunId
           ? await tx
             .select()
@@ -16843,13 +16877,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
-      const allowBlockedSourceScopedRecoveryWake = await isVerifiedBlockedSourceScopedRecoveryWake({
-        issue,
-        agentId,
-        reason,
-        contextSnapshot: enrichedContextSnapshot,
-        tx,
-      });
       const eligibility = evaluateIssueWakeEligibility({
         agent,
         issue,
@@ -17361,6 +17388,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(and(eq(issues.id, issueId), eq(issues.companyId, candidate.request.companyId)))
         .then((rows) => rows[0] ?? null);
 
+      const allowBlockedSourceScopedRecoveryWake = issue
+        ? await isVerifiedBlockedSourceScopedRecoveryWake({
+          issue: {
+            id: issue.id,
+            companyId: candidate.request.companyId,
+            status: issue.status,
+          },
+          agentId: candidate.agent.id,
+          reason: candidate.request.reason,
+          contextSnapshot: wakeContext.contextSnapshot,
+          tx: db,
+        })
+        : false;
       const staleReason = issue
         ? evaluateIssueWakeEligibility({
           agent: candidate.agent,
@@ -17369,6 +17409,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           triggerDetail: candidate.request.triggerDetail,
           reason: candidate.request.reason,
           contextSnapshot: wakeContext.contextSnapshot,
+          allowBlockedSourceScopedRecoveryWake,
         })
         : { allowed: false as const, reason: "issue_execution_issue_not_found" };
       if (staleReason.allowed) continue;

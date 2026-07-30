@@ -964,6 +964,10 @@ async function seedAssignedTodoNoRunFixture(input?: {
 async function seedBlockedSourceScopedRecoveryWakeFixture(input?: {
   actionId?: string;
   actionStatus?: string;
+  actionKind?: string;
+  actionCause?: string;
+  actionFingerprint?: string;
+  actionEvidence?: Record<string, unknown>;
   actionSourceIssueId?: string;
   actionOwnerAgentId?: string;
   attemptCount?: number;
@@ -1052,19 +1056,20 @@ async function seedBlockedSourceScopedRecoveryWakeFixture(input?: {
     companyId,
     sourceIssueId: actionSourceIssueId,
     recoveryIssueId: null,
-    kind: "stranded_assigned_issue",
+    kind: input?.actionKind ?? "stranded_assigned_issue",
     status: input?.actionStatus ?? "active",
     ownerType: "agent",
     ownerAgentId: actionOwnerAgentId,
     ownerUserId: null,
     previousOwnerAgentId: agentId,
     returnOwnerAgentId: agentId,
-    cause: "stranded_assigned_issue",
-    fingerprint: `test:${actionId}`,
+    cause: input?.actionCause ?? "stranded_assigned_issue",
+    fingerprint: input?.actionFingerprint ?? `test:${actionId}`,
     evidence: {
       sourceIssueId: actionSourceIssueId,
       previousStatus: "in_progress",
       latestRunId: randomUUID(),
+      ...(input?.actionEvidence ?? {}),
     },
     nextAction: "Restore a live execution path on the blocked source issue.",
     attemptCount: input?.attemptCount ?? 1,
@@ -1420,6 +1425,327 @@ it("does not bypass blocked status for mismatched source-scoped recovery context
     .where(eq(agentWakeupRequests.agentId, fixtures.agentId));
   expect(skipped).toHaveLength(3);
   expect(skipped.every((wakeup) => wakeup.status === "skipped" && wakeup.reason === "issue_status_blocked")).toBe(true);
+});
+
+it("allows a matching GitHub CI recovery wake on a blocked source issue", async () => {
+  const fingerprint = "ci-failure-1";
+  const headSha = "head-ci-1";
+  const { agentId, issueId, actionId } = await seedBlockedSourceScopedRecoveryWakeFixture({
+    actionKind: "github_ci_failure",
+    actionCause: "github_ci_failure",
+    actionFingerprint: fingerprint,
+    actionEvidence: {
+      prUrl: "https://github.com/acme/repo/pull/7",
+      repository: "acme/repo",
+      prNumber: 7,
+      headSha,
+    },
+  });
+  const heartbeat = heartbeatService(db);
+  const context = {
+    issueId,
+    sourceIssueId: issueId,
+    recoveryActionId: actionId,
+    recoveryActionKind: "github_ci_failure",
+    recoveryCause: "github_ci_failure",
+    prUrl: "https://github.com/acme/repo/pull/7",
+    repository: "acme/repo",
+    prNumber: 7,
+    headSha,
+    fingerprint,
+    wakeReason: "source_scoped_recovery_action",
+    forceFreshSession: true,
+  };
+
+  const run = await heartbeat.wakeup(agentId, {
+    source: "assignment",
+    triggerDetail: "system",
+    reason: "source_scoped_recovery_action",
+    payload: context,
+    contextSnapshot: context,
+  });
+
+  expect(run?.contextSnapshot).toMatchObject({ issueId, recoveryActionId: actionId, headSha, fingerprint });
+  await waitForHeartbeatIdle(db);
+});
+
+it("rejects a blocked GitHub CI wake when CI action kind, cause, head, or fingerprint mismatches", async () => {
+  const fingerprint = "ci-failure-2";
+  const headSha = "head-ci-2";
+  const { agentId, issueId, actionId } = await seedBlockedSourceScopedRecoveryWakeFixture({
+    actionKind: "github_ci_failure",
+    actionCause: "github_ci_failure",
+    actionFingerprint: fingerprint,
+    actionEvidence: { prUrl: "https://github.com/acme/repo/pull/8", repository: "acme/repo", prNumber: 8, headSha },
+  });
+  const heartbeat = heartbeatService(db);
+  const [action] = await db
+    .select({ kind: issueRecoveryActions.kind, cause: issueRecoveryActions.cause, ownerAgentId: issueRecoveryActions.ownerAgentId })
+    .from(issueRecoveryActions)
+    .where(eq(issueRecoveryActions.id, actionId));
+  expect(action).toMatchObject({ kind: "github_ci_failure", cause: "github_ci_failure", ownerAgentId: agentId });
+  const baseContext = {
+    issueId,
+    sourceIssueId: issueId,
+    recoveryActionId: actionId,
+    recoveryActionKind: "github_ci_failure",
+    recoveryCause: "github_ci_failure",
+    prUrl: "https://github.com/acme/repo/pull/8",
+    repository: "acme/repo",
+    prNumber: 8,
+    headSha,
+    fingerprint,
+    wakeReason: "source_scoped_recovery_action",
+  };
+
+  for (const [name, patch] of [
+    ["kind", { recoveryActionKind: "stranded_assigned_issue" }],
+    ["cause", { recoveryCause: "stranded_assigned_issue" }],
+    ["head", { headSha: "head-ci-old" }],
+    ["fingerprint", { fingerprint: "ci-failure-old" }],
+  ] as const) {
+    const run = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "source_scoped_recovery_action",
+      payload: { ...baseContext, ...patch },
+      contextSnapshot: { ...baseContext, ...patch },
+      idempotencyKey: `ci-mismatch:${name}`,
+    });
+    expect(run).toBeNull();
+  }
+
+  const skipped = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+  expect(skipped).toHaveLength(4);
+  expect(skipped.every((wakeup) => wakeup.status === "skipped" && wakeup.reason === "issue_status_blocked")).toBe(true);
+});
+
+it("rejects a matching GitHub CI wake after the issue assignee changes", async () => {
+  const fingerprint = "ci-failure-assignee";
+  const headSha = "head-ci-assignee";
+  const { companyId, agentId, issueId, actionId } = await seedBlockedSourceScopedRecoveryWakeFixture({
+    actionKind: "github_ci_failure",
+    actionCause: "github_ci_failure",
+    actionFingerprint: fingerprint,
+    actionEvidence: { headSha },
+  });
+  const newAssigneeId = randomUUID();
+  await db.insert(agents).values({
+    id: newAssigneeId,
+    companyId,
+    name: "New CI Owner",
+    role: "ceo",
+    status: "idle",
+    adapterType: "codex_local",
+    adapterConfig: {},
+    runtimeConfig: {},
+    permissions: {},
+  });
+  await db.update(issues).set({ assigneeAgentId: newAssigneeId }).where(eq(issues.id, issueId));
+  const heartbeat = heartbeatService(db);
+  const context = {
+    issueId,
+    sourceIssueId: issueId,
+    recoveryActionId: actionId,
+    recoveryActionKind: "github_ci_failure",
+    recoveryCause: "github_ci_failure",
+    headSha,
+    fingerprint,
+    wakeReason: "source_scoped_recovery_action",
+  };
+
+  expect(await heartbeat.wakeup(agentId, {
+    source: "assignment",
+    triggerDetail: "system",
+    reason: "source_scoped_recovery_action",
+    payload: context,
+    contextSnapshot: context,
+  })).toBeNull();
+  expect((await db.select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId }).from(issues).where(eq(issues.id, issueId)))[0]).toEqual({
+    status: "blocked",
+    assigneeAgentId: newAssigneeId,
+  });
+});
+
+it("rejects a matching GitHub CI wake while a first-class blocker remains unresolved", async () => {
+  const fingerprint = "ci-failure-blocker";
+  const headSha = "head-ci-blocker";
+  const { companyId, agentId, issueId, actionId } = await seedBlockedSourceScopedRecoveryWakeFixture({
+    actionKind: "github_ci_failure",
+    actionCause: "github_ci_failure",
+    actionFingerprint: fingerprint,
+    actionEvidence: { headSha },
+  });
+  const blockerId = randomUUID();
+  await db.insert(issues).values({
+    id: blockerId,
+    companyId,
+    title: "Unresolved blocker",
+    status: "in_progress",
+    priority: "high",
+    assigneeAgentId: agentId,
+    responsibleUserId: "responsible-user",
+    issueNumber: 2,
+    identifier: `BLOCK-${blockerId.slice(0, 6)}`,
+  });
+  await db.insert(issueRelations).values({ companyId, issueId: blockerId, relatedIssueId: issueId, type: "blocks" });
+  const heartbeat = heartbeatService(db);
+  const context = {
+    issueId,
+    sourceIssueId: issueId,
+    recoveryActionId: actionId,
+    recoveryActionKind: "github_ci_failure",
+    recoveryCause: "github_ci_failure",
+    headSha,
+    fingerprint,
+    wakeReason: "source_scoped_recovery_action",
+  };
+
+  expect(await heartbeat.wakeup(agentId, {
+    source: "assignment",
+    triggerDetail: "system",
+    reason: "source_scoped_recovery_action",
+    payload: context,
+    contextSnapshot: context,
+  })).toBeNull();
+  expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).at(-1)).toMatchObject({
+    status: "skipped",
+    reason: "issue_dependencies_blocked",
+  });
+});
+
+it("promotes a valid deferred GitHub CI recovery wake without changing issue ownership or status", async () => {
+  const fingerprint = "ci-failure-deferred";
+  const headSha = "head-ci-deferred";
+  const { companyId, agentId, issueId, actionId } = await seedBlockedSourceScopedRecoveryWakeFixture({
+    actionKind: "github_ci_failure",
+    actionCause: "github_ci_failure",
+    actionFingerprint: fingerprint,
+    actionEvidence: { headSha },
+  });
+  const activeRunId = randomUUID();
+  const activeWakeupId = randomUUID();
+  const now = new Date("2026-03-19T00:00:00.000Z");
+  await db.insert(agentWakeupRequests).values({
+    id: activeWakeupId,
+    companyId,
+    agentId,
+    source: "assignment",
+    triggerDetail: "system",
+    reason: "issue_assigned",
+    payload: { issueId },
+    status: "claimed",
+    runId: activeRunId,
+  });
+  await db.insert(heartbeatRuns).values({
+    id: activeRunId,
+    companyId,
+    agentId,
+    invocationSource: "assignment",
+    triggerDetail: "system",
+    status: "running",
+    wakeupRequestId: activeWakeupId,
+    contextSnapshot: { issueId, taskId: issueId },
+    startedAt: now,
+    updatedAt: now,
+  });
+  await db.update(issues).set({ executionRunId: activeRunId }).where(eq(issues.id, issueId));
+  const heartbeat = heartbeatService(db);
+  const context = {
+    issueId,
+    sourceIssueId: issueId,
+    recoveryActionId: actionId,
+    recoveryActionKind: "github_ci_failure",
+    recoveryCause: "github_ci_failure",
+    headSha,
+    fingerprint,
+    wakeReason: "source_scoped_recovery_action",
+    forceFreshSession: true,
+  };
+
+  await db.insert(agentWakeupRequests).values({
+    companyId,
+    agentId,
+    source: "assignment",
+    triggerDetail: "system",
+    reason: "issue_execution_deferred",
+    payload: { issueId, _paperclipWakeContext: context },
+    status: "deferred_issue_execution",
+  });
+  const deferred = await db
+    .select()
+    .from(agentWakeupRequests)
+    .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution")))
+    .then((rows) => rows[0] ?? null);
+  expect(deferred).toBeTruthy();
+
+  await heartbeat.cancelRun(activeRunId);
+  await heartbeat.resumeQueuedRuns();
+  const promoted = await waitForValue(async () => {
+    if (!deferred) return null;
+    return db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferred.id))
+      .then((rows) => rows[0]?.status !== "deferred_issue_execution" ? rows[0] : null);
+  });
+  expect(["queued", "claimed", "running"]).toContain(promoted?.status);
+  expect(promoted?.runId).toBeTruthy();
+  expect(await db.select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId }).from(issues).where(eq(issues.id, issueId))).toEqual([
+    { status: "blocked", assigneeAgentId: agentId },
+  ]);
+});
+
+it("preserves matching CI janitor wakes and cancels stale CI evidence with activity", async () => {
+  const fingerprint = "ci-failure-janitor";
+  const headSha = "head-ci-janitor";
+  const fixture = await seedBlockedSourceScopedRecoveryWakeFixture({
+    actionKind: "github_ci_failure",
+    actionCause: "github_ci_failure",
+    actionFingerprint: fingerprint,
+    actionEvidence: { headSha },
+  });
+  const preservedWakeId = randomUUID();
+  const staleWakeId = randomUUID();
+  const makePayload = (overrides: Record<string, unknown>) => ({
+    issueId: fixture.issueId,
+    sourceIssueId: fixture.issueId,
+    recoveryActionId: fixture.actionId,
+    recoveryActionKind: "github_ci_failure",
+    recoveryCause: "github_ci_failure",
+    headSha,
+    fingerprint,
+    wakeReason: "source_scoped_recovery_action",
+    ...overrides,
+  });
+  await db.insert(agentWakeupRequests).values([
+    {
+      id: preservedWakeId,
+      companyId: fixture.companyId,
+      agentId: fixture.agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "source_scoped_recovery_action",
+      payload: makePayload({}),
+      status: "queued",
+    },
+    {
+      id: staleWakeId,
+      companyId: fixture.companyId,
+      agentId: fixture.agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "source_scoped_recovery_action",
+      payload: makePayload({ headSha: "head-ci-stale" }),
+      status: "queued",
+    },
+  ]);
+  const heartbeat = heartbeatService(db);
+
+  expect(await heartbeat.cancelStaleIssueWakeups(new Date("2026-03-19T00:20:00.000Z"))).toBe(1);
+  expect((await db.select({ status: agentWakeupRequests.status }).from(agentWakeupRequests).where(eq(agentWakeupRequests.id, preservedWakeId)))[0]?.status).toBe("queued");
+  expect((await db.select({ status: agentWakeupRequests.status }).from(agentWakeupRequests).where(eq(agentWakeupRequests.id, staleWakeId)))[0]?.status).toBe("cancelled");
+  expect(await db.select().from(activityLog).where(and(eq(activityLog.action, "heartbeat.wakeup_cancelled_stale"), eq(activityLog.entityId, fixture.issueId)))).toHaveLength(1);
 });
 
 it("requeues one stale source-scoped recovery action wake", async () => {

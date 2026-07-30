@@ -63,7 +63,7 @@ function decide(overrides: Partial<Parameters<typeof decideSuccessfulRunHandoff>
 }
 
 describe("successful run handoff decision", () => {
-  it("queues one status-only corrective wake to the original agent when a successful run has no disposition", () => {
+  it("queues one normal-model corrective wake to the original agent when a successful run has no disposition", () => {
     const decision = decide();
 
     expect(decision.kind).toBe("enqueue");
@@ -80,23 +80,22 @@ describe("successful run handoff decision", () => {
       maxHandoffAttempts: 1,
       resumeIntent: true,
       resumeFromRunId: "run-1",
-      modelProfile: "cheap",
-      allowDeliverableWork: false,
-      allowDocumentUpdates: false,
-      resumeRequiresNormalModel: true,
     });
     expect(decision.contextSnapshot).toMatchObject({
       wakeReason: FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
       handoffRequired: true,
-      modelProfile: "cheap",
-      allowDeliverableWork: false,
-      allowDocumentUpdates: false,
-      resumeRequiresNormalModel: true,
     });
+    for (const value of [decision.payload, decision.contextSnapshot]) {
+      expect(value).not.toHaveProperty("modelProfile");
+      expect(value).not.toHaveProperty("recoveryIntent");
+      expect(value).not.toHaveProperty("allowDeliverableWork");
+      expect(value).not.toHaveProperty("allowDocumentUpdates");
+      expect(value).not.toHaveProperty("resumeRequiresNormalModel");
+    }
     expect(decision.instruction).toContain(
-      "This is a status-only retry to the original agent. Record a disposition; do not start new work.",
+      "This corrective wake uses the normal model and may perform the verification or deliverable work needed to choose an honest disposition.",
     );
-    expect(decision.instruction).toContain("Resolve the missing disposition before creating or revising any new artifacts");
+    expect(decision.instruction).toContain("Resolve the missing disposition");
     expect(decision.instruction).toContain("Choose **exactly one** outcome");
     expect(decision.instruction).toContain("record an explicit continuation path");
   });

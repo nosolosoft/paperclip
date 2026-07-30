@@ -35,6 +35,9 @@ jobs:
             exit 1
           fi
 
+      - name: Test GitHub CI analyzer
+        run: python3 scripts/test_github_ci_autoreview.py
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
         with:

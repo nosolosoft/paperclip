@@ -23,6 +23,84 @@ GitHub Actions owns `pnpm-lock.yaml`.
 - Pull request CI validates dependency resolution when manifests change.
 - Pushes to `master` regenerate `pnpm-lock.yaml` with `pnpm install --lockfile-only --no-frozen-lockfile`, commit it back if needed, and then run verification with `--frozen-lockfile`.
 
+## GitHub CI Autoreview Recovery
+
+Paperclip ships `scripts/github-ci-autoreview.py` as a supported, external-scheduler
+entrypoint. It reads GitHub check results through the authenticated `gh` CLI and
+uses Paperclip APIs for candidate discovery and CI reports. Python's standard
+library is sufficient; the test runner is:
+
+```sh
+python3 scripts/test_github_ci_autoreview.py
+```
+
+Configure an existing Paperclip board/operator bearer key and the target company
+through the environment. Keep the key in the scheduler's secret store rather than
+committing it or placing it in a repository workflow file:
+
+```sh
+export PAPERCLIP_API_BASE=http://127.0.0.1:3100
+export PAPERCLIP_API_KEY='<existing Paperclip board API key>'
+export PAPERCLIP_COMPANY_ID='<company UUID>'
+```
+
+Run a read-only scan first:
+
+```sh
+python3 scripts/github-ci-autoreview.py --scan-paperclip --json
+```
+
+When output is correct, add `--enqueue` to submit failed or restored CI reports:
+
+```sh
+python3 scripts/github-ci-autoreview.py --scan-paperclip --enqueue --json
+```
+
+The analyzer still uses `gh` for GitHub PR metadata and check logs, so the
+execution environment must already have `gh auth` configured with access to the
+repositories being inspected. The Paperclip client sends only bearer-authenticated
+requests to:
+
+- `GET /api/companies/:companyId/github-ci/candidates`
+- `POST /api/companies/:companyId/github-ci/reports`
+
+Candidate discovery is company-scoped and returns linked, nonterminal PRs. It also
+returns the active CI failure fingerprint when one exists, allowing a green scan
+to resolve the matching recovery action. A direct PR scan can use `--pr-url` and
+`--issue-id`; a direct passed report additionally needs
+`--failure-fingerprint`:
+
+```sh
+python3 scripts/github-ci-autoreview.py \
+  --pr-url 'https://github.com/OWNER/REPO/pull/123' \
+  --issue-id '<issue UUID>' \
+  --failure-fingerprint '<active CI fingerprint>' \
+  --enqueue --json
+```
+
+Schedule the scan externally with cron, systemd, or an existing CI scheduler.
+This repository does not install or manage a scheduler. Repeated reports for the
+same PR head and failure fingerprint are idempotent; a changed head supersedes
+stale recovery evidence. Dry-run remains the safe rollback test.
+
+Recovery ownership and state changes stay server-side:
+
+- `in_review` wakes only the current invokable QA participant.
+- Other eligible states resolve a valid Engineer owner server-side.
+- CI never changes issue status, assignee, blockers, execution policy, QA verdict,
+  or QA evidence.
+- Blocked wakes pass only when recovery action, owner, PR, head, and fingerprint
+  still match normal heartbeat gates.
+- A passed report resolves only its matching active CI recovery action; it cannot
+  fabricate a pass for a different head or issue.
+
+To disable the flow, stop or remove the external scheduler invocation and revoke
+or rotate the API key used by that scheduler. Do not edit the database directly.
+Existing recovery actions remain auditable; handle any queued work through normal
+Paperclip controls. Hermes `paperclip-janitor` is unchanged and is not required
+for this analyzer. If an operator later wants Hermes to invoke it, that is a
+deployment-level integration outside this repository change.
+
 ## Start Dev
 
 From repo root:

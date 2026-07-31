@@ -332,6 +332,7 @@ export {
   type ResetAgentSession,
   type TestAdapterEnvironment,
   type UpdateAgentPermissions,
+  type AgentExecutionWorkspaceDefaultMode,
 } from "./agent.js";
 
 export {

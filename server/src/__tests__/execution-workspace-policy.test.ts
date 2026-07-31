@@ -20,13 +20,13 @@ describe("execution workspace policy helpers", () => {
         enabled: true,
         defaultMode: "isolated_workspace",
       }),
-    ).toEqual({ mode: "isolated_workspace" });
+    ).toEqual({ mode: "isolated_workspace", source: "project_default" });
     expect(
       defaultIssueExecutionWorkspaceSettingsForProject({
         enabled: true,
         defaultMode: "shared_workspace",
       }),
-    ).toEqual({ mode: "shared_workspace" });
+    ).toEqual({ mode: "shared_workspace", source: "project_default" });
     expect(defaultIssueExecutionWorkspaceSettingsForProject(null)).toBeNull();
   });
 
@@ -487,7 +487,6 @@ describe("agent default workspace mode precedence", () => {
       agentDefaultMode: "operator_branch",
     })).toBe("operator_branch");
   });
-
   it("clears stale adapter workspace config for an agent default without other controls", () => {
     expect(buildExecutionWorkspaceAdapterConfig({
       agentConfig: {
@@ -501,4 +500,4 @@ describe("agent default workspace mode precedence", () => {
       legacyUseProjectWorkspace: null,
     })).toEqual({ unrelated: "preserved" });
   });
-});
+  });

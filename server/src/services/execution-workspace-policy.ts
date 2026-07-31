@@ -1,4 +1,5 @@
 import type {
+  AgentExecutionWorkspaceDefaultMode,
   ExecutionWorkspaceMode,
   ExecutionWorkspaceStrategy,
   IssueExecutionWorkspaceSettings,
@@ -251,6 +252,7 @@ export function defaultIssueExecutionWorkspaceSettingsForProject(
 ): IssueExecutionWorkspaceSettings | null {
   if (!projectPolicy?.enabled) return null;
   return {
+    source: "project_default",
     mode:
       projectPolicy.defaultMode === "isolated_workspace"
         ? "isolated_workspace"
@@ -281,10 +283,20 @@ export function resolveExecutionWorkspaceMode(input: {
   projectPolicy: ProjectExecutionWorkspacePolicy | null;
   issueSettings: IssueExecutionWorkspaceSettings | null;
   legacyUseProjectWorkspace: boolean | null;
+  agentDefaultMode?: AgentExecutionWorkspaceDefaultMode | null;
 }): ParsedExecutionWorkspaceMode {
   const issueMode = input.issueSettings?.mode;
-  if (issueMode && issueMode !== "inherit" && issueMode !== "reuse_existing") {
-    return issueMode;
+  const issueModeIsSelectable = Boolean(issueMode) && issueMode !== "inherit" && issueMode !== "reuse_existing";
+  const issueModeIsInheritedFromProject = input.issueSettings?.source === "project_default";
+
+  if (issueModeIsSelectable && !issueModeIsInheritedFromProject) {
+    return issueMode as ParsedExecutionWorkspaceMode;
+  }
+  if (input.agentDefaultMode) {
+    return input.agentDefaultMode;
+  }
+  if (issueModeIsSelectable) {
+    return issueMode as ParsedExecutionWorkspaceMode;
   }
   if (input.projectPolicy?.enabled) {
     if (input.projectPolicy.defaultMode === "isolated_workspace") return "isolated_workspace";

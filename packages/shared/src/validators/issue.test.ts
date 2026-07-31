@@ -5,6 +5,7 @@ import {
   createIssueSchema,
   issueBlockedInboxAttentionSchema,
   issueRecoveryActionReadModelSchema,
+  issueExecutionWorkspaceSettingsSchema,
   resolveIssueRecoveryActionSchema,
   respondIssueThreadInteractionSchema,
   suggestedTaskDraftSchema,

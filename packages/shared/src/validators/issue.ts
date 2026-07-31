@@ -120,6 +120,8 @@ const executionWorkspaceStrategySchema = z
 export const issueExecutionWorkspaceSettingsSchema = z
   .object({
     mode: z.enum(ISSUE_EXECUTION_WORKSPACE_PREFERENCES).optional(),
+    // Absence means the setting is explicit; "project_default" means it was stamped from policy.
+    source: z.enum(["project_default"]).optional(),
     environmentId: z.string().uuid().optional().nullable(),
     workspaceStrategy: executionWorkspaceStrategySchema.optional().nullable(),
     workspaceRuntime: z.record(z.string(), z.unknown()).optional().nullable(),

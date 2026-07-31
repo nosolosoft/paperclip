@@ -295,6 +295,8 @@ export {
   createAgentHireSchema,
   updateAgentSchema,
   agentRuntimeConfigSchema,
+  agentExecutionWorkspaceDefaultModeSchema,
+  AGENT_EXECUTION_WORKSPACE_DEFAULT_MODES,
   agentInstructionsBundleModeSchema,
   updateAgentInstructionsBundleSchema,
   upsertAgentInstructionsFileSchema,

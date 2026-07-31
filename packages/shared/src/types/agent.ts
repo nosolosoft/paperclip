@@ -14,7 +14,7 @@ import type {
   TrustPreset,
 } from "../trust-policy.js";
 import type { AgentOrgChainHealth } from "../agent-eligibility.js";
-import type { AgentApiKeyScope } from "../validators/agent.js";
+import type { AgentApiKeyScope, AgentExecutionWorkspaceDefaultMode } from "../validators/agent.js";
 
 export interface AgentPermissions extends Record<string, unknown> {
   canCreateAgents: boolean;
@@ -29,8 +29,13 @@ export interface AgentModelProfileConfig {
   adapterConfig: Record<string, unknown>;
 }
 
+export interface AgentExecutionWorkspaceConfig {
+  defaultMode?: AgentExecutionWorkspaceDefaultMode;
+}
+
 export interface AgentRuntimeConfig extends Record<string, unknown> {
   modelProfiles?: Partial<Record<ModelProfileKey, AgentModelProfileConfig>>;
+  executionWorkspace?: AgentExecutionWorkspaceConfig;
 }
 
 export type AgentInstructionsBundleMode = "managed" | "external";

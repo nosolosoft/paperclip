@@ -62,10 +62,30 @@ const agentModelProfileConfigSchema = z.object({
   adapterConfig: adapterConfigSchema,
 }).strict();
 
+export const AGENT_EXECUTION_WORKSPACE_DEFAULT_MODES = [
+  "shared_workspace",
+  "isolated_workspace",
+  "operator_branch",
+  "agent_default",
+] as const;
+
+export const agentExecutionWorkspaceDefaultModeSchema = z.enum(
+  AGENT_EXECUTION_WORKSPACE_DEFAULT_MODES,
+);
+
+export type AgentExecutionWorkspaceDefaultMode = z.infer<
+  typeof agentExecutionWorkspaceDefaultModeSchema
+>;
+
+const agentExecutionWorkspaceConfigSchema = z.object({
+  defaultMode: agentExecutionWorkspaceDefaultModeSchema.optional(),
+}).strict();
+
 export const agentRuntimeConfigSchema = z.object({
   modelProfiles: z.object({
     cheap: agentModelProfileConfigSchema.optional(),
   }).strict().optional(),
+  executionWorkspace: agentExecutionWorkspaceConfigSchema.optional(),
 }).catchall(z.unknown());
 
 export const createAgentSchema = z.object({

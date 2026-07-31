@@ -8,6 +8,7 @@ import type { agents } from "@paperclipai/db";
 import { sessionCodec as codexSessionCodec } from "@paperclipai/adapter-codex-local/server";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import {
+  applyLowTrustWorkspaceIsolationUpgrade,
   applyPersistedExecutionWorkspaceConfig,
   assertGitSensitiveAdapterWorkspaceValid,
   assertGitWorktreeBaseWorkspaceReady,
@@ -2724,5 +2725,27 @@ describe("parseSessionCompactionPolicy", () => {
       maxRawInputTokens: 500_000,
       maxSessionAgeHours: 0,
     });
+  });
+});
+
+describe("applyLowTrustWorkspaceIsolationUpgrade", () => {
+  it("forces isolation for a low-trust shared workspace run", () => {
+    expect(applyLowTrustWorkspaceIsolationUpgrade(lowTrustResolution(), "shared_workspace"))
+      .toBe("isolated_workspace");
+  });
+
+  it("forces isolation for a low-trust agent_default run", () => {
+    expect(applyLowTrustWorkspaceIsolationUpgrade(lowTrustResolution(), "agent_default"))
+      .toBe("isolated_workspace");
+  });
+
+  it("leaves operator_branch untouched under low trust", () => {
+    expect(applyLowTrustWorkspaceIsolationUpgrade(lowTrustResolution(), "operator_branch"))
+      .toBe("operator_branch");
+  });
+
+  it("leaves agent_default untouched for a standard trust preset", () => {
+    expect(applyLowTrustWorkspaceIsolationUpgrade(standardTrustResolution(), "agent_default"))
+      .toBe("agent_default");
   });
 });

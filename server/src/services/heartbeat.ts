@@ -1260,6 +1260,16 @@ function buildExecutionWorkspaceConfigSnapshot(
   return hasSnapshot ? snapshot : null;
 }
 
+const LOW_TRUST_UNCONTAINED_WORKSPACE_MODES = new Set(["shared_workspace", "agent_default"]);
+
+export function applyLowTrustWorkspaceIsolationUpgrade<T extends string>(
+  trustPreset: TrustPresetResolution,
+  resolvedMode: T,
+): T | "isolated_workspace" {
+  if (trustPreset.kind !== "low_trust_review") return resolvedMode;
+  return LOW_TRUST_UNCONTAINED_WORKSPACE_MODES.has(resolvedMode) ? "isolated_workspace" : resolvedMode;
+}
+
 export function stripHostWorkspaceProvisionForLowTrustSandbox(input: {
   config: Record<string, unknown>;
   trustPreset: TrustPresetResolution;
@@ -12800,10 +12810,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
       agentDefaultMode: parseAgentExecutionWorkspaceDefaultMode(agent.runtimeConfig),
     });
-    const requestedExecutionWorkspaceMode =
-      trustPreset.kind === "low_trust_review" && resolvedExecutionWorkspaceMode === "shared_workspace"
-        ? "isolated_workspace"
-        : resolvedExecutionWorkspaceMode;
+    const requestedExecutionWorkspaceMode = applyLowTrustWorkspaceIsolationUpgrade(
+      trustPreset,
+      resolvedExecutionWorkspaceMode,
+    );
     const issueRef = issueContext
       ? {
           id: issueContext.id,

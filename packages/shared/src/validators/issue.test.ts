@@ -493,3 +493,37 @@ describe("issue validators", () => {
     expect(updateIssueSchema.parse({ qaVerdict: "fail" }).qaVerdict).toBe("fail");
   });
 });
+
+describe("issueExecutionWorkspaceSettingsSchema provenance", () => {
+  it("rejects server-owned project default provenance from API input", () => {
+    expect(
+      issueExecutionWorkspaceSettingsSchema.safeParse({
+        mode: "isolated_workspace",
+        source: "project_default",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("treats a setting without source as explicit", () => {
+    const parsed = issueExecutionWorkspaceSettingsSchema.parse({ mode: "isolated_workspace" });
+    expect(parsed).toEqual({ mode: "isolated_workspace" });
+  });
+
+  it("rejects provenance values other than project_default", () => {
+    expect(
+      issueExecutionWorkspaceSettingsSchema.safeParse({
+        mode: "isolated_workspace",
+        source: "user",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("still rejects unknown keys", () => {
+    expect(
+      issueExecutionWorkspaceSettingsSchema.safeParse({
+        mode: "isolated_workspace",
+        setBy: "policy",
+      }).success,
+    ).toBe(false);
+  });
+});

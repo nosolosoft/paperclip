@@ -2378,7 +2378,15 @@ function quoteShellArg(value: string) {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-function resolveRepoManagedWorkspaceCommand(command: string, repoRoot: string) {
+export type RepoManagedWorkspaceCommandResolution =
+  | { kind: "resolved"; command: string }
+  | { kind: "skip"; relativePath: string; repoRoot: string }
+  | { kind: "passthrough"; command: string };
+
+export function resolveRepoManagedWorkspaceCommand(
+  command: string,
+  repoRoot: string,
+): RepoManagedWorkspaceCommandResolution {
   const patterns = [
     /^(?<prefix>(?:bash|sh|zsh)\s+)(?<quote>["']?)(?<relative>\.\/[^"'\s]+)\k<quote>(?<suffix>(?:\s.*)?)$/s,
     /^(?<quote>["']?)(?<relative>\.\/[^"'\s]+)\k<quote>(?<suffix>(?:\s.*)?)$/s,
@@ -2388,16 +2396,18 @@ function resolveRepoManagedWorkspaceCommand(command: string, repoRoot: string) {
     const match = command.match(pattern);
     if (!match?.groups) continue;
 
-    const relativePath = match.groups.relative;
-    const repoManagedPath = path.join(repoRoot, relativePath.slice(2));
-    if (!existsSync(repoManagedPath)) continue;
+    const relativePath = match.groups.relative.slice(2);
+    const repoManagedPath = path.join(repoRoot, relativePath);
+    if (!existsSync(repoManagedPath)) {
+      return { kind: "skip", relativePath, repoRoot };
+    }
 
     const prefix = match.groups.prefix ?? "";
     const suffix = match.groups.suffix ?? "";
-    return `${prefix}${quoteShellArg(repoManagedPath)}${suffix}`;
+    return { kind: "resolved", command: `${prefix}${quoteShellArg(repoManagedPath)}${suffix}` };
   }
 
-  return command;
+  return { kind: "passthrough", command };
 }
 
 async function runWorkspaceCommand(input: {
@@ -2552,6 +2562,36 @@ async function recordWorkspaceCommandOperation(
   );
 }
 
+async function recordSkippedRepoManagedWorkspaceCommand(
+  recorder: WorkspaceOperationRecorder | null | undefined,
+  input: {
+    phase: "workspace_provision" | "workspace_teardown";
+    command: string;
+    cwd: string;
+    relativePath: string;
+    repoRoot: string;
+    metadata?: Record<string, unknown> | null;
+  },
+) {
+  if (!recorder) return;
+
+  await recorder.recordOperation({
+    phase: input.phase,
+    command: input.command,
+    cwd: input.cwd,
+    metadata: {
+      ...(input.metadata ?? {}),
+      relativePath: input.relativePath,
+      repoRoot: input.repoRoot,
+    },
+    run: async () => ({
+      status: "skipped",
+      exitCode: null,
+      system: `Skipped repo-managed workspace command "${input.command}" because ${input.relativePath} is not present in repository root ${input.repoRoot}.\n`,
+    }),
+  });
+}
+
 async function provisionExecutionWorktree(input: {
   strategy: Record<string, unknown>;
   base: ExecutionWorkspaceInput;
@@ -2565,12 +2605,27 @@ async function provisionExecutionWorktree(input: {
 }) {
   const provisionCommand = asString(input.strategy.provisionCommand, "").trim();
   if (!provisionCommand) return;
-  const resolvedProvisionCommand = resolveRepoManagedWorkspaceCommand(provisionCommand, input.repoRoot);
+  const provisionResolution = resolveRepoManagedWorkspaceCommand(provisionCommand, input.repoRoot);
+  if (provisionResolution.kind === "skip") {
+    await recordSkippedRepoManagedWorkspaceCommand(input.recorder, {
+      phase: "workspace_provision",
+      command: provisionCommand,
+      cwd: input.worktreePath,
+      relativePath: provisionResolution.relativePath,
+      repoRoot: provisionResolution.repoRoot,
+      metadata: {
+        worktreePath: input.worktreePath,
+        branchName: input.branchName,
+        created: input.created,
+      },
+    });
+    return;
+  }
 
   await recordWorkspaceCommandOperation(input.recorder, {
     phase: "workspace_provision",
     command: provisionCommand,
-    resolvedCommand: resolvedProvisionCommand,
+    resolvedCommand: provisionResolution.command,
     cwd: input.worktreePath,
     env: buildWorkspaceCommandEnv({
       base: input.base,
@@ -2587,7 +2642,7 @@ async function provisionExecutionWorktree(input: {
       worktreePath: input.worktreePath,
       branchName: input.branchName,
       created: input.created,
-      resolvedCommand: resolvedProvisionCommand === provisionCommand ? null : resolvedProvisionCommand,
+      resolvedCommand: provisionResolution.command === provisionCommand ? null : provisionResolution.command,
     },
     successMessage: `Provisioned workspace at ${input.worktreePath}\n`,
   });
@@ -3297,9 +3352,26 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
 
   for (const command of cleanupCommands) {
     try {
-      const resolvedCommand = repoRoot
+      const cleanupResolution = repoRoot
         ? resolveRepoManagedWorkspaceCommand(command, repoRoot)
-        : command;
+        : null;
+      if (cleanupResolution?.kind === "skip") {
+        await recordSkippedRepoManagedWorkspaceCommand(input.recorder, {
+          phase: "workspace_teardown",
+          command,
+          cwd: workspacePath ?? input.projectWorkspace?.cwd ?? process.cwd(),
+          relativePath: cleanupResolution.relativePath,
+          repoRoot: cleanupResolution.repoRoot,
+          metadata: {
+            workspaceId: input.workspace.id,
+            workspacePath,
+            branchName: input.workspace.branchName,
+            providerType: input.workspace.providerType,
+          },
+        });
+        continue;
+      }
+      const resolvedCommand = cleanupResolution?.command ?? command;
       await recordWorkspaceCommandOperation(input.recorder, {
         phase: "workspace_teardown",
         command,

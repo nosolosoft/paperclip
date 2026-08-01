@@ -2292,6 +2292,170 @@ describe("realizeExecutionWorkspace", () => {
     expect(operations[1]?.command).toBe("bash ./scripts/provision.sh");
   });
 
+  it("records a skipped provision operation when the repo-managed script is absent", async () => {
+    const repoRoot = await createTempRepo();
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+
+    const workspace = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+          provisionCommand: "bash ./scripts/provision-worktree.sh",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-542",
+        title: "Skip missing provision script",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+      recorder,
+    });
+
+    const provisionOperation = operations.find((operation) => operation.phase === "workspace_provision");
+    expect(provisionOperation?.command).toBe("bash ./scripts/provision-worktree.sh");
+    expect(provisionOperation?.metadata).toMatchObject({
+      relativePath: "scripts/provision-worktree.sh",
+      repoRoot,
+      worktreePath: workspace.worktreePath,
+      branchName: workspace.branchName,
+      created: true,
+    });
+    expect(provisionOperation?.result).toMatchObject({
+      status: "skipped",
+      exitCode: null,
+    });
+    expect(provisionOperation?.result.system).toContain("not present in repository root");
+  });
+
+  it("does not execute an absent repo-managed provision command without a recorder", async () => {
+    const repoRoot = await createTempRepo();
+
+    const workspace = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+          provisionCommand: "bash ./scripts/missing.sh || touch provision-should-not-run",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-546",
+        title: "Skip missing provision without recorder",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    await expect(fs.stat(path.join(workspace.cwd, "provision-should-not-run"))).rejects.toThrow();
+  });
+
+  it("executes an existing repo-managed provision script", async () => {
+    const repoRoot = await createTempRepo();
+
+    await fs.mkdir(path.join(repoRoot, "scripts"), { recursive: true });
+    await fs.writeFile(
+      path.join(repoRoot, "scripts", "provision-worktree.sh"),
+      "#!/usr/bin/env bash\nprintf 'provision marker\\n' > provision-marker.txt\n",
+      "utf8",
+    );
+    await runGit(repoRoot, ["add", "scripts/provision-worktree.sh"]);
+    await runGit(repoRoot, ["commit", "-m", "Add provision worktree script"]);
+
+    const workspace = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+          provisionCommand: "bash ./scripts/provision-worktree.sh",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-543",
+        title: "Run existing provision script",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    await expect(fs.readFile(path.join(workspace.cwd, "provision-marker.txt"), "utf8"))
+      .resolves.toBe("provision marker\n");
+  });
+
+  it("propagates a non-zero repo-managed provision script exit", async () => {
+    const repoRoot = await createTempRepo();
+
+    await fs.mkdir(path.join(repoRoot, "scripts"), { recursive: true });
+    await fs.writeFile(path.join(repoRoot, "scripts", "provision-worktree.sh"), "#!/usr/bin/env bash\nexit 17\n", "utf8");
+    await runGit(repoRoot, ["add", "scripts/provision-worktree.sh"]);
+    await runGit(repoRoot, ["commit", "-m", "Add failing provision worktree script"]);
+
+    await expect(realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+          provisionCommand: "bash ./scripts/provision-worktree.sh",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-544",
+        title: "Propagate provision failure",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    })).rejects.toThrow("Execution workspace provision command \"bash ./scripts/provision-worktree.sh\" failed");
+  });
+
   it("truncates oversized provision command output before storing it in memory", async () => {
     const repoRoot = await createTempRepo();
     const { recorder, operations } = createWorkspaceOperationRecorderDouble();
@@ -3666,6 +3830,123 @@ it("repairs a stale project-primary shared workspace by returning to the current
     expect(operations[2]?.metadata).toMatchObject({
       cleanupAction: "branch_delete",
     });
+  });
+
+  it("records skipped repo-managed cleanup and teardown commands without warnings", async () => {
+    const repoRoot = await createTempRepo();
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const workspace = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-545",
+        title: "Skip missing cleanup scripts",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+      workspace: {
+        id: "execution-workspace-1",
+        cwd: workspace.cwd,
+        providerType: "git_worktree",
+        providerRef: workspace.worktreePath,
+        branchName: workspace.branchName,
+        repoUrl: workspace.repoUrl,
+        baseRef: workspace.repoRef,
+        projectId: workspace.projectId,
+        projectWorkspaceId: workspace.workspaceId,
+        sourceIssueId: "issue-1",
+        metadata: { createdByRuntime: true },
+      },
+      cleanupCommand: "bash ./scripts/cleanup-worktree.sh",
+      teardownCommand: "bash ./scripts/teardown-worktree.sh",
+      recorder,
+    });
+
+    const skippedOperations = operations.filter((operation) => operation.phase === "workspace_teardown");
+    expect(cleanup.warnings).toEqual([]);
+    expect(skippedOperations).toHaveLength(2);
+    expect(skippedOperations.map((operation) => operation.result.status)).toEqual(["skipped", "skipped"]);
+    expect(skippedOperations.map((operation) => operation.result.exitCode)).toEqual([null, null]);
+    expect(skippedOperations[0]?.metadata).toMatchObject({
+      relativePath: "scripts/cleanup-worktree.sh",
+      repoRoot,
+      workspacePath: workspace.worktreePath,
+      branchName: workspace.branchName,
+    });
+    expect(skippedOperations[1]?.metadata).toMatchObject({
+      relativePath: "scripts/teardown-worktree.sh",
+      repoRoot,
+    });
+  });
+
+  it("does not execute absent repo-managed cleanup commands without a recorder", async () => {
+    const repoRoot = await createTempRepo();
+    const markerPath = path.join(os.tmpdir(), `paperclip-cleanup-should-not-run-${randomUUID()}`);
+    const workspace = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-547",
+        title: "Skip missing cleanup without recorder",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+      workspace: {
+        id: "execution-workspace-1",
+        cwd: workspace.cwd,
+        providerType: "git_worktree",
+        providerRef: workspace.worktreePath,
+        branchName: workspace.branchName,
+        repoUrl: workspace.repoUrl,
+        baseRef: workspace.repoRef,
+        projectId: workspace.projectId,
+        projectWorkspaceId: workspace.workspaceId,
+        sourceIssueId: "issue-1",
+        metadata: { createdByRuntime: true },
+      },
+      cleanupCommand: `bash ./scripts/missing.sh || touch ${JSON.stringify(markerPath)}`,
+    });
+
+    expect(cleanup.warnings).toEqual([]);
+    await expect(fs.stat(markerPath)).rejects.toThrow();
   });
 });
 

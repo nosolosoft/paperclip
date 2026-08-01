@@ -176,6 +176,7 @@ import {
   issueExecutionWorkspaceModeForPersistedWorkspace,
   isUnrunnableWorktreeCombo,
   parseIssueExecutionWorkspaceSettings,
+  parseAgentExecutionWorkspaceDefaultMode,
   parseProjectExecutionWorkspacePolicy,
   resolveEffectiveWorkspaceStrategyType,
   resolveExecutionWorkspaceEnvironmentId,
@@ -12797,6 +12798,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       projectPolicy: projectExecutionWorkspacePolicy,
       issueSettings: issueExecutionWorkspaceSettings,
       legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
+      agentDefaultMode: parseAgentExecutionWorkspaceDefaultMode(agent.runtimeConfig),
     });
     const requestedExecutionWorkspaceMode =
       trustPreset.kind === "low_trust_review" && resolvedExecutionWorkspaceMode === "shared_workspace"
@@ -16635,6 +16637,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             projectPolicy: null,
             issueSettings,
             legacyUseProjectWorkspace: null,
+            agentDefaultMode: parseAgentExecutionWorkspaceDefaultMode(agent.runtimeConfig),
           });
           const workspaceManagedConfig = buildExecutionWorkspaceAdapterConfig({
             agentConfig: parseObject(agent.adapterConfig),

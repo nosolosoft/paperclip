@@ -2670,6 +2670,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     expect(issue.executionWorkspaceSettings).toEqual({
       mode: "shared_workspace",
+      source: "project_default",
     });
   });
 
@@ -2751,7 +2752,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       priority: "medium",
     });
 
-    expect(issue.executionWorkspaceSettings).toEqual({ mode: "shared_workspace" });
+    expect(issue.executionWorkspaceSettings).toEqual({ mode: "shared_workspace", source: "project_default" });
   });
 
   it("does not rewrite execution workspace settings on reassignment", async () => {
@@ -2848,6 +2849,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     expect(created.executionWorkspaceSettings).toEqual({
       mode: "shared_workspace",
+      source: "project_default",
     });
 
     const reassigned = await svc.update(created.id, {
@@ -2857,6 +2859,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     expect(reassigned).not.toBeNull();
     expect(reassigned!.executionWorkspaceSettings).toEqual({
       mode: "shared_workspace",
+      source: "project_default",
     });
   });
 

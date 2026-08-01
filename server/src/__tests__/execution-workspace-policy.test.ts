@@ -5,6 +5,7 @@ import {
   gateProjectExecutionWorkspacePolicy,
   isUnrunnableWorktreeCombo,
   issueExecutionWorkspaceModeForPersistedWorkspace,
+  parseAgentExecutionWorkspaceDefaultMode,
   parseIssueExecutionWorkspaceSettings,
   parseProjectExecutionWorkspacePolicy,
   resolveExecutionWorkspaceEnvironmentId,
@@ -291,6 +292,59 @@ describe("execution workspace policy helpers", () => {
       mode: "shared_workspace",
       environmentId: "11111111-1111-4111-8111-111111111111",
     });
+    expect(
+      parseIssueExecutionWorkspaceSettings({
+        mode: "isolated_workspace",
+        networkEgress: {
+          allowFqdns: ["github.com", "pypi.org"],
+          allowCidrs: ["203.0.113.0/24"],
+        },
+      }),
+    ).toEqual({
+      mode: "isolated_workspace",
+      networkEgress: {
+        allowFqdns: ["github.com", "pypi.org"],
+        allowCidrs: ["203.0.113.0/24"],
+      },
+    });
+  });
+
+  it("preserves only the project-default issue source", () => {
+    expect(parseIssueExecutionWorkspaceSettings({
+      mode: "shared_workspace",
+      source: "project_default",
+    })).toEqual({ mode: "shared_workspace", source: "project_default" });
+    expect(parseIssueExecutionWorkspaceSettings({
+      mode: "shared_workspace",
+      source: "agent",
+    })).toEqual({ mode: "shared_workspace" });
+  });
+
+  it("parses only valid persisted agent default workspace modes", () => {
+    expect(parseAgentExecutionWorkspaceDefaultMode({ executionWorkspace: { defaultMode: "shared_workspace" } })).toBe("shared_workspace");
+    expect(parseAgentExecutionWorkspaceDefaultMode({ executionWorkspace: { defaultMode: "isolated_workspace" } })).toBe("isolated_workspace");
+    expect(parseAgentExecutionWorkspaceDefaultMode({ executionWorkspace: { defaultMode: "operator_branch" } })).toBe("operator_branch");
+    expect(parseAgentExecutionWorkspaceDefaultMode({ executionWorkspace: { defaultMode: "agent_default" } })).toBe("agent_default");
+    expect(parseAgentExecutionWorkspaceDefaultMode({ executionWorkspace: { defaultMode: "adapter_default" } })).toBeNull();
+    expect(parseAgentExecutionWorkspaceDefaultMode({ executionWorkspace: { defaultMode: "invalid" } })).toBeNull();
+    expect(parseAgentExecutionWorkspaceDefaultMode(null)).toBeNull();
+  });
+
+  it("keeps egress grants independent from isolated workspace mode", () => {
+    const parsedSettings = {
+      mode: "isolated_workspace" as const,
+      workspaceRuntime: { image: "example/image" },
+      networkEgress: {
+        allowFqdns: ["github.com"],
+        allowCidrs: ["203.0.113.0/24"],
+      },
+    };
+
+    expect(selectEnvironmentExecutionWorkspaceSettings(parsedSettings, false)).toEqual({
+      networkEgress: parsedSettings.networkEgress,
+    });
+    expect(selectEnvironmentExecutionWorkspaceSettings(parsedSettings, true)).toEqual(parsedSettings);
+    expect(selectEnvironmentExecutionWorkspaceSettings({ mode: "isolated_workspace" }, false)).toBeNull();
   });
 
   it("prefers the agent default environment", () => {
@@ -355,5 +409,96 @@ describe("execution workspace policy helpers", () => {
         true,
       ),
     ).toEqual({ enabled: true, defaultMode: "isolated_workspace" });
+  });
+});
+describe("agent default workspace mode precedence", () => {
+  const enabledProject = (defaultMode: "isolated_workspace" | "operator_branch") => ({
+    enabled: true as const,
+    defaultMode,
+  });
+
+  it("stamps project-derived issue settings as inherited", () => {
+    expect(defaultIssueExecutionWorkspaceSettingsForProject(enabledProject("isolated_workspace")))
+      .toEqual({ mode: "isolated_workspace", source: "project_default" });
+    expect(defaultIssueExecutionWorkspaceSettingsForProject({ enabled: true, defaultMode: "adapter_default" }))
+      .toEqual({ mode: "agent_default", source: "project_default" });
+    expect(defaultIssueExecutionWorkspaceSettingsForProject({ enabled: false, defaultMode: "isolated_workspace" }))
+      .toBeNull();
+  });
+
+  it("lets an explicit issue setting beat the agent default", () => {
+    expect(resolveExecutionWorkspaceMode({
+      projectPolicy: enabledProject("isolated_workspace"),
+      issueSettings: { mode: "operator_branch" },
+      legacyUseProjectWorkspace: null,
+      agentDefaultMode: "agent_default",
+    })).toBe("operator_branch");
+  });
+
+  it("lets the agent default beat an inherited project default", () => {
+    expect(resolveExecutionWorkspaceMode({
+      projectPolicy: enabledProject("isolated_workspace"),
+      issueSettings: { mode: "isolated_workspace", source: "project_default" },
+      legacyUseProjectWorkspace: null,
+      agentDefaultMode: "agent_default",
+    })).toBe("agent_default");
+  });
+
+  it("keeps the stamped project default when the agent has none", () => {
+    expect(resolveExecutionWorkspaceMode({
+      projectPolicy: null,
+      issueSettings: { mode: "isolated_workspace", source: "project_default" },
+      legacyUseProjectWorkspace: null,
+    })).toBe("isolated_workspace");
+  });
+
+  it("uses the agent default when the issue carries no settings", () => {
+    expect(resolveExecutionWorkspaceMode({
+      projectPolicy: enabledProject("isolated_workspace"),
+      issueSettings: null,
+      legacyUseProjectWorkspace: null,
+      agentDefaultMode: "agent_default",
+    })).toBe("agent_default");
+  });
+
+  it("falls back to project policy, then legacy, then shared", () => {
+    expect(resolveExecutionWorkspaceMode({
+      projectPolicy: enabledProject("operator_branch"),
+      issueSettings: null,
+      legacyUseProjectWorkspace: null,
+    })).toBe("operator_branch");
+    expect(resolveExecutionWorkspaceMode({
+      projectPolicy: null,
+      issueSettings: null,
+      legacyUseProjectWorkspace: false,
+    })).toBe("agent_default");
+    expect(resolveExecutionWorkspaceMode({
+      projectPolicy: null,
+      issueSettings: null,
+      legacyUseProjectWorkspace: null,
+    })).toBe("shared_workspace");
+  });
+
+  it("treats inherit as no selection so the agent default applies", () => {
+    expect(resolveExecutionWorkspaceMode({
+      projectPolicy: null,
+      issueSettings: { mode: "inherit" },
+      legacyUseProjectWorkspace: null,
+      agentDefaultMode: "operator_branch",
+    })).toBe("operator_branch");
+  });
+
+  it("clears stale adapter workspace config for an agent default without other controls", () => {
+    expect(buildExecutionWorkspaceAdapterConfig({
+      agentConfig: {
+        workspaceStrategy: { type: "git_worktree" },
+        workspaceRuntime: { services: [{ name: "stale" }] },
+        unrelated: "preserved",
+      },
+      projectPolicy: null,
+      issueSettings: null,
+      mode: "agent_default",
+      legacyUseProjectWorkspace: null,
+    })).toEqual({ unrelated: "preserved" });
   });
 });

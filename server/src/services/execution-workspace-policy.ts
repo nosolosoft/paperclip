@@ -9,6 +9,22 @@ import { asString, parseObject } from "../adapters/utils.js";
 
 export type ParsedExecutionWorkspaceMode = Exclude<ExecutionWorkspaceMode, "inherit" | "reuse_existing">;
 
+export function parseAgentExecutionWorkspaceDefaultMode(
+  runtimeConfig: unknown,
+): AgentExecutionWorkspaceDefaultMode | null {
+  const executionWorkspace = parseObject(parseObject(runtimeConfig).executionWorkspace);
+  const defaultMode = asString(executionWorkspace.defaultMode, "");
+  if (
+    defaultMode === "shared_workspace" ||
+    defaultMode === "isolated_workspace" ||
+    defaultMode === "operator_branch" ||
+    defaultMode === "agent_default"
+  ) {
+    return defaultMode;
+  }
+  return null;
+}
+
 export const WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE = "workspace_worktree_requires_project";
 export const WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION =
   "Attach a project to the task, or bind a reusable execution workspace, then retry.";
@@ -186,6 +202,7 @@ export function parseIssueExecutionWorkspaceSettings(
     ...(normalizedMode
       ? { mode: normalizedMode as IssueExecutionWorkspaceSettings["mode"] }
       : {}),
+    ...(parsed.source === "project_default" ? { source: "project_default" as const } : {}),
     ...(options.includeEnvironmentId && (typeof parsed.environmentId === "string" || parsed.environmentId === null)
       ? { environmentId: parsed.environmentId }
       : {}),
@@ -295,7 +312,11 @@ export function buildExecutionWorkspaceAdapterConfig(input: {
     input.issueSettings?.workspaceStrategy ||
     input.issueSettings?.workspaceRuntime,
   );
-  const hasWorkspaceControl = projectHasPolicy || issueHasWorkspaceOverrides || input.legacyUseProjectWorkspace === false;
+  const hasWorkspaceControl =
+    input.mode === "agent_default" ||
+    projectHasPolicy ||
+    issueHasWorkspaceOverrides ||
+    input.legacyUseProjectWorkspace === false;
 
   if (hasWorkspaceControl) {
     if (input.mode === "isolated_workspace") {

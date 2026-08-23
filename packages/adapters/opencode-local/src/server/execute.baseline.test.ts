@@ -48,6 +48,27 @@ function successRunResult(sessionId: string) {
   };
 }
 
+function shellGuardOkResult() {
+  return {
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    stdout: "__PAPERCLIP_SHELL_ENV_GUARD__:ok\n",
+    stderr: "",
+    pid: 90,
+    startedAt: new Date().toISOString(),
+  };
+}
+
+type RunChildProcessArgs = [string, string, string[], Record<string, unknown>];
+
+function mockOpenCodeRun(implementation: (...args: RunChildProcessArgs) => unknown) {
+  runChildProcess.mockImplementation(async (...args: RunChildProcessArgs) => {
+    if (args[2][0] === "-c") return shellGuardOkResult();
+    return implementation(...args);
+  });
+}
+
 describe("opencode execute() baseline (no adapterConfig.agent)", () => {
   const cleanupDirs: string[] = [];
   const originalAllowAllModels = process.env.OPENCODE_ALLOW_ALL_MODELS;
@@ -107,7 +128,7 @@ describe("opencode execute() baseline (no adapterConfig.agent)", () => {
 
   it("builds argv in `run --format json [--model] [--variant] [...extraArgs]` order for a fresh session, with no --agent flag", async () => {
     const workspaceDir = await makeWorkspace("paperclip-opencode-baseline-argv-");
-    runChildProcess.mockImplementation(async () => successRunResult("session_new"));
+    mockOpenCodeRun(async () => successRunResult("session_new"));
 
     const result = await execute({
       runId: "run-argv",
@@ -156,7 +177,7 @@ describe("opencode execute() baseline (no adapterConfig.agent)", () => {
   it("omits --variant when unset and orders --print-logs, --session, --model, in that fixed sequence", async () => {
     const workspaceDir = await makeWorkspace("paperclip-opencode-baseline-session-");
     process.env.PAPERCLIP_OPENCODE_PRINT_LOGS = "true";
-    runChildProcess.mockImplementation(async () => successRunResult("session_abc"));
+    mockOpenCodeRun(async () => successRunResult("session_abc"));
 
     try {
       await execute({
@@ -198,7 +219,7 @@ describe("opencode execute() baseline (no adapterConfig.agent)", () => {
   it("retries exactly once with a fresh session when the resumed session is unknown, and returns the retry's result", async () => {
     const workspaceDir = await makeWorkspace("paperclip-opencode-baseline-retry-");
     let callCount = 0;
-    runChildProcess.mockImplementation(async (_runId: string, _command: string, args: string[]) => {
+    mockOpenCodeRun(async (_runId: string, _command: string, args: string[]) => {
       callCount += 1;
       if (args.includes("--session")) {
         return {
@@ -248,7 +269,7 @@ describe("opencode execute() baseline (no adapterConfig.agent)", () => {
 
   it("synthesizes a nonzero exit code and errorMessage from a structured JSON error event even when the process exits 0", async () => {
     const workspaceDir = await makeWorkspace("paperclip-opencode-baseline-error-");
-    runChildProcess.mockImplementation(async () => ({
+    mockOpenCodeRun(async () => ({
       exitCode: 0,
       signal: null,
       timedOut: false,
@@ -282,7 +303,7 @@ describe("opencode execute() baseline (no adapterConfig.agent)", () => {
 
   it("returns sessionId, usage, and cost synthesized from parsed NDJSON on success", async () => {
     const workspaceDir = await makeWorkspace("paperclip-opencode-baseline-success-");
-    runChildProcess.mockImplementation(async () => successRunResult("session_success"));
+    mockOpenCodeRun(async () => successRunResult("session_success"));
 
     const result = await execute({
       runId: "run-success",

@@ -44,6 +44,27 @@ function successRunResult(sessionId: string, stdout?: string, stderr = "") {
   };
 }
 
+function shellGuardOkResult() {
+  return {
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    stdout: "__PAPERCLIP_SHELL_ENV_GUARD__:ok\n",
+    stderr: "",
+    pid: 90,
+    startedAt: new Date().toISOString(),
+  };
+}
+
+type RunChildProcessArgs = [string, string, string[], Record<string, unknown>];
+
+function mockOpenCodeRun(implementation: (...args: RunChildProcessArgs) => unknown) {
+  runChildProcess.mockImplementation(async (...args: RunChildProcessArgs) => {
+    if (args[2][0] === "-c") return shellGuardOkResult();
+    return implementation(...args);
+  });
+}
+
 describe("opencode execute() — adapterConfig.agent (T2)", () => {
   const cleanupDirs: string[] = [];
   const originalAllowAllModels = process.env.OPENCODE_ALLOW_ALL_MODELS;
@@ -99,7 +120,7 @@ describe("opencode execute() — adapterConfig.agent (T2)", () => {
 
   it("inserts --agent <fullName> as one argv item, right after --format json and before --model, preserving a name with spaces and a hyphen", async () => {
     const workspaceDir = await makeWorkspace("paperclip-opencode-agent-argv-");
-    runChildProcess.mockImplementation(async () => successRunResult("session_1"));
+    mockOpenCodeRun(async () => successRunResult("session_1"));
 
     await execute({
       runId: "run-agent-argv",
@@ -127,7 +148,7 @@ describe("opencode execute() — adapterConfig.agent (T2)", () => {
   it("inserts --agent after --session in the fixed order run/--format/json/--print-logs/--agent/--session/--model/--variant", async () => {
     const workspaceDir = await makeWorkspace("paperclip-opencode-agent-order-");
     process.env.PAPERCLIP_OPENCODE_PRINT_LOGS = "true";
-    runChildProcess.mockImplementation(async () => successRunResult("session_abc"));
+    mockOpenCodeRun(async () => successRunResult("session_abc"));
 
     try {
       await execute({
@@ -171,7 +192,7 @@ describe("opencode execute() — adapterConfig.agent (T2)", () => {
 
   it("stays byte-identical to the T1 baseline argv when config.agent is absent (backward compatible)", async () => {
     const workspaceDir = await makeWorkspace("paperclip-opencode-agent-absent-");
-    runChildProcess.mockImplementation(async () => successRunResult("session_2"));
+    mockOpenCodeRun(async () => successRunResult("session_2"));
 
     await execute({
       runId: "run-no-agent",
@@ -189,7 +210,7 @@ describe("opencode execute() — adapterConfig.agent (T2)", () => {
 
   it("throws before spawning when extraArgs already contains a literal --agent token and config.agent is also set", async () => {
     const workspaceDir = await makeWorkspace("paperclip-opencode-agent-conflict-");
-    runChildProcess.mockImplementation(async () => successRunResult("session_3"));
+    mockOpenCodeRun(async () => successRunResult("session_3"));
 
     await expect(
       execute({
@@ -229,7 +250,7 @@ describe("opencode execute() — adapterConfig.agent (T2)", () => {
 
   it("synthesizes a failure when the fallback phrase appears in stdout even though the process exits 0", async () => {
     const workspaceDir = await makeWorkspace("paperclip-opencode-agent-fallback-stdout-");
-    runChildProcess.mockImplementation(async () =>
+    mockOpenCodeRun(async () =>
       successRunResult(
         "session_4",
         [
@@ -260,7 +281,7 @@ describe("opencode execute() — adapterConfig.agent (T2)", () => {
 
   it("synthesizes a failure when the fallback phrase appears in stderr only, even with exit 0 and no parsed JSON error", async () => {
     const workspaceDir = await makeWorkspace("paperclip-opencode-agent-fallback-stderr-");
-    runChildProcess.mockImplementation(async () =>
+    mockOpenCodeRun(async () =>
       successRunResult("session_5", undefined, "agent not found. Falling back to default agent.\n"),
     );
 

@@ -81,6 +81,118 @@ function resolveOpenCodeBiller(env: Record<string, string>, provider: string | n
 
 const REMOTE_OPENCODE_MODELS_PROBE_DEFAULT_TIMEOUT_SEC = 20;
 const REMOTE_OPENCODE_MODELS_PROBE_SANDBOX_TIMEOUT_SEC = 120;
+const LOCAL_PAPERCLIP_SHELL_ENV_GUARD_TIMEOUT_SEC = 5;
+const LOCAL_PAPERCLIP_SHELL_ENV_GUARD_GRACE_SEC = 1;
+
+const PROTECTED_PAPERCLIP_SHELL_ENV_KEYS = [
+  "PAPERCLIP_AGENT_ID",
+  "PAPERCLIP_COMPANY_ID",
+  "PAPERCLIP_API_URL",
+  "PAPERCLIP_API_KEY",
+  "PAPERCLIP_RUN_ID",
+  "PAPERCLIP_TASK_ID",
+  "PAPERCLIP_SPAWNED",
+] as const;
+
+type ProtectedPaperclipShellEnvKey = (typeof PROTECTED_PAPERCLIP_SHELL_ENV_KEYS)[number];
+
+const PAPERCLIP_SHELL_ENV_GUARD_EXPECTED_KEYS = {
+  PAPERCLIP_AGENT_ID: "_PAPERCLIP_GUARD_EXPECTED_AGENT_ID",
+  PAPERCLIP_COMPANY_ID: "_PAPERCLIP_GUARD_EXPECTED_COMPANY_ID",
+  PAPERCLIP_API_URL: "_PAPERCLIP_GUARD_EXPECTED_API_URL",
+  PAPERCLIP_API_KEY: "_PAPERCLIP_GUARD_EXPECTED_API_KEY",
+  PAPERCLIP_RUN_ID: "_PAPERCLIP_GUARD_EXPECTED_RUN_ID",
+  PAPERCLIP_TASK_ID: "_PAPERCLIP_GUARD_EXPECTED_TASK_ID",
+  PAPERCLIP_SPAWNED: "_PAPERCLIP_GUARD_EXPECTED_SPAWNED",
+} as const satisfies Record<ProtectedPaperclipShellEnvKey, string>;
+
+const PAPERCLIP_SHELL_ENV_GUARD_MARKER = "__PAPERCLIP_SHELL_ENV_GUARD__:";
+const PAPERCLIP_SHELL_ENV_GUARD_SCRIPT = `
+mismatches=""
+append_mismatch() {
+  if [ -n "$mismatches" ]; then mismatches="$mismatches,"; fi
+  mismatches="$mismatches"$1
+}
+if [ "$PAPERCLIP_AGENT_ID" != "$_PAPERCLIP_GUARD_EXPECTED_AGENT_ID" ]; then append_mismatch PAPERCLIP_AGENT_ID; fi
+if [ "$PAPERCLIP_COMPANY_ID" != "$_PAPERCLIP_GUARD_EXPECTED_COMPANY_ID" ]; then append_mismatch PAPERCLIP_COMPANY_ID; fi
+if [ "$PAPERCLIP_API_URL" != "$_PAPERCLIP_GUARD_EXPECTED_API_URL" ]; then append_mismatch PAPERCLIP_API_URL; fi
+if [ "$PAPERCLIP_API_KEY" != "$_PAPERCLIP_GUARD_EXPECTED_API_KEY" ]; then append_mismatch PAPERCLIP_API_KEY; fi
+if [ "$PAPERCLIP_RUN_ID" != "$_PAPERCLIP_GUARD_EXPECTED_RUN_ID" ]; then append_mismatch PAPERCLIP_RUN_ID; fi
+if [ "$PAPERCLIP_TASK_ID" != "$_PAPERCLIP_GUARD_EXPECTED_TASK_ID" ]; then append_mismatch PAPERCLIP_TASK_ID; fi
+if [ "$PAPERCLIP_SPAWNED" != "$_PAPERCLIP_GUARD_EXPECTED_SPAWNED" ]; then append_mismatch PAPERCLIP_SPAWNED; fi
+if [ -n "$mismatches" ]; then
+  printf '%s%s\\n' "${PAPERCLIP_SHELL_ENV_GUARD_MARKER}" "$mismatches"
+  exit 78
+fi
+printf '%sok\\n' "${PAPERCLIP_SHELL_ENV_GUARD_MARKER}"
+`;
+
+async function assertPaperclipShellEnvStable(input: {
+  runId: string;
+  cwd: string;
+  runtimeEnv: Record<string, string>;
+  timeoutSec: number;
+  graceSec: number;
+}): Promise<void> {
+  if (process.platform === "win32") return;
+
+  const configuredShell = input.runtimeEnv.SHELL?.trim();
+  const shell = configuredShell ||
+    (process.platform === "darwin"
+      ? "/bin/zsh"
+      : (await fs.access("/bin/bash").then(() => true, () => false))
+        ? "/bin/bash"
+        : "/bin/sh");
+  const guardEnv: Record<string, string> = { ...input.runtimeEnv };
+  for (const key of PROTECTED_PAPERCLIP_SHELL_ENV_KEYS) {
+    guardEnv[key] = input.runtimeEnv[key] ?? "";
+    guardEnv[PAPERCLIP_SHELL_ENV_GUARD_EXPECTED_KEYS[key]] = input.runtimeEnv[key] ?? "";
+  }
+
+  let result: Awaited<ReturnType<typeof runChildProcess>>;
+  try {
+    result = await runChildProcess(input.runId, shell, ["-c", PAPERCLIP_SHELL_ENV_GUARD_SCRIPT], {
+      cwd: input.cwd,
+      env: guardEnv,
+      timeoutSec: input.timeoutSec,
+      graceSec: input.graceSec,
+      onLog: async () => {},
+    });
+  } catch {
+    throw new Error(
+      `opencode_local: PAPERCLIP_SHELL_ENV_CHECK_FAILED (shell=${shell}, exit=spawn): unable to verify protected Paperclip run variables before starting OpenCode.`,
+    );
+  }
+
+  if (result.timedOut) {
+    throw new Error(
+      `opencode_local: PAPERCLIP_SHELL_ENV_CHECK_FAILED (shell=${shell}, exit=timeout): unable to verify protected Paperclip run variables before starting OpenCode.`,
+    );
+  }
+
+  const markerLines = result.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith(PAPERCLIP_SHELL_ENV_GUARD_MARKER));
+  const marker = markerLines.length === 1 ? markerLines[0] : null;
+  if (result.exitCode === 0 && marker === `${PAPERCLIP_SHELL_ENV_GUARD_MARKER}ok`) return;
+
+  if (result.exitCode === 78 && marker?.startsWith(PAPERCLIP_SHELL_ENV_GUARD_MARKER)) {
+    const mismatchNames = marker.slice(PAPERCLIP_SHELL_ENV_GUARD_MARKER.length).split(",");
+    const validMismatchNames =
+      mismatchNames.length > 0 &&
+      mismatchNames.every((name) => PROTECTED_PAPERCLIP_SHELL_ENV_KEYS.some((key) => key === name));
+    if (validMismatchNames) {
+      throw new Error(
+        `opencode_local: PAPERCLIP_SHELL_ENV_MISMATCH (${mismatchNames.join(",")}): shell startup changed protected Paperclip run variables; fixed agent credentials must not be sourced when PAPERCLIP_SPAWNED=true.`,
+      );
+    }
+  }
+
+  throw new Error(
+    `opencode_local: PAPERCLIP_SHELL_ENV_CHECK_FAILED (shell=${shell}, exit=${result.exitCode ?? "unknown"}): unable to verify protected Paperclip run variables before starting OpenCode.`,
+  );
+}
 
 export async function ensureRemoteOpenCodeModelConfiguredAndAvailable(input: {
   runId: string;
@@ -366,6 +478,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       throw new Error(
         'opencode_local: adapterConfig.agent conflicts with a literal "--agent" already present in extraArgs/args; remove one.',
       );
+    }
+    if (!executionTargetIsRemote) {
+      await assertPaperclipShellEnvStable({
+        runId,
+        cwd,
+        runtimeEnv,
+        timeoutSec: LOCAL_PAPERCLIP_SHELL_ENV_GUARD_TIMEOUT_SEC,
+        graceSec: LOCAL_PAPERCLIP_SHELL_ENV_GUARD_GRACE_SEC,
+      });
     }
     let restoreRemoteWorkspace: (() => Promise<void>) | null = null;
     let localSkillsDir: string | null = null;

@@ -113,6 +113,7 @@ export async function discoverOpenCodeModels(input: {
   command?: unknown;
   cwd?: unknown;
   env?: unknown;
+  forceRefresh?: boolean;
 } = {}): Promise<AdapterModel[]> {
   const command = resolveOpenCodeCommand(input.command);
   const cwd = asString(input.cwd, process.cwd());
@@ -135,7 +136,7 @@ export async function discoverOpenCodeModels(input: {
   const result = await runChildProcess(
     `opencode-models-${Date.now()}-${Math.random().toString(16).slice(2)}`,
     command,
-    ["models"],
+    input.forceRefresh ? ["models", "--refresh"] : ["models"],
     {
       cwd,
       env: runtimeEnv,
@@ -160,6 +161,7 @@ export async function discoverOpenCodeModelsCached(input: {
   command?: unknown;
   cwd?: unknown;
   env?: unknown;
+  forceRefresh?: boolean;
 } = {}): Promise<AdapterModel[]> {
   const command = resolveOpenCodeCommand(input.command);
   const cwd = asString(input.cwd, process.cwd());
@@ -168,9 +170,9 @@ export async function discoverOpenCodeModelsCached(input: {
   const now = Date.now();
   pruneExpiredDiscoveryCache(now);
   const cached = discoveryCache.get(key);
-  if (cached && cached.expiresAt > now) return cached.models;
+  if (input.forceRefresh !== true && cached && cached.expiresAt > now) return cached.models;
 
-  const models = await discoverOpenCodeModels({ command, cwd, env });
+  const models = await discoverOpenCodeModels({ command, cwd, env, forceRefresh: input.forceRefresh });
   discoveryCache.set(key, { expiresAt: now + MODELS_CACHE_TTL_MS, models });
   return models;
 }
@@ -205,14 +207,24 @@ export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
     env: input.env,
   });
 
-  if (models.length === 0) {
-    throw new Error("OpenCode returned no models. Run `opencode models` and verify provider auth.");
-  }
+  if (models.length === 0 || !models.some((entry) => entry.id === model)) {
+    const refreshedModels = await discoverOpenCodeModelsCached({
+      command: input.command,
+      cwd: input.cwd,
+      env: input.env,
+      forceRefresh: true,
+    });
+    if (refreshedModels.length > 0 && refreshedModels.some((entry) => entry.id === model)) {
+      return refreshedModels;
+    }
 
-  if (!models.some((entry) => entry.id === model)) {
-    const sample = models.slice(0, 12).map((entry) => entry.id).join(", ");
+    if (refreshedModels.length === 0) {
+      throw new Error("OpenCode returned no models. Run `opencode models` and verify provider auth.");
+    }
+
+    const sample = refreshedModels.slice(0, 12).map((entry) => entry.id).join(", ");
     throw new Error(
-      `Configured OpenCode model is unavailable: ${model}. Available models: ${sample}${models.length > 12 ? ", ..." : ""}`,
+      `Configured OpenCode model is unavailable: ${model}. Available models: ${sample}${refreshedModels.length > 12 ? ", ..." : ""}`,
     );
   }
 

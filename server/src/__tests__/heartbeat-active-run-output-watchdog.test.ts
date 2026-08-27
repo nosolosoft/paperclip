@@ -5,6 +5,7 @@ import {
   activityLog,
   agents,
   companies,
+  companyMemberships,
   createDb,
   heartbeatRunEvents,
   heartbeatRunWatchdogDecisions,
@@ -149,6 +150,13 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       issuePrefix,
       defaultResponsibleUserId: "responsible-user",
       requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "responsible-user",
+      membershipRole: "owner",
+      status: "active",
     });
     await db.insert(agents).values([
       {

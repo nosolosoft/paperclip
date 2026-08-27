@@ -13,6 +13,7 @@ import {
   agentWakeupRequests,
   agents,
   companies,
+  companyMemberships,
   companySkills,
   createDb,
   documentRevisions,
@@ -34,6 +35,8 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { seedResponsibleUserMembership } from "./helpers/responsible-user.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 
@@ -102,15 +105,6 @@ async function waitForRunToFinish(heartbeat: Heartbeat, runId: string, timeoutMs
   return heartbeat.getRun(runId);
 }
 
-async function waitForHeartbeatIdle(db: Db, timeoutMs = 5_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const runs = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns);
-    if (!runs.some((run) => run.status === "queued" || run.status === "running")) return;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-}
-
 async function waitForRuntimeStateLastRun(db: Db, agentId: string, runId: string, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -173,6 +167,7 @@ async function seedRunTarget(db: Db, repoRoot: string) {
     createdAt: new Date(),
     updatedAt: new Date(),
   });
+  await seedResponsibleUserMembership(db, companyId);
   await db.insert(projects).values({
     id: projectId,
     companyId,
@@ -275,7 +270,14 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
   }, 20_000);
 
   afterEach(async () => {
-    await waitForHeartbeatIdle(db);
+    // Await every in-flight background heartbeat run to quiescence before the
+    // deletes below. A wakeup claims a run and dispatches its execution
+    // fire-and-forget, and finalization success can dispatch a follow-up
+    // wakeup, so a run or wakeup can still write heartbeat_runs and issues rows
+    // when teardown starts. The shared drain also awaits an in-flight wakeup
+    // that is still before run registration, which a plain run table status
+    // poll cannot see.
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
     adapterExecute.mockReset();
     adapterExecute.mockImplementation(async () => ({
       exitCode: 0,
@@ -307,6 +309,7 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
     await db.delete(executionWorkspaces);
     await db.delete(environments);
     await db.delete(companySkills);
+    await db.delete(companyMemberships);
     await db.delete(companies);
   });
 

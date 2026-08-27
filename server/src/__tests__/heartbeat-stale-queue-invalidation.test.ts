@@ -19,6 +19,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { seedResponsibleUserMembership } from "./helpers/responsible-user.js";
 import {
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
@@ -193,6 +194,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       defaultResponsibleUserId: "responsible-user",
       requireBoardApprovalForNewAgents: false,
     });
+    await seedResponsibleUserMembership(db, companyId);
     await db.insert(agents).values({
       id: agentId,
       companyId,
@@ -365,6 +367,48 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(wakeups[0]?.reason).toBe("heartbeat.timer.no_actionable_work");
     expect(agent?.lastHeartbeatAt).toBeInstanceOf(Date);
     expect(agent?.lastHeartbeatAt?.getTime()).toBeGreaterThan(now.getTime() - 120_000);
+  });
+
+  it("atomically claims a due timer interval across overlapping scheduler ticks", async () => {
+    const { agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+        intervalSec: 60,
+      },
+    });
+    const now = new Date();
+    await db
+      .update(agents)
+      .set({
+        createdAt: new Date(now.getTime() - 120_000),
+        lastHeartbeatAt: null,
+      })
+      .where(eq(agents.id, agentId));
+
+    const results = await Promise.all([
+      heartbeat.tickTimers(now),
+      heartbeat.tickTimers(now),
+    ]);
+
+    expect(results.reduce((total, result) => total + result.enqueued, 0)).toBe(1);
+
+    const runs = await db
+      .select({
+        id: heartbeatRuns.id,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    const [agent] = await db
+      .select({ lastHeartbeatAt: agents.lastHeartbeatAt })
+      .from(agents)
+      .where(eq(agents.id, agentId));
+
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.contextSnapshot).toMatchObject({
+      timerClaimWasFirstHeartbeat: true,
+    });
+    expect(agent?.lastHeartbeatAt?.getTime()).toBeGreaterThanOrEqual(now.getTime());
   });
 
   it("allows generic timer wakes when the agent has assigned todo work", async () => {
@@ -715,7 +759,7 @@ it("runs generic timer wakes by default for proactive agents without assigned is
       wakeupRequestId,
       contextSnapshot: { issueId },
     });
-    await db.insert(issues).values({
+	    await db.insert(issues).values({
       id: issueId,
       companyId,
       title: "Queued issue work",
@@ -1084,7 +1128,8 @@ it("runs generic timer wakes by default for proactive agents without assigned is
         issueId,
         _paperclipWakeContext: {
           issueId,
-          wakeReason: "issue_mention",
+          wakeReason: "issue_comment_mentioned",
+          wakeCommentId: randomUUID(),
         },
       },
       status: "deferred_issue_execution",
@@ -1122,6 +1167,7 @@ it("runs generic timer wakes by default for proactive agents without assigned is
     const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Bookkeeper" });
     const qaAgentId = randomUUID();
     const issueId = randomUUID();
+    const commentId = randomUUID();
     const wakeupRequestId = randomUUID();
     const queuedRunId = randomUUID();
     const deferredWakeupId = randomUUID();
@@ -1200,6 +1246,15 @@ it("runs generic timer wakes by default for proactive agents without assigned is
       executionLockedAt: new Date(Date.now() - 301_000),
     });
 
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId,
+      authorType: "user",
+      authorUserId: "local-board",
+      body: "@QA Browser please verify this issue.",
+    });
+
     await db.insert(agentWakeupRequests).values({
       id: deferredWakeupId,
       companyId,
@@ -1212,7 +1267,8 @@ it("runs generic timer wakes by default for proactive agents without assigned is
         _paperclipWakeContext: {
           issueId,
           taskId: issueId,
-          wakeReason: "qa_browser_requested",
+          wakeReason: "issue_comment_mentioned",
+          wakeCommentId: commentId,
         },
       },
       status: "deferred_issue_execution",

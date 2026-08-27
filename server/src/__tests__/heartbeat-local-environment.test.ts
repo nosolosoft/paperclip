@@ -15,6 +15,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { seedResponsibleUserMembership } from "./helpers/responsible-user.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -110,6 +111,7 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
     });
+    await seedResponsibleUserMembership(db, companyId);
 
     await db.insert(agents).values({
       id: agentId,
@@ -170,6 +172,7 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
     });
+    await seedResponsibleUserMembership(db, companyId);
 
     await db.insert(agents).values({
       id: agentId,

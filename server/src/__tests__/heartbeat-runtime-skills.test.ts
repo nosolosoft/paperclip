@@ -22,8 +22,10 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { seedResponsibleUserMembership } from "./helpers/responsible-user.js";
 import { companySkillService } from "../services/company-skills.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { instanceSettingsService } from "../services/instance-settings.ts";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -110,6 +112,7 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
 
   afterEach(async () => {
     capturedRuns.length = 0;
+    await instanceSettingsService(db).updateExperimental({ enableBetaSkills: false });
     await new Promise((resolve) => setTimeout(resolve, 100));
     await db.execute(sql.raw(`
       TRUNCATE TABLE
@@ -159,6 +162,7 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
     });
+    await seedResponsibleUserMembership(db, companyId);
     await fs.writeFile(path.join(skillDir, "SKILL.md"), "# Runtime Coach\n\nVersion one.\n", "utf8");
     await db.insert(companySkills).values({
       id: skillId,
@@ -228,6 +232,9 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
       },
     ]);
 
+    const settings = instanceSettingsService(db);
+    await settings.updateExperimental({ enableBetaSkills: true });
+
     const heartbeat = heartbeatService(db);
     const firstRun = await heartbeat.invoke(firstAgentId, "on_demand", {}, "manual");
     expect(firstRun).not.toBeNull();
@@ -276,6 +283,49 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
       sourceStatus: "available",
     });
     expect((await fs.stat(firstSkillFile)).mtime.toISOString()).toBe(oldMtime.toISOString());
+
+    await settings.updateExperimental({ enableBetaSkills: false });
+    const defaultRun = await heartbeat.invoke(firstAgentId, "on_demand", {}, "manual");
+    expect(defaultRun).not.toBeNull();
+    expect((await waitForRunToFinish(heartbeat, defaultRun!.id))?.status).toBe("succeeded");
+    const defaultSkill = capturedRuns
+      .filter((run) => run.agentId === firstAgentId)
+      .at(-1)
+      ?.skills.find((entry) => entry.key === skillKey);
+    expect(defaultSkill).toMatchObject({
+      key: skillKey,
+      versionId: null,
+      currentVersionId: versionTwo.id,
+      sourceStatus: "available",
+    });
+    await expect(fs.readFile(path.join(defaultSkill!.source, "SKILL.md"), "utf8"))
+      .resolves.toContain("Version two.");
+    const storedPreference = await db
+      .select({ adapterConfig: agents.adapterConfig })
+      .from(agents)
+      .where(eq(agents.id, firstAgentId))
+      .then((rows) => rows[0]?.adapterConfig);
+    expect(storedPreference).toMatchObject({
+      paperclipSkillSync: {
+        desiredSkills: [{ key: skillKey, versionId: versionOne.id }],
+      },
+    });
+
+    await settings.updateExperimental({ enableBetaSkills: true });
+    const restoredRun = await heartbeat.invoke(firstAgentId, "on_demand", {}, "manual");
+    expect(restoredRun).not.toBeNull();
+    expect((await waitForRunToFinish(heartbeat, restoredRun!.id))?.status).toBe("succeeded");
+    const restoredSkill = capturedRuns
+      .filter((run) => run.agentId === firstAgentId)
+      .at(-1)
+      ?.skills.find((entry) => entry.key === skillKey);
+    expect(restoredSkill).toMatchObject({
+      versionId: versionOne.id,
+      currentVersionId: versionTwo.id,
+      sourceStatus: "available",
+    });
+    await expect(fs.readFile(path.join(restoredSkill!.source, "SKILL.md"), "utf8"))
+      .resolves.toContain("Version one.");
   });
 
   it("delivers installed connections without exposing gateway bearers in adapter config or logs", async () => {
@@ -288,6 +338,7 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
     });
+    await seedResponsibleUserMembership(db, companyId);
     await db.insert(agents).values({
       id: agentId,
       companyId,

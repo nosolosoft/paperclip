@@ -10,6 +10,7 @@ const mockProjectService = vi.hoisted(() => ({
   create: vi.fn(),
   getById: vi.fn(),
   update: vi.fn(),
+  validateQaPolicy: vi.fn(async () => undefined),
   createWorkspace: vi.fn(),
   remove: vi.fn(),
   resolveByReference: vi.fn(),

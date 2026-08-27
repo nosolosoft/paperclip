@@ -18,6 +18,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { seedResponsibleUserMembership } from "./helpers/responsible-user.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
@@ -117,6 +118,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
       createdAt: new Date(),
       updatedAt: new Date(),
     });
+    await seedResponsibleUserMembership(db, companyId);
     await db.insert(projects).values({
       id: projectId,
       companyId,
@@ -213,6 +215,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
       companyId,
       environmentId,
       executionWorkspaceId: expect.any(String),
+      executionWorkspaceSettings: null,
       issueId: null,
       config: { template: "base" },
       agentId,
@@ -360,6 +363,8 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
         updatedAt: new Date(),
       },
     ]);
+    await seedResponsibleUserMembership(db, companyAId, "responsible-user-a");
+    await seedResponsibleUserMembership(db, companyBId, "responsible-user-b");
     await db.insert(projects).values([
       {
         id: projectAId,
@@ -523,6 +528,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
       createdAt: new Date(),
       updatedAt: new Date(),
     });
+    await seedResponsibleUserMembership(db, companyId);
     await db.insert(projects).values({
       id: projectId,
       companyId,
@@ -674,6 +680,7 @@ describeEmbeddedPostgres("heartbeat plugin environments", () => {
       companyId,
       environmentId: newEnvironmentId,
       executionWorkspaceId: expect.any(String),
+      executionWorkspaceSettings: { mode: "shared_workspace" },
       issueId,
       config: { template: "new" },
       agentId,

@@ -12,6 +12,7 @@ import {
   agentWakeupRequests,
   agents,
   companies,
+  companyMemberships,
   companySkills,
   createDb,
   documentRevisions,
@@ -35,7 +36,10 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { seedResponsibleUserMembership } from "./helpers/responsible-user.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/index.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
@@ -131,6 +135,7 @@ async function readGit(cwd: string, args: string[]) {
 async function createGitRepo() {
   const repoRoot = await mkdtemp(path.join(os.tmpdir(), "paperclip-branch-containment-repo-"));
   await runGit(repoRoot, ["init"]);
+  await runGit(repoRoot, ["config", "core.hooksPath", "/dev/null"]);
   await runGit(repoRoot, ["config", "user.email", "paperclip-test@example.com"]);
   await runGit(repoRoot, ["config", "user.name", "Paperclip Test"]);
   await writeFile(path.join(repoRoot, "README.md"), "branch containment\n", "utf8");
@@ -168,21 +173,6 @@ async function waitForRunToFinish(heartbeat: Heartbeat, runId: string, timeoutMs
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   return heartbeat.getRun(runId);
-}
-
-async function waitForHeartbeatIdle(db: Db, timeoutMs = 5_000) {
-  const deadline = Date.now() + timeoutMs;
-  let idleSince: number | null = null;
-  while (Date.now() < deadline) {
-    const runs = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns);
-    if (!runs.some((run) => run.status === "queued" || run.status === "running")) {
-      idleSince ??= Date.now();
-      if (Date.now() - idleSince >= 250) return;
-    } else {
-      idleSince = null;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
 }
 
 async function deleteHeartbeatRunsForCleanup(db: Db) {
@@ -235,7 +225,7 @@ async function waitForContainmentSideEffects(input: {
     const hasRecoveryActionComment = recoveryActionId
       ? comments.some((comment) =>
           comment.issueId === input.sourceIssueId &&
-          comment.body.includes(`Recovery action: \`${recoveryActionId}\``))
+          noticeMetadataReferencesRecoveryAction(comment.metadata, recoveryActionId))
       : false;
     if (
       source?.status === "blocked" &&
@@ -348,6 +338,7 @@ async function seedBranchContainmentRun(
     createdAt: now,
     updatedAt: now,
   });
+  await seedResponsibleUserMembership(db, companyId);
   await db.insert(projects).values({
     id: projectId,
     companyId,
@@ -699,7 +690,10 @@ async function expectContainedWorkspaceBranchFailure(input: {
     }),
   });
 
-  expect(comments.filter((comment) => comment.issueId === input.sourceIssueId && comment.body.includes(`Recovery action: \`${action.id}\``))).toHaveLength(1);
+  expect(comments.filter((comment) =>
+    comment.issueId === input.sourceIssueId &&
+    noticeMetadataReferencesRecoveryAction(comment.metadata, action.id),
+  )).toHaveLength(1);
   expect(comments.filter((comment) => comment.issueId === input.sameWorkspaceSiblingId)).toHaveLength(0);
   expect(comments.filter((comment) => comment.issueId === input.otherWorkspaceSiblingId)).toHaveLength(0);
 }
@@ -826,14 +820,10 @@ async function expectForwardBranchReconciled(input: {
       ]),
     );
     if (resolvedRecoveryActionId) {
-      expect(comments).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            authorType: "system",
-            body: expect.stringContaining(`Recovery action: \`${resolvedRecoveryActionId}\``),
-          }),
-        ]),
-      );
+      expect(comments.some((comment) =>
+        comment.authorType === "system" &&
+        noticeMetadataReferencesRecoveryAction(comment.metadata, resolvedRecoveryActionId),
+      )).toBe(true);
     }
 
     const activities = await input.db
@@ -875,7 +865,14 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
   }, 20_000);
 
   afterEach(async () => {
-    await waitForHeartbeatIdle(db);
+    // Await every in-flight background heartbeat run to quiescence before the
+    // deletes below. resumeQueuedRuns claims a run and dispatches its execution
+    // fire-and-forget, and the containment path can dispatch a follow-up
+    // recovery wakeup, so a run or wakeup can still write heartbeat_runs and
+    // issues rows when teardown starts. The shared drain also awaits an
+    // in-flight wakeup that is still before run registration, which a plain run
+    // table status poll cannot see.
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
     adapterExecute.mockReset();
     adapterExecute.mockImplementation(async () => ({
       exitCode: 0,
@@ -912,6 +909,7 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
     await db.delete(executionWorkspaces);
     await db.delete(environments);
     await db.delete(companySkills);
+    await db.delete(companyMemberships);
     await db.delete(companies);
   });
 
@@ -935,6 +933,7 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
       status: "active",
       defaultResponsibleUserId: "responsible-user",
     });
+    await seedResponsibleUserMembership(db, companyId);
     await db.insert(agents).values({
       id: agentId,
       companyId,
@@ -968,7 +967,7 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
       },
     });
 
-    const heartbeat = heartbeatService(db);
+    const heartbeat = heartbeatService(db, { runtimeEnv: {} });
     const run = await heartbeat.wakeup(agentId, {
       source: "assignment",
       triggerDetail: "system",
@@ -1046,62 +1045,75 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
   });
 
   it.each([
-    ["workspace-runtime fresh worktree reuse", "fresh_realize" as const, null],
-    ["workspace-runtime persisted restore", "persisted_restore" as const, "source-workspace"],
-  ])("contains mid-change branch divergence at %s", async (_name, callSite, expectedWorkspaceId) => {
+    ["workspace-runtime fresh worktree reuse", "fresh_realize" as const, false],
+    ["workspace-runtime persisted restore", "persisted_restore" as const, true],
+  ])("self-heals non-forward branch divergence at %s", async (_name, callSite, preservesWorkspaceId) => {
     const repoRoot = await createGitRepo();
     tempRoots.push(repoRoot);
-    const seeded = await seedBranchContainmentRun(db, repoRoot, callSite);
-
-    if (callSite === "finalize") {
-      adapterExecute.mockImplementationOnce(async (adapterInput) => {
-        const workspace = readAdapterWorkspace(adapterInput);
-        const actualBranch = `${workspace.branchName.replace(/-recorded$/, "")}-actual`;
-        await db
-          .update(issues)
-          .set({
-            executionWorkspaceId: workspace.executionWorkspaceId,
-            executionWorkspacePreference: "reuse_existing",
-            executionWorkspaceSettings: { mode: "isolated_workspace" },
-            updatedAt: new Date(),
-          })
-          .where(eq(issues.id, seeded.sameWorkspaceSiblingId));
-        await runGit(workspace.cwd, ["checkout", "-b", actualBranch]);
-        await writeFile(path.join(workspace.cwd, "actual-branch.txt"), "actual branch work\n", "utf8");
-        await runGit(workspace.cwd, ["add", "actual-branch.txt"]);
-        await runGit(workspace.cwd, ["commit", "-m", "Add actual branch work"]);
-        return {
-          exitCode: 0,
-          signal: null,
-          timedOut: false,
-          summary: "Adapter completed after switching to an unrecorded branch.",
-          provider: "test",
-          model: "test-model",
-        };
-      });
-    }
-
-    const heartbeat = heartbeatService(db);
-    await heartbeat.resumeQueuedRuns();
-
-    await expectContainedWorkspaceBranchFailure({
-      db,
-      heartbeat,
-      runId: seeded.runId,
-      companyId: seeded.companyId,
-      sourceIssueId: seeded.sourceIssueId,
-      sameWorkspaceSiblingId: seeded.sameWorkspaceSiblingId,
-      otherWorkspaceSiblingId: seeded.otherWorkspaceSiblingId,
-      sourceExecutionWorkspaceId:
-        expectedWorkspaceId === "source-workspace"
-          ? seeded.sourceExecutionWorkspaceId
-          : expectedWorkspaceId === "runtime-workspace"
-            ? undefined
-            : null,
-      expectedBranch: seeded.expectedBranch,
-      actualBranch: seeded.actualBranch,
+    const seeded = await seedBranchContainmentRun(db, repoRoot, callSite, {
+      enableWorkspaceBranchReconcileForward: false,
     });
-    expect(adapterExecute).toHaveBeenCalledTimes(callSite === "finalize" ? 1 : 0);
+    const actualHead = await readGit(repoRoot, ["rev-parse", seeded.actualBranch]);
+
+    const heartbeat = heartbeatService(db, { runtimeEnv: {} });
+    await heartbeat.resumeQueuedRuns();
+    const finishedRun = await waitForRunToFinish(heartbeat, seeded.runId, 10_000);
+
+    expect(finishedRun).toMatchObject({ status: "succeeded", errorCode: null });
+    const adapterWorkspace = readAdapterWorkspace(adapterExecute.mock.calls[0]?.[0]);
+    expect(adapterWorkspace).toMatchObject({
+      cwd: repoRoot,
+      branchName: seeded.expectedBranch,
+    });
+    if (preservesWorkspaceId) {
+      expect(adapterWorkspace.executionWorkspaceId).toBe(seeded.sourceExecutionWorkspaceId);
+    } else {
+      expect(adapterWorkspace.executionWorkspaceId).not.toBe(seeded.sourceExecutionWorkspaceId);
+    }
+    await expect(readGit(repoRoot, ["rev-parse", seeded.actualBranch])).resolves.toBe(actualHead);
+    await expect(readGit(repoRoot, ["worktree", "list", "--porcelain"])).resolves.not.toContain(seeded.worktreePath);
+    expect(adapterExecute).toHaveBeenCalledTimes(1);
+  }, 30_000);
+
+  it("keeps managed forward branch reconciliation enabled at heartbeat finalization", async () => {
+    const repoRoot = await createGitRepo();
+    tempRoots.push(repoRoot);
+    const seeded = await seedBranchContainmentRun(db, repoRoot, "finalize", {
+      enableWorkspaceBranchReconcileForward: false,
+    });
+
+    adapterExecute.mockImplementationOnce(async (adapterInput) => {
+      const workspace = readAdapterWorkspace(adapterInput);
+      const actualBranch = `${workspace.branchName.replace(/-recorded$/, "")}-actual`;
+      await db
+        .update(issues)
+        .set({
+          executionWorkspaceId: workspace.executionWorkspaceId,
+          executionWorkspacePreference: "reuse_existing",
+          executionWorkspaceSettings: { mode: "isolated_workspace" },
+          updatedAt: new Date(),
+        })
+        .where(eq(issues.id, seeded.sameWorkspaceSiblingId));
+      await runGit(workspace.cwd, ["checkout", "-b", actualBranch]);
+      await writeFile(path.join(workspace.cwd, "actual-branch.txt"), "actual branch work\n", "utf8");
+      await runGit(workspace.cwd, ["add", "actual-branch.txt"]);
+      await runGit(workspace.cwd, ["commit", "-m", "Add actual branch work"]);
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        summary: "Adapter completed after switching to an unrecorded branch.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    const heartbeat = heartbeatService(db, { runtimeEnv: {} });
+    await heartbeat.resumeQueuedRuns();
+    const finishedRun = await waitForRunToFinish(heartbeat, seeded.runId, 10_000);
+
+    expect(finishedRun).toMatchObject({ status: "succeeded", errorCode: null });
+    expect(adapterExecute).toHaveBeenCalledTimes(1);
   }, 30_000);
 
   it.each([

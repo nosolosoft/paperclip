@@ -8,6 +8,7 @@ import {
   agentWakeupRequests,
   agents,
   companies,
+  companyMemberships,
   companySkills,
   createDb,
   documentRevisions,
@@ -24,6 +25,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { seedResponsibleUserMembership } from "./helpers/responsible-user.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
 
@@ -114,6 +116,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     await db.delete(agentRuntimeState);
     await db.delete(agents);
     await db.delete(companySkills);
+    await db.delete(companyMemberships);
     await db.delete(companies);
   }
 
@@ -163,6 +166,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
     });
+    await seedResponsibleUserMembership(db, companyId);
 
     await db.insert(agents).values({
       id: agentId,

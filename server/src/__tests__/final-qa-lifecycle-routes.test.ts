@@ -179,10 +179,6 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
       status: "in_progress",
       qaPolicy: { mode: "final", finalQaAgentId: qaAgentId },
     });
-    await db.insert(heartbeatRuns).values([
-      { id: engineerRunId, companyId, agentId: engineerId, status: "running", responsibleUserId },
-      { id: qaRunId, companyId, agentId: qaAgentId, status: "running", responsibleUserId },
-    ]);
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -201,6 +197,26 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
       assigneeAgentId: engineerId,
       originalEngineerAssigneeAgentId: engineerId,
     });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: engineerRunId,
+        companyId,
+        agentId: engineerId,
+        issueId,
+        status: "running",
+        responsibleUserId,
+        contextSnapshot: { issueId },
+      },
+      {
+        id: qaRunId,
+        companyId,
+        agentId: qaAgentId,
+        issueId,
+        status: "running",
+        responsibleUserId,
+        contextSnapshot: { issueId },
+      },
+    ]);
     await db.insert(issueWorkProducts).values({
       companyId,
       projectId,
@@ -361,6 +377,7 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
       returnAssignee: { type: "agent", agentId: seeded.engineerId, userId: null },
       reviewRequest: null,
       completedStageIds: [pendingStage.id],
+      changesRequestedCount: 0,
       lastDecisionId: decision.id,
       lastDecisionOutcome: "approved",
       qaVerdict: "pass",

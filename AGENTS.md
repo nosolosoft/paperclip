@@ -29,6 +29,10 @@ Before making changes, read in this order:
 - `packages/adapters/`: agent adapter implementations (Claude, Codex, Cursor, etc.)
 - `packages/adapter-utils/`: shared adapter utilities
 - `packages/plugins/`: plugin system packages
+- `packages/skills-catalog/`: app-shipped skills catalog (`@paperclipai/skills-catalog`)
+- `packages/teams-catalog/`: app-shipped teams catalog (`@paperclipai/teams-catalog`)
+- `cli/`: `paperclipai` CLI package (published bin, agent-facing commands)
+- `skills/`: Paperclip runtime/operational skills (not part of the app catalog)
 - `doc/`: operational and product docs
 
 ## 4. Dev Setup (Auto DB)
@@ -182,7 +186,7 @@ A change is done when all are true:
 4. Docs updated when behavior or commands change
 5. PR description follows the [PR template](.github/PULL_REQUEST_TEMPLATE.md) with all sections filled in (including Model Used)
 
-## 11. Branch and Code-Graph Workflow
+## 12. Branch and Code-Graph Workflow
 
 This fork's canonical local integration branch is `paperclip-stable-auto`.
 
@@ -199,7 +203,7 @@ For codebase exploration, prefer the indexed graph tools before raw file scans:
 - Use TokenSave tools for affected tests, dependency impact, type diagnostics, and persisted decisions. Do not initialize a missing index automatically.
 - Fall back to `Glob`, `Grep`, and file reads only for unindexed files, documentation, configuration, or details the graph cannot provide.
 
-## 12. Fork-Specific: HenkDz/paperclip
+## 13. Fork-Specific: HenkDz/paperclip
 
 This is a fork of `paperclipai/paperclip` with QoL patches and a **built-in** Hermes adapter story on branch `feat/externalize-hermes-adapter` ([tree](https://github.com/HenkDz/paperclip/tree/feat/externalize-hermes-adapter)).
 
@@ -241,6 +245,6 @@ PR #2218 (`feat/external-adapter-phase1`) adds external adapter support. See roo
 - Built-in UI adapters can shadow external plugin parsers; external override pause/resume should restore the built-in parser.
 - Reference external adapters: Droid (npm); Hermes can also be tested as an override package.
 
-## 13. Design system
+## 14. Design system
 
 `DESIGN.md` at the repo root is the source of truth for UI design decisions. The token-only rule applies to all `ui/` changes: every color, spacing, radius, type, shadow, and motion value in `ui/src/components/**` and `ui/src/pages/**` comes from the token layer in `ui/src/index.css` — no hex, raw px, arbitrary Tailwind bracket values, or raw `font-size`/`fontSize` declarations in components, outside the documented allowlist in `ui/src/index.css`. Run `pnpm check:token-gates` (`scripts/check-token-gates.mjs`) before committing UI changes — it fails on any violation not covered by that allowlist.

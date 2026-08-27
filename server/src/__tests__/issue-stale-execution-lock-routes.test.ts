@@ -147,6 +147,9 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       executionAgentNameKey: "codexcoder",
       executionLockedAt: new Date(),
     });
+    await db.update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, currentRunId));
 
     const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
       .patch(`/api/issues/${issueId}`)
@@ -174,7 +177,6 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
   it.each([
     { status: "done" as const, title: "Done release preserves status", completedAt: new Date() },
     { status: "cancelled" as const, title: "Cancelled release preserves status", cancelledAt: new Date() },
-    { status: "in_review" as const, title: "In review release preserves status" },
     { status: "blocked" as const, title: "Blocked release preserves status" },
   ])(
     "preserves $status when releasing a non-in_progress issue",
@@ -223,6 +225,33 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       });
     },
   );
+
+  it("rejects agent release of an in-review issue without a review path", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "In review release requires disposition",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      checkoutRunId: currentRunId,
+      executionRunId: currentRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/release`)
+      .send();
+
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({
+      code: "invalid_issue_disposition",
+      details: { missing: "review_path", issueId, status: "in_review" },
+    });
+  });
 
   it("allows the rightful assignee to release after the owning run failed", async () => {
     const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
@@ -290,6 +319,9 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       executionAgentNameKey: "codexcoder",
       executionLockedAt: new Date(),
     });
+    await db.update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, currentRunId));
 
     const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
       .patch(`/api/issues/${issueId}`)

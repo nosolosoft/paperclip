@@ -140,7 +140,6 @@ function flushChildStderr(state: ChildStderrState) {
 type AcpxAgentProcessIdentity = { pid: number; startedAt: string };
 
 type PaperclipAcpRuntimeOptions = AcpRuntimeOptions & {
-  onAgentSpawn?: (meta: AcpxAgentProcessIdentity) => Promise<void>;
   // Return the current-run parent-context token. It is the `task.run` token
   // during startup and after the turn, and the `agent.turn` token during the
   // turn. A detached exec reads this getter to parent to the live run span. The
@@ -2363,7 +2362,77 @@ function renderApiAccessNote(env: Record<string, string>): string {
   return lines.join("\n");
 }
 
-async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean, env: Record<string, string>): Promise<{
+// A `mode: persistent` warm session reuses the SAME already-running acpx agent
+// process across every heartbeat run that lands on it — the process's OS
+// environment is fixed at its original spawn and is never re-injected per
+// turn, because there is no portable way to change a running process's env
+// from outside. The warm-handle reuse fingerprint (see `adapterEnvHash`
+// above) deliberately excludes the per-run `PAPERCLIP_API_KEY`/`PAPERCLIP_RUN_ID`
+// et al, so a resumed turn never forces a respawn on their account — meaning
+// every turn after the first silently keeps authenticating as (and reporting
+// the run id of) whichever run first spawned this session, until the warm
+// handle is eventually evicted. Confirmed in production: a resumed OMP run
+// found `PAPERCLIP_API_KEY` empty in its shell, and a separate resumed OMP
+// run found a stale, unrelated token there — both from a shell that was
+// never told about the current turn's values.
+//
+// Fix: regenerate a small, gitignore-convention (`.paperclip-runtime/`)
+// runtime-env file on every RESUMED turn with this turn's actual
+// PAPERCLIP_* values, and point the agent at its PATH (never the raw values)
+// via a prompt note. The file only ever touches the local host filesystem
+// (`prepared.cwd` is host-valid on the local lane; on the remote-sandboxed
+// lane it is host-nonexistent, so the write cleanly no-ops via the catch
+// below — a known gap on that lane, not a regression). Never put the literal
+// token in prompt text: prompt content is logged/stored as a run event and
+// is not covered by the structured-field secret redaction that protects
+// `meta.env`.
+const PAPERCLIP_RUNTIME_ENV_REFRESH_RELATIVE_PATH = path.join(".paperclip-runtime", "runtime-env.sh");
+
+async function refreshPaperclipRuntimeEnvFile(
+  cwd: string,
+  env: Record<string, string>,
+  onLog: AdapterExecutionContext["onLog"],
+): Promise<string | null> {
+  const entries = Object.entries(env)
+    .filter(([key]) => isPaperclipRuntimeEnvKey(key))
+    .sort(([a], [b]) => a.localeCompare(b));
+  if (entries.length === 0) return null;
+  const refreshPath = path.join(cwd, PAPERCLIP_RUNTIME_ENV_REFRESH_RELATIVE_PATH);
+  try {
+    await fs.mkdir(path.dirname(refreshPath), { recursive: true });
+    const script = [
+      "# Paperclip-managed. Regenerated at the start of every turn of this resumed",
+      "# session so PAPERCLIP_* values stay current even though this session's shell",
+      "# was first started on an earlier, now-stale run. Never edit or commit this file.",
+      ...entries.map(([key, value]) => `export ${key}=${shellQuote(value)}`),
+      "",
+    ].join("\n");
+    await fs.writeFile(refreshPath, script, { mode: 0o600 });
+    return PAPERCLIP_RUNTIME_ENV_REFRESH_RELATIVE_PATH;
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    await onLog(
+      "stderr",
+      `[paperclip] Warning: could not refresh resumed-session runtime env file: ${reason}\n`,
+    );
+    return null;
+  }
+}
+
+function renderPaperclipEnvRefreshNote(relativeRefreshPath: string | null): string {
+  if (!relativeRefreshPath) return "";
+  return [
+    "Paperclip runtime refresh (resumed session):",
+    "This session's shell was first started on an earlier run. PAPERCLIP_API_KEY, PAPERCLIP_RUN_ID,",
+    "and other PAPERCLIP_* values it inherited from that spawn are now stale — the current run has",
+    "fresh ones. Before making any Paperclip API call or trusting a PAPERCLIP_* value this turn, run:",
+    `  . ${shellQuote(relativeRefreshPath)}`,
+    "from the workspace root to load the current values into your shell.",
+  ].join("\n");
+}
+
+
+async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean, env: Record<string, string>, cwd: string): Promise<{
   prompt: string;
   promptMetrics: Record<string, number>;
   commandNotes: string[];
@@ -2421,6 +2490,8 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
   const paperclipEnvNote = renderPaperclipEnvNote(env);
+  const envRefreshPath = resumedSession ? await refreshPaperclipRuntimeEnvFile(cwd, env, onLog) : null;
+  const envRefreshNote = renderPaperclipEnvRefreshNote(envRefreshPath);
   const apiAccessNote = renderApiAccessNote(env);
   const prompt = joinPromptSections([
     promptInstructionsPrefix,
@@ -2429,6 +2500,7 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
     sessionHandoffNote,
     taskContextNote,
     paperclipEnvNote,
+    envRefreshNote,
     apiAccessNote,
     renderedPrompt,
   ]);
@@ -3452,6 +3524,16 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           // fingerprint / compat key are unaffected — this redirects ONLY the host
           // `spawn()` `chdir`, not the in-sandbox data path.
           spawnCwd: prepared.hostSpawnCwd,
+          // The child environment travels here, NOT through `sessionOptions.env`.
+          // acpx persists `sessionOptions` into its on-disk session record and
+          // replays it on every reconnect, so routing `PAPERCLIP_API_KEY` and the
+          // adapter's own provider tokens through it wrote live secrets to disk and
+          // resurrected a dead run's credentials whenever a session reconnected.
+          // `agentProcessEnv` is the upstream child-only overlay: same spawn-time
+          // precedence (it is applied last, after auth credentials), never
+          // serialized. A live child still holds the env it was spawned with, which
+          // is what the resumed-turn refresh file below exists to correct.
+          agentProcessEnv: prepared.env,
           sessionStore: createRuntimeStore({ stateDir: prepared.stateDir }),
           agentRegistry: prepared.agentRegistry,
           permissionMode: prepared.permissionMode,
@@ -3465,13 +3547,18 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           onAgentStderr: prepared.childStderrLogPath
             ? (chunk) => routeChildStderr(childStderrState, chunk)
             : undefined,
-          onAgentSpawn: async (meta) => {
-            processIdentitySink.latest = meta;
-            await processIdentitySink.current?.({
-              pid: meta.pid,
-              processGroupId: null,
-              startedAt: meta.startedAt,
-            });
+          // Upstream admission hook (acpx >= 0.15.0). Rejecting it aborts the
+          // startup and acpx terminates the already-spawned child, which is the
+          // same contract the removed `onAgentSpawn` patch hunk provided.
+          processLifecycle: {
+            onSpawned: async (meta) => {
+              processIdentitySink.latest = { pid: meta.pid, startedAt: meta.startedAt };
+              await processIdentitySink.current?.({
+                pid: meta.pid,
+                processGroupId: null,
+                startedAt: meta.startedAt,
+              });
+            },
           },
           getRuntimeParentContext,
         };
@@ -3521,7 +3608,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                   mode: prepared.mode,
                   cwd: prepared.cwd,
                   resumeSessionId,
-                  sessionOptions: { env: prepared.env },
+                  // No `sessionOptions.env`: see `agentProcessEnv` above.
                 });
                 ensureSessionMs = now() - ensureSessionStart;
                 return established;
@@ -3552,7 +3639,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                   agent: prepared.acpxAgent,
                   mode: prepared.mode,
                   cwd: prepared.cwd,
-                  sessionOptions: { env: prepared.env },
+                  // No `sessionOptions.env`: see `agentProcessEnv` above.
                 });
                 retryEnsureSessionMs = now() - ensureSessionStart;
                 return established;
@@ -3783,7 +3870,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // Build the prompt and emit the run metadata inside the turn failure
         // boundary. A failure here settles the runtime through the turn catch and
         // returns an error result with phase `prepare_turn`.
-        const { prompt, promptMetrics, commandNotes } = await buildPrompt(ctx, resumedSession, prepared.env);
+        const { prompt, promptMetrics, commandNotes } = await buildPrompt(ctx, resumedSession, prepared.env, prepared.cwd);
         const runPrompt = joinPromptSections([prepared.skillPromptInstructions, prompt]);
         await emitAcpxLog(ctx, {
           type: "acpx.session",

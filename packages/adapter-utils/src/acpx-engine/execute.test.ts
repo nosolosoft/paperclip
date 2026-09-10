@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AcpRuntimeOptions } from "acpx/runtime";
+import type { AcpProcessStarted, AcpRuntimeOptions } from "acpx/runtime";
 import type { AdapterExecutionContext, AdapterRuntimeMcpAccess } from "@paperclipai/adapter-utils";
 import {
   DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC,
@@ -43,6 +43,23 @@ import {
 
 
 const tempRoots: string[] = [];
+
+/** Drive the upstream acpx spawn-admission hook the way a real launch would. */
+async function announceAgentSpawn(
+  options: AcpRuntimeOptions,
+  meta: { pid: number; startedAt: string },
+): Promise<void> {
+  const started: AcpProcessStarted = {
+    launchId: `launch-${meta.pid}`,
+    scope: { kind: "client" },
+    command: "node",
+    args: [],
+    cwd: options.cwd,
+    pid: meta.pid,
+    startedAt: meta.startedAt,
+  };
+  await options.processLifecycle?.onSpawned?.(started);
+}
 
 async function makeTempRoot() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-acpx-skills-"));
@@ -164,7 +181,7 @@ async function runExecutor(
     startupTraceContext?: AdapterExecutionContext["startupTraceContext"];
   } = {},
 ) {
-  const runtimeOptions: Record<string, unknown>[] = [];
+  const runtimeOptions: AcpRuntimeOptions[] = [];
   const configOptions: Array<{ key: string; value: string }> = [];
   const sessionInputs: Record<string, unknown>[] = [];
   const meta: Record<string, unknown>[] = [];
@@ -175,7 +192,7 @@ async function runExecutor(
       ? { prepareRemoteManagedHome: options.prepareRemoteManagedHome }
       : {}),
     createRuntime: (options) => {
-      runtimeOptions.push(options as unknown as Record<string, unknown>);
+      runtimeOptions.push(options);
       return buildRuntime(
         ({ key, value }) => configOptions.push({ key, value }),
         (input) => sessionInputs.push(input),
@@ -348,12 +365,9 @@ describe("shared ACPX engine runtime behavior", () => {
       warmHandles,
       createRuntime: (options) => {
         runtimeCreateCount += 1;
-        const patchedOptions = options as AcpRuntimeOptions & {
-          onAgentSpawn?: (meta: { pid: number; startedAt: string }) => Promise<void>;
-        };
         return {
           ensureSession: async () => {
-            await patchedOptions.onAgentSpawn?.({ pid: processPid, startedAt });
+            await announceAgentSpawn(options, { pid: processPid, startedAt });
             return {
               backendSessionId: "backend-session",
               agentSessionId: "agent-session",
@@ -910,17 +924,14 @@ describe("shared ACPX engine runtime behavior", () => {
         "custom-a",
       ),
     ).toBe("node ./fake-acp.js");
-    expect(
-      (second.sessionInputs[0]!.sessionOptions as { env: Record<string, string> }).env
-        .PAPERCLIP_API_KEY,
-    ).toBe("new-key");
+    expect(second.runtimeOptions[0]!.agentProcessEnv!.PAPERCLIP_API_KEY).toBe("new-key");
     await expect(fs.access(path.join(stateDir, "wrappers"))).rejects.toThrow();
   });
 
-  it("forwards resolved adapter env through session options without overriding runtime vars", async () => {
+  it("forwards resolved adapter env to the child without overriding runtime vars", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
-    const { sessionInputs } = await runExecutor(
+    const { runtimeOptions } = await runExecutor(
       {
         agentCommand: "node ./fake-acp.js",
         stateDir,
@@ -941,7 +952,7 @@ describe("shared ACPX engine runtime behavior", () => {
         context: { taskId: "issue-real", wakeReason: "issue_assigned" },
       },
     );
-    const env = (sessionInputs[0]!.sessionOptions as { env: Record<string, string> }).env;
+    const env = runtimeOptions[0]!.agentProcessEnv!;
     expect(env.OOGA_BOOGA_123).toBe("plain-value");
     expect(env.OPENROUTER_API_KEY).toBe("resolved-secret-value");
     expect(env.PAPERCLIP_TASK_ID).toBe("issue-real");
@@ -1154,15 +1165,15 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(fp(after)).not.toBe(fp(before));
   });
 
-  it("shapes ACPX session env for remote execution identities", async () => {
+  it("shapes the ACPX child env for remote execution identities", async () => {
     const root = await makeTempRoot();
     const localCwd = path.join(root, "local");
     const remoteCwd = "/workspace/remote";
-    const { sessionInputs, runtimeOptions } = await runExecutor(
+    const { runtimeOptions } = await runExecutor(
       { agent: "custom", agentCommand: "node ./fake-acp.js", cwd: localCwd, stateDir: path.join(root, "state") },
       { context: { paperclipWorkspace: { cwd: localCwd, workspaceWorktreePath: localCwd } }, executionTarget: { kind: "remote", transport: "ssh", remoteCwd } },
     );
-    const env = (sessionInputs[0]!.sessionOptions as { env: Record<string, string> }).env;
+    const env = runtimeOptions[0]!.agentProcessEnv!;
     expect(env.PAPERCLIP_WORKSPACE_CWD).toBe(localCwd);
     // The ssh remote transport is NOT the runner-backed process-session lane, so
     // it stays byte-identical: no host-spawn redirect. `cwd` is the host cwd and
@@ -1178,19 +1189,13 @@ describe("shared ACPX engine runtime behavior", () => {
     await expect(fs.access(path.join(stateDir, "wrappers"))).rejects.toThrow();
   });
 
-  it("keeps concurrent credentials isolated in their session options", async () => {
+  it("keeps concurrent credentials isolated in their child env", async () => {
     const [first, second] = await Promise.all([
       runExecutor({ agent: "custom", agentCommand: "node ./fake-acp.js" }, { authToken: "first" }),
       runExecutor({ agent: "custom", agentCommand: "node ./fake-acp.js" }, { authToken: "second" }),
     ]);
-    expect(
-      (first.sessionInputs[0]!.sessionOptions as { env: Record<string, string> }).env
-        .PAPERCLIP_API_KEY,
-    ).toBe("first");
-    expect(
-      (second.sessionInputs[0]!.sessionOptions as { env: Record<string, string> }).env
-        .PAPERCLIP_API_KEY,
-    ).toBe("second");
+    expect(first.runtimeOptions[0]!.agentProcessEnv!.PAPERCLIP_API_KEY).toBe("first");
+    expect(second.runtimeOptions[0]!.agentProcessEnv!.PAPERCLIP_API_KEY).toBe("second");
   });
 
   it("enriches acpx.error diagnostics and child stderr when ensureSession rejects", async () => {
@@ -1468,12 +1473,12 @@ describe("shared ACPX engine runtime behavior", () => {
     await expect(fs.readFile(path.join(stateDir, "run-stderr", "run-warm-2.log"), "utf8")).resolves.toContain("current-run-stderr");
   });
 
-  it("passes Paperclip env through ACPX session options instead of process.env", async () => {
+  it("passes Paperclip env to the ACPX child overlay instead of process.env", async () => {
     let observedSessionEnv: Record<string, string> | undefined;
     const execute = createAcpxEngineExecutor({
-      createRuntime: () => ({
-        ensureSession: async (input: { sessionOptions?: { env?: Record<string, string> } }) => {
-          observedSessionEnv = input.sessionOptions?.env;
+      createRuntime: (options) => ({
+        ensureSession: async () => {
+          observedSessionEnv = options.agentProcessEnv;
           return { backendSessionId: "backend-session", agentSessionId: "agent-session", runtimeSessionName: "runtime-session" };
         },
         startTurn: () => ({
@@ -4432,6 +4437,76 @@ describe("ACPX engine per-step startup timing (run.startup.step events)", () => 
     expect(handshakeEvents[0]!.payload?.durationMs).toBe(0);
   });
 
+  it("refreshes stale PAPERCLIP_* values for a resumed warm session without leaking them into the prompt", async () => {
+    const root = await makeTempRoot();
+    const localCwd = path.join(root, "worktree");
+    await fs.mkdir(localCwd, { recursive: true });
+    const stateDir = path.join(root, "state");
+    const warmHandles = new Map();
+    const meta: Record<string, unknown>[] = [];
+    const execute = createAcpxEngineExecutor({
+      warmHandles,
+      createRuntime: () => buildRuntime() as never,
+    });
+    const config = {
+      agent: "custom",
+      agentCommand: "node ./fake-acp.js",
+      cwd: localCwd,
+      stateDir,
+      mode: "persistent",
+      warmHandleIdleMs: 60_000,
+    };
+    const first = await execute({
+      runId: "run-warm-1",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config,
+      context: {},
+      authToken: "first-turn-secret",
+      onLog: async () => {},
+      onMeta: async (payload: unknown) => meta.push(payload as Record<string, unknown>),
+      onEvent: async () => {},
+    } as never);
+
+    // The fresh (non-resumed) first turn needs no refresh: its own process
+    // spawn already gets the correct env, and the note would be dead weight.
+    const firstPrompt = String(meta[0]?.prompt ?? "");
+    expect(firstPrompt).not.toContain("Paperclip runtime refresh");
+    await expect(
+      fs.access(path.join(localCwd, ".paperclip-runtime", "runtime-env.sh")),
+    ).rejects.toThrow();
+
+    await execute({
+      runId: "run-warm-2",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: { sessionParams: first.sessionParams },
+      config,
+      context: {},
+      authToken: "second-turn-secret",
+      onLog: async () => {},
+      onMeta: async (payload: unknown) => meta.push(payload as Record<string, unknown>),
+      onEvent: async () => {},
+    } as never);
+
+    // The resumed second turn's shell may still hold the first turn's stale
+    // exports, so the prompt must point at a refresh file by path, and must
+    // never carry either turn's raw token as prompt text.
+    const secondPrompt = String(meta[1]?.prompt ?? "");
+    expect(secondPrompt).toContain("Paperclip runtime refresh (resumed session)");
+    expect(secondPrompt).toContain(".paperclip-runtime/runtime-env.sh");
+    expect(secondPrompt).not.toContain("first-turn-secret");
+    expect(secondPrompt).not.toContain("second-turn-secret");
+
+    // The refresh file itself carries this turn's real, current values.
+    const refreshFile = path.join(localCwd, ".paperclip-runtime", "runtime-env.sh");
+    const refreshContents = await fs.readFile(refreshFile, "utf8");
+    expect(refreshContents).toContain("export PAPERCLIP_API_KEY='second-turn-secret'");
+    expect(refreshContents).toContain("export PAPERCLIP_RUN_ID='run-warm-2'");
+    expect(refreshContents).not.toContain("first-turn-secret");
+    const stat = await fs.stat(refreshFile);
+    expect(stat.mode & 0o777).toBe(0o600);
+  });
+
   it("does not emit startup-step events on a local (non-sandbox) run except workspace.resolve", async () => {
     const root = await makeTempRoot();
     const localCwd = path.join(root, "worktree");
@@ -4673,12 +4748,9 @@ describe("ACPX engine run lifecycle corrections (F2: close the runtime for every
       warmHandles,
       createRuntime: (options) => {
         created += 1;
-        const opts = options as AcpRuntimeOptions & {
-          onAgentSpawn?: (meta: { pid: number; startedAt: string }) => Promise<void>;
-        };
         return {
           ensureSession: async () => {
-            await opts.onAgentSpawn?.({ pid: 4242, startedAt });
+            await announceAgentSpawn(options, { pid: 4242, startedAt });
             return handle;
           },
           startTurn: () => ({
@@ -4778,12 +4850,9 @@ describe("ACPX engine run lifecycle corrections (F2: close the runtime for every
       warmHandles,
       createRuntime: (options) => {
         const id = (created += 1);
-        const opts = options as AcpRuntimeOptions & {
-          onAgentSpawn?: (meta: { pid: number; startedAt: string }) => Promise<void>;
-        };
         return {
           ensureSession: async () => {
-            await opts.onAgentSpawn?.({ pid: 1000 + id, startedAt });
+            await announceAgentSpawn(options, { pid: 1000 + id, startedAt });
             return handle;
           },
           startTurn: () => ({

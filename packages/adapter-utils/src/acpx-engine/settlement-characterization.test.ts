@@ -559,12 +559,17 @@ describe("ACP settlement — Layer A: engine teardown orchestration", () => {
       warmHandles,
       createRuntime: (options) => {
         created += 1;
-        const opts = options as {
-          onAgentSpawn?: (meta: { pid: number; startedAt: string }) => Promise<void>;
-        };
         return {
           ensureSession: async () => {
-            await opts.onAgentSpawn?.({ pid: 4242, startedAt });
+            await options.processLifecycle?.onSpawned?.({
+              launchId: "launch-1",
+              scope: { kind: "client" },
+              command: "node",
+              args: [],
+              cwd: options.cwd,
+              pid: 4242,
+              startedAt,
+            });
             return okHandle;
           },
           startTurn: () => completedTurn(),

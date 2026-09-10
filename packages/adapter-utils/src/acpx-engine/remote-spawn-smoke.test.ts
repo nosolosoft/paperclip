@@ -35,7 +35,6 @@ const fixturePath = path.join(repoRoot, "scripts", "mcp-fixtures", "servers", "a
 const tempRoots: string[] = [];
 
 type PatchedAcpRuntimeOptions = AcpRuntimeOptions & {
-  onAgentSpawn?: (meta: { pid: number; startedAt: string }) => Promise<void>;
   spawnCwd?: string;
 };
 
@@ -55,7 +54,8 @@ async function makeTempDir(prefix: string): Promise<string> {
  * Drive a REAL acpx runtime through `ensureSession`, which performs the real
  * host `spawn()` (and its libuv `chdir`). `cwd` is the advertised session cwd;
  * `spawnCwd`, when set, is the host-only spawn cwd the acpx patch consumes as
- * `spawnCwd ?? cwd`.
+ * `spawnCwd ?? cwd`. `onAgentSpawn` rides the upstream `processLifecycle`
+ * admission seam, which terminates the child when the hook rejects.
  */
 async function ensureRealAcpSession(input: {
   cwd: string;
@@ -67,7 +67,7 @@ async function ensureRealAcpSession(input: {
   const agentCommand = `${JSON.stringify(process.execPath.replaceAll("\\", "/"))} ${JSON.stringify(fixturePath.replaceAll("\\", "/"))}`;
   const runtimeOptions: PatchedAcpRuntimeOptions = {
     cwd: input.cwd,
-    // `spawnCwd` is the host-only knob added by patches/acpx@0.12.0.patch; when
+    // `spawnCwd` is the host-only knob added by patches/acpx@0.15.1.patch; when
     // unset acpx falls back to `cwd`, so every non-proxy lane is byte-identical.
     ...(input.spawnCwd ? { spawnCwd: input.spawnCwd } : {}),
     sessionStore: createRuntimeStore({ stateDir: path.join(stateRoot, "state") }),
@@ -75,7 +75,9 @@ async function ensureRealAcpSession(input: {
     permissionMode: "approve-all",
     nonInteractivePermissions: "deny",
     onAgentStderr: (chunk: string) => stderrChunks.push(chunk),
-    onAgentSpawn: input.onAgentSpawn,
+    processLifecycle: input.onAgentSpawn
+      ? { onSpawned: async (started) => input.onAgentSpawn?.({ pid: started.pid, startedAt: started.startedAt }) }
+      : undefined,
   };
   const runtime = createAcpRuntime(runtimeOptions);
 

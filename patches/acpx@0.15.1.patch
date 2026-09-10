@@ -1,0 +1,69 @@
+diff --git a/dist/live-checkpoint-sB7dFOYR.js b/dist/live-checkpoint-sB7dFOYR.js
+index 021c4e48b76c69d9f9b526e074d3698c6e42c134..25e74603ad5e0869d70ebff778e9ae7942649add 100644
+--- a/dist/live-checkpoint-sB7dFOYR.js
++++ b/dist/live-checkpoint-sB7dFOYR.js
+@@ -4295,6 +4295,10 @@ var AcpClient = class {
+ 		const startupStderr = [];
+ 		child.stderr.on("data", (chunk) => {
+ 			this.captureStartupStderr(startupStderr, chunk);
++			if (this.options.onAgentStderr) {
++				this.options.onAgentStderr(chunk.toString());
++				return;
++			}
+ 			if (!this.options.verbose) return;
+ 			process.stderr.write(chunk);
+ 		});
+@@ -4341,7 +4345,7 @@ var AcpClient = class {
+ 			geminiAcp: isGeminiAcpCommand(spawnCommand, args),
+ 			copilotAcp: isCopilotAcpCommand(spawnCommand, args),
+ 			claudeAcp: isClaudeAcpCommand(spawnCommand, args),
+-			spawnOptions: buildAgentSpawnOptions(this.options.cwd, this.options.authCredentials, this.options.sessionOptions?.env, this.options.agentProcessEnv)
++			spawnOptions: buildAgentSpawnOptions(this.options.spawnCwd ?? this.options.cwd, this.options.authCredentials, this.options.sessionOptions?.env, this.options.agentProcessEnv)
+ 		};
+ 	}
+ 	logAgentLaunch(plan) {
+diff --git a/dist/runtime.d.ts b/dist/runtime.d.ts
+index 05152b2465f2c97cc3407b3fb3e1ba44e4697430..3b59e85018c01e91a85c54734da94b169ba05522 100644
+--- a/dist/runtime.d.ts
++++ b/dist/runtime.d.ts
+@@ -313,6 +313,10 @@ type AcpRuntimeOptions = {
+   timeoutMs?: number;
+   probeAgent?: string;
+   verbose?: boolean;
++  /** Host-only: route agent child stderr instead of writing it to process.stderr. */
++  onAgentStderr?: (chunk: string) => void;
++  /** Host-only: chdir for the spawned child, independent of the advertised ACP cwd. */
++  spawnCwd?: string;
+   /** ACP elicitation modes the embedding host can render for prompt turns. */
+   elicitationModes?: readonly AcpElicitationMode[];
+   /** Optional lifecycle observer for ACP agent processes owned by this runtime. */
+diff --git a/dist/runtime.js b/dist/runtime.js
+index 3888cc171910d0df938673143dd29b93949488a2..4f00f24d86475d55e2186b41ad2a8d86916ea66e 100644
+--- a/dist/runtime.js
++++ b/dist/runtime.js
+@@ -791,7 +791,9 @@ var AcpRuntimeManager = class {
+ 	createClient(options) {
+ 		const clientOptions = {
+ 			...options,
+-			agentProcessEnv: this.options.agentProcessEnv
++			agentProcessEnv: this.options.agentProcessEnv,
++			onAgentStderr: this.options.onAgentStderr,
++			spawnCwd: this.options.spawnCwd
+ 		};
+ 		return this.deps.clientFactory?.(clientOptions) ?? new AcpClient(clientOptions);
+ 	}
+diff --git a/dist/session-options-DyIGRNfu.d.ts b/dist/session-options-DyIGRNfu.d.ts
+index 0ffef0232ac4091fcad55933d357d9cfe1f8cc7f..9e94f595e81506c2cafcdf87bb74372807975762 100644
+--- a/dist/session-options-DyIGRNfu.d.ts
++++ b/dist/session-options-DyIGRNfu.d.ts
+@@ -140,6 +140,10 @@ type AcpClientOptions = {
+   /** Trusted child-only environment overlay; never persisted as session options. */
+   agentProcessEnv?: Record<string, string>;
+   cwd: string;
++  /** Host-only: route agent child stderr instead of writing it to process.stderr. */
++  onAgentStderr?: (chunk: string) => void;
++  /** Host-only: chdir for the spawned child, independent of the advertised ACP cwd. */
++  spawnCwd?: string;
+   mcpServers?: McpServer[];
+   permissionMode: PermissionMode;
+   nonInteractivePermissions?: NonInteractivePermissionPolicy;

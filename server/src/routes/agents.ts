@@ -2102,6 +2102,7 @@ export function agentRoutes(
     "cursor",
     "gemini_local",
     "opencode_local",
+    "omp_local",
     "pi_local",
   ]);
 

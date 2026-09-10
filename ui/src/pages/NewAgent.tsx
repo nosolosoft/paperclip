@@ -41,6 +41,7 @@ import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "@paperclipai/a
 import { DEFAULT_CURSOR_LOCAL_MODEL } from "@paperclipai/adapter-cursor-local";
 import { DEFAULT_GEMINI_LOCAL_MODEL } from "@paperclipai/adapter-gemini-local";
 import { DEFAULT_OPENCODE_LOCAL_MODEL, isValidOpenCodeModelId } from "@paperclipai/adapter-opencode-local";
+import { isValidOmpModelSelector } from "@paperclipai/adapter-omp-local";
 
 function createValuesForAdapterType(
   adapterType: CreateConfigValues["adapterType"],
@@ -170,6 +171,12 @@ export function NewAgent() {
     if (configValues.adapterType === "opencode_local") {
       if (!isValidOpenCodeModelId(configValues.model)) {
         setFormError("OpenCode requires an explicit model in provider/model format.");
+        return;
+      }
+    }
+    if (configValues.adapterType === "omp_local") {
+      if (!isValidOmpModelSelector(configValues.model)) {
+        setFormError("OMP requires an explicit model in provider/model format.");
         return;
       }
     }

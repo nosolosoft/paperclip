@@ -93,5 +93,19 @@ describe("buildAssigneeAdapterOverrides", () => {
     ).toEqual({
       adapterConfig: { variant: "max" },
     });
+    expect(
+      buildAssigneeAdapterOverrides({
+        adapterType: "omp_local",
+        lane: "custom",
+        modelOverride: "cliproxy-openai/gpt-5.6-sol",
+        thinkingEffortOverride: "medium",
+        chrome: false,
+      }),
+    ).toEqual({
+      adapterConfig: {
+        model: "cliproxy-openai/gpt-5.6-sol",
+        thinking: "medium",
+      },
+    });
   });
 });

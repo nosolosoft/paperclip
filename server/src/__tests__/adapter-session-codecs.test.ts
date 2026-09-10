@@ -13,6 +13,7 @@ import {
   sessionCodec as opencodeSessionCodec,
   isOpenCodeUnknownSessionError,
 } from "@paperclipai/adapter-opencode-local/server";
+import { sessionCodec as ompSessionCodec } from "@paperclipai/adapter-omp-local/server";
 import { sessionCodec as acpxSessionCodec } from "@paperclipai/adapter-utils/acpx-engine/session-codec";
 
 describe("adapter session codecs", () => {
@@ -233,6 +234,33 @@ describe("adapter session codecs", () => {
     expect(acpxSessionCodec.serialize(parsed)).toEqual(parsed);
     expect(acpxSessionCodec.getDisplayId?.(parsed)).toBe("runtime-session-1");
   });
+  it("preserves omp ACP session params for persistent resumes", () => {
+    const parsed = ompSessionCodec.deserialize({
+      sessionKey: "paperclip:company:agent:task:fingerprint",
+      runtimeSessionName: "runtime-session-omp",
+      acpxRecordId: "record-omp",
+      acpSessionId: "acp-session-omp",
+      agentSessionId: "agent-session-omp",
+      agent: "omp",
+      cwd: "/tmp/omp-acp",
+      mode: "persistent",
+      stateDir: "/tmp/omp-acp-state",
+      configFingerprint: "fingerprint",
+      workspaceId: "workspace-omp",
+    });
+
+    expect(parsed).toMatchObject({
+      runtimeSessionName: "runtime-session-omp",
+      acpSessionId: "acp-session-omp",
+      agent: "omp",
+      cwd: "/tmp/omp-acp",
+      configFingerprint: "fingerprint",
+      workspaceId: "workspace-omp",
+    });
+    expect(ompSessionCodec.serialize(parsed)).toEqual(parsed);
+    expect(ompSessionCodec.getDisplayId?.(parsed)).toBe("runtime-session-omp");
+  });
+
 });
 
 describe("codex resume recovery detection", () => {

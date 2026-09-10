@@ -138,7 +138,7 @@ const emptyOverlay: AgentConfigOverlay = {
 const EMPTY_ENV: Record<string, EnvBinding> = {};
 
 export function supportsAdapterModelRefresh(adapterType: string): boolean {
-  return adapterType === "claude_local" || adapterType === "codex_local";
+  return adapterType === "claude_local" || adapterType === "codex_local" || adapterType === "omp_local";
 }
 
 function isOverlayDirty(o: AgentConfigOverlay): boolean {
@@ -183,6 +183,16 @@ const codexThinkingEffortOptions = [
 
 const openCodeThinkingEffortOptions = [
   { id: "", label: "Auto" },
+  { id: "minimal", label: "Minimal" },
+  { id: "low", label: "Low" },
+  { id: "medium", label: "Medium" },
+  { id: "high", label: "High" },
+  { id: "xhigh", label: "X-High" },
+  { id: "max", label: "Max" },
+] as const;
+const ompThinkingEffortOptions = [
+  { id: "", label: "Auto" },
+  { id: "off", label: "Off" },
   { id: "minimal", label: "Minimal" },
   { id: "low", label: "Low" },
   { id: "medium", label: "Medium" },
@@ -676,7 +686,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       }
       return agentsApi.detectModel(selectedCompanyId, adapterType);
     },
-    enabled: Boolean(selectedCompanyId && isLocal && adapterType !== "opencode_local"),
+    enabled: Boolean(selectedCompanyId && isLocal && adapterType !== "opencode_local" && adapterType !== "omp_local"),
   });
   const detectedModel = detectedModelData?.model ?? null;
   const detectedModelCandidates = detectedModelData?.candidates ?? [];
@@ -1083,17 +1093,21 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       ? "modelReasoningEffort"
       : adapterType === "cursor"
         ? "mode"
-        : adapterType === "opencode_local"
-          ? "variant"
-          : "effort";
+        : adapterType === "omp_local"
+          ? "thinking"
+          : adapterType === "opencode_local"
+            ? "variant"
+            : "effort";
   const thinkingEffortOptions =
     adapterType === "codex_local"
       ? codexThinkingEffortOptions
       : adapterType === "cursor"
         ? cursorModeOptions
-        : adapterType === "opencode_local"
-          ? openCodeThinkingEffortOptions
-          : claudeThinkingEffortOptions;
+        : adapterType === "omp_local"
+          ? ompThinkingEffortOptions
+          : adapterType === "opencode_local"
+            ? openCodeThinkingEffortOptions
+            : claudeThinkingEffortOptions;
   const currentThinkingEffort = isCreate
     ? val!.thinkingEffort
     : adapterType === "codex_local"
@@ -1104,9 +1118,11 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
         )
       : adapterType === "cursor"
         ? eff("adapterConfig", "mode", String(config.mode ?? ""))
-        : adapterType === "opencode_local"
-          ? eff("adapterConfig", "variant", String(config.variant ?? ""))
-          : eff("adapterConfig", "effort", String(config.effort ?? ""));
+        : adapterType === "omp_local"
+          ? eff("adapterConfig", "thinking", String(config.thinking ?? ""))
+          : adapterType === "opencode_local"
+            ? eff("adapterConfig", "variant", String(config.variant ?? ""))
+            : eff("adapterConfig", "effort", String(config.effort ?? ""));
   const showThinkingEffort = adapterType !== "gemini_local" && adapterType !== "cursor_cloud";
   const codexSearchEnabled = adapterType === "codex_local"
     ? (isCreate ? Boolean(val!.search) : eff("adapterConfig", "search", Boolean(config.search)))
@@ -1476,6 +1492,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                         effort: "",
                         modelReasoningEffort: "",
                         variant: "",
+                        thinking: "",
                         mode: "",
                         ...(t === "codex_local"
                           ? {
@@ -1585,6 +1602,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                       pi_local: "pi",
                       cursor: "agent",
                       opencode_local: "opencode",
+                      omp_local: "omp",
                     } as Record<string, string>)[adapterType] ?? adapterType.replace(/_local$/, "")
                   }
                 />
@@ -1603,13 +1621,13 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                 }
                 open={modelOpen}
                 onOpenChange={setModelOpen}
-                allowDefault={adapterType !== "opencode_local"}
-                required={adapterType === "opencode_local"}
-                groupByProvider={adapterType === "opencode_local"}
+                allowDefault={adapterType !== "opencode_local" && adapterType !== "omp_local"}
+                required={adapterType === "opencode_local" || adapterType === "omp_local"}
+                groupByProvider={adapterType === "opencode_local" || adapterType === "omp_local"}
                 creatable
                 detectedModel={detectedModel}
                 detectedModelCandidates={[]}
-                onDetectModel={adapterType === "opencode_local"
+                onDetectModel={adapterType === "opencode_local" || adapterType === "omp_local"
                   ? undefined
                   : async () => {
                       const result = await refetchDetectedModel();

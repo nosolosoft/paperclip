@@ -551,7 +551,8 @@ export function IssueProperties({
     supportsAssigneeOverrides
       && (assigneeAdapterType === "claude_local"
         || assigneeAdapterType === "codex_local"
-        || assigneeAdapterType === "opencode_local"),
+        || assigneeAdapterType === "opencode_local"
+        || assigneeAdapterType === "omp_local"),
   );
   const assigneeOverrideLane = overrideLane(assigneeAdapterOverrides);
   const assigneeOverrideAdapterConfig = asRecord(assigneeAdapterOverrides?.adapterConfig);
@@ -623,6 +624,7 @@ export function IssueProperties({
     delete nextConfig.reasoningEffort;
     delete nextConfig.effort;
     delete nextConfig.variant;
+    delete nextConfig.thinking;
     if (nextValue) {
       nextConfig[thinkingEffortKeyFor(assigneeAdapterType)] = nextValue;
     }

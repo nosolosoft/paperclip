@@ -38,6 +38,13 @@ describe("ui adapter registry", () => {
     expect(listUIAdapters().some((adapter) => adapter.type === "external_test")).toBe(true);
   });
 
+  it("registers OMP as a built-in UI adapter", () => {
+    expect(getUIAdapter("omp_local")).toMatchObject({
+      type: "omp_local",
+      label: "OMP",
+    });
+  });
+
   it("falls back to the process parser for unknown types after unregistering", () => {
     registerUIAdapter(externalUIAdapter);
 

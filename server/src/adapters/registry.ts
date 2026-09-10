@@ -100,6 +100,20 @@ import {
   modelProfiles as openCodeModelProfiles,
 } from "@paperclipai/adapter-opencode-local";
 import {
+  execute as ompExecute,
+  listOmpSkills,
+  syncOmpSkills,
+  testEnvironment as ompTestEnvironment,
+  sessionCodec as ompSessionCodec,
+  listOmpModels,
+  refreshOmpModels,
+} from "@paperclipai/adapter-omp-local/server";
+import {
+  agentConfigurationDoc as ompAgentConfigurationDoc,
+  models as ompModels,
+  modelProfiles as ompModelProfiles,
+} from "@paperclipai/adapter-omp-local";
+import {
   execute as openclawGatewayExecute,
   testEnvironment as openclawGatewayTestEnvironment,
 } from "@paperclipai/adapter-openclaw-gateway/server";
@@ -401,6 +415,38 @@ const openCodeLocalAdapter: ServerAdapterModule = {
   agentConfigurationDoc: openCodeAgentConfigurationDoc,
 };
 
+const ompLocalAdapter: ServerAdapterModule = {
+  type: "omp_local",
+  execute: ompExecute,
+  testEnvironment: ompTestEnvironment,
+  acp: {
+    agentId: "omp",
+    skillsMode: "unsupported",
+    prerequisites: {},
+  },
+  listSkills: listOmpSkills,
+  syncSkills: syncOmpSkills,
+  sessionCodec: ompSessionCodec,
+  sessionManagement: getAdapterSessionManagement("omp_local") ?? undefined,
+  models: ompModels,
+  modelProfiles: ompModelProfiles,
+  listModels: listOmpModels,
+  refreshModels: refreshOmpModels,
+  supportsLocalAgentJwt: true,
+  supportsInstructionsBundle: true,
+  instructionsPathKey: "instructionsFilePath",
+  requiresMaterializedRuntimeSkills: true,
+  getRuntimeCommandSpec: (config) => {
+    const command = readConfiguredCommand(config, "omp");
+    return {
+      command,
+      detectCommand: command,
+      installCommand: null,
+    };
+  },
+  agentConfigurationDoc: ompAgentConfigurationDoc,
+};
+
 const piLocalAdapter: ServerAdapterModule = {
   type: "pi_local",
   execute: piExecute,
@@ -438,6 +484,7 @@ function registerBuiltInAdapters() {
     claudeLocalAdapter,
     codexLocalAdapter,
     openCodeLocalAdapter,
+    ompLocalAdapter,
     piLocalAdapter,
     cursorCloudAdapter,
     cursorLocalAdapter,

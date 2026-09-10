@@ -257,6 +257,49 @@ describe("server adapter registry", () => {
     expect(adapter!.supportsLocalAgentJwt).toBe(true);
   });
 
+  it("registers built-in omp_local with ACP, model, skill, instruction, JWT, and session capabilities", async () => {
+    const adapter = findActiveServerAdapter("omp_local");
+
+    expect(adapter).not.toBeNull();
+    expect(adapter?.acp).toEqual({
+      agentId: "omp",
+      skillsMode: "unsupported",
+      prerequisites: {},
+    });
+    expect(adapter?.listModels).toBeTypeOf("function");
+    expect(adapter?.refreshModels).toBeTypeOf("function");
+    expect(adapter?.listSkills).toBeTypeOf("function");
+    expect(adapter?.syncSkills).toBeTypeOf("function");
+    expect(adapter?.supportsInstructionsBundle).toBe(true);
+    expect(adapter?.instructionsPathKey).toBe("instructionsFilePath");
+    expect(adapter?.requiresMaterializedRuntimeSkills).toBe(true);
+    expect(adapter?.supportsLocalAgentJwt).toBe(true);
+    expect(adapter?.sessionCodec).toBeDefined();
+    expect(adapter?.sessionManagement).toMatchObject({
+      supportsSessionResume: true,
+      nativeContextManagement: "unknown",
+    });
+    await expect(listAdapterModelProfiles("omp_local")).resolves.toEqual([
+      expect.objectContaining({
+        key: "cheap",
+        adapterConfig: expect.objectContaining({
+          model: "cliproxy-openai/gpt-5.6-luna",
+        }),
+        source: "adapter_default",
+      }),
+    ]);
+    expect(adapter?.getRuntimeCommandSpec?.({})).toEqual({
+      command: "omp",
+      detectCommand: "omp",
+      installCommand: null,
+    });
+    expect(adapter?.getRuntimeCommandSpec?.({ command: "/opt/omp/bin/omp" })).toEqual({
+      command: "/opt/omp/bin/omp",
+      detectCommand: "/opt/omp/bin/omp",
+      installCommand: null,
+    });
+  });
+
   it("built-in local adapters declare cheap model profile defaults where supported", async () => {
     await expect(listAdapterModelProfiles("claude_local")).resolves.toEqual([
       expect.objectContaining({

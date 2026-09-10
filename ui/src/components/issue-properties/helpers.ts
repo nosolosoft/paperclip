@@ -76,6 +76,16 @@ export const ISSUE_THINKING_EFFORT_OPTIONS = {
     { value: "xhigh", label: "X-High" },
     { value: "max", label: "Max" },
   ],
+  omp_local: [
+    { value: "", label: "Default" },
+    { value: "off", label: "Off" },
+    { value: "minimal", label: "Minimal" },
+    { value: "low", label: "Low" },
+    { value: "medium", label: "Medium" },
+    { value: "high", label: "High" },
+    { value: "xhigh", label: "X-High" },
+    { value: "max", label: "Max" },
+  ],
 } as const;
 
 export function asRecord(value: unknown): Record<string, unknown> {
@@ -93,12 +103,14 @@ export function compactRecord(record: Record<string, unknown>) {
 export function thinkingEffortOptionsFor(adapterType: string | null | undefined) {
   if (adapterType === "codex_local") return ISSUE_THINKING_EFFORT_OPTIONS.codex_local;
   if (adapterType === "opencode_local") return ISSUE_THINKING_EFFORT_OPTIONS.opencode_local;
+  if (adapterType === "omp_local") return ISSUE_THINKING_EFFORT_OPTIONS.omp_local;
   return ISSUE_THINKING_EFFORT_OPTIONS.claude_local;
 }
 
 export function thinkingEffortKeyFor(adapterType: string | null | undefined) {
   if (adapterType === "codex_local") return "modelReasoningEffort";
   if (adapterType === "opencode_local") return "variant";
+  if (adapterType === "omp_local") return "thinking";
   return "effort";
 }
 
@@ -108,6 +120,9 @@ export function thinkingEffortValueFor(adapterType: string | null | undefined, a
   }
   if (adapterType === "opencode_local") {
     return String(adapterConfig.variant ?? "");
+  }
+  if (adapterType === "omp_local") {
+    return String(adapterConfig.thinking ?? "");
   }
   return String(adapterConfig.effort ?? "");
 }

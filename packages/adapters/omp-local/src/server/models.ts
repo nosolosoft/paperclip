@@ -1,0 +1,299 @@
+import { createHash } from "node:crypto";
+import os from "node:os";
+import type { AdapterModel } from "@paperclipai/adapter-utils";
+import {
+  asString,
+  ensurePathInEnv,
+  runChildProcess,
+} from "@paperclipai/adapter-utils/server-utils";
+import { isValidOMPModelId } from "../index.js";
+
+const MODELS_CACHE_TTL_MS = 60_000;
+const MODELS_DISCOVERY_TIMEOUT_MS = 20_000;
+// `omp models` is a lightweight metadata call, but on a shared ollama
+// daemon it can queue behind an in-flight `omp run` generation on the
+// same host and either time out or fail with an opaque error. Retry a few
+// times with backoff before surfacing a hard failure (SAG-6326/SAG-6336).
+const MODELS_DISCOVERY_RETRY_DELAYS_MS = [2_000, 4_000];
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function resolveOMPCommand(input: unknown): string {
+  const envOverride =
+    typeof process.env.PAPERCLIP_OMP_COMMAND === "string" &&
+    process.env.PAPERCLIP_OMP_COMMAND.trim().length > 0
+      ? process.env.PAPERCLIP_OMP_COMMAND.trim()
+      : "omp";
+  return asString(input, envOverride);
+}
+
+const discoveryCache = new Map<string, { expiresAt: number; models: AdapterModel[] }>();
+const VOLATILE_ENV_KEY_PREFIXES = ["PAPERCLIP_", "npm_", "NPM_"] as const;
+const VOLATILE_ENV_KEY_EXACT = new Set(["PWD", "OLDPWD", "SHLVL", "_", "TERM_SESSION_ID", "HOME"]);
+
+export function requireOMPModelId(input: unknown): string {
+  const model = asString(input, "").trim();
+  if (!isValidOMPModelId(model)) {
+    throw new Error("OMP requires `adapterConfig.model` in provider/model format.");
+  }
+  return model;
+}
+
+function dedupeModels(models: AdapterModel[]): AdapterModel[] {
+  const seen = new Set<string>();
+  const deduped: AdapterModel[] = [];
+  for (const model of models) {
+    const id = model.id.trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    deduped.push({ id, label: model.label.trim() || id });
+  }
+  return deduped;
+}
+
+function sortModels(models: AdapterModel[]): AdapterModel[] {
+  return [...models].sort((a, b) =>
+    a.id.localeCompare(b.id, "en", { numeric: true, sensitivity: "base" }),
+  );
+}
+
+function firstNonEmptyLine(text: string): string {
+  return (
+    text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean) ?? ""
+  );
+}
+
+export function parseOMPModelsOutput(stdout: string): AdapterModel[] {
+  try {
+    const parsed = JSON.parse(stdout) as { models?: unknown };
+    if (Array.isArray(parsed.models)) {
+      const models: AdapterModel[] = [];
+      for (const item of parsed.models) {
+        if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
+        const record = item as Record<string, unknown>;
+        const selector = typeof record.selector === "string" ? record.selector.trim() : "";
+        const name = typeof record.name === "string" ? record.name.trim() : "";
+        if (selector.includes("/")) models.push({ id: selector, label: name || selector });
+      }
+      return sortModels(dedupeModels(models));
+    }
+  } catch {
+    // Fall through for compatibility with line-oriented model output.
+  }
+  const parsed: AdapterModel[] = [];
+  for (const raw of stdout.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    const firstToken = line.split(/\s+/)[0]?.trim() ?? "";
+    if (!firstToken.includes("/")) continue;
+    parsed.push({ id: firstToken, label: firstToken });
+  }
+  return dedupeModels(parsed);
+}
+
+function normalizeEnv(input: unknown): Record<string, string> {
+  const envInput = typeof input === "object" && input !== null && !Array.isArray(input)
+    ? (input as Record<string, unknown>)
+    : {};
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(envInput)) {
+    if (typeof value === "string") env[key] = value;
+  }
+  return env;
+}
+
+function isVolatileEnvKey(key: string): boolean {
+  if (VOLATILE_ENV_KEY_EXACT.has(key)) return true;
+  return VOLATILE_ENV_KEY_PREFIXES.some((prefix) => key.startsWith(prefix));
+}
+
+function hashValue(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function discoveryCacheKey(command: string, cwd: string, env: Record<string, string>) {
+  const envKey = Object.entries(env)
+    .filter(([key]) => !isVolatileEnvKey(key))
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, value]) => `${key}=${hashValue(value)}`)
+    .join("\n");
+  return `${command}\n${cwd}\n${envKey}`;
+}
+
+function pruneExpiredDiscoveryCache(now: number) {
+  for (const [key, value] of discoveryCache.entries()) {
+    if (value.expiresAt <= now) discoveryCache.delete(key);
+  }
+}
+
+export async function discoverOMPModels(input: {
+  command?: unknown;
+  cwd?: unknown;
+  env?: unknown;
+  forceRefresh?: boolean;
+} = {}): Promise<AdapterModel[]> {
+  const command = resolveOMPCommand(input.command);
+  const cwd = asString(input.cwd, process.cwd());
+  const env = normalizeEnv(input.env);
+  // Ensure HOME points to the actual running user's home directory.
+  // When the server is started via `runuser -u <user>`, HOME may still
+  // reflect the parent process (e.g. /root), causing OMP to miss
+  // provider auth credentials stored under the target user's home.
+  let resolvedHome: string | undefined;
+  try {
+    resolvedHome = os.userInfo().homedir || undefined;
+  } catch {
+    // os.userInfo() throws a SystemError when the current UID has no
+    // /etc/passwd entry (e.g. `docker run --user 1234` with a minimal
+    // image). Fall back to process.env.HOME.
+  }
+  // Prevent OMP from writing an omp.json into the working directory.
+  const runtimeEnv = normalizeEnv(ensurePathInEnv({ ...process.env, ...env, ...(resolvedHome ? { HOME: resolvedHome } : {}), OMP_DISABLE_PROJECT_CONFIG: "true" }));
+
+  const maxAttempts = MODELS_DISCOVERY_RETRY_DELAYS_MS.length + 1;
+  let lastError: Error | undefined;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const result = await runChildProcess(
+      `omp-models-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      command,
+      input.forceRefresh ? ["models", "refresh", "--json"] : ["models", "--json"],
+      {
+        cwd,
+        env: runtimeEnv,
+        timeoutSec: MODELS_DISCOVERY_TIMEOUT_MS / 1000,
+        graceSec: 3,
+        onLog: async () => {},
+      },
+    );
+
+    if (result.timedOut) {
+      lastError = new Error(`\`omp models\` timed out after ${MODELS_DISCOVERY_TIMEOUT_MS / 1000}s.`);
+    } else if ((result.exitCode ?? 1) !== 0) {
+      const detail = firstNonEmptyLine(result.stderr) || firstNonEmptyLine(result.stdout);
+      lastError = new Error(detail ? `\`omp models\` failed: ${detail}` : "`omp models` failed.");
+    } else {
+      return sortModels(parseOMPModelsOutput(result.stdout));
+    }
+
+    const delayMs = MODELS_DISCOVERY_RETRY_DELAYS_MS[attempt - 1];
+    if (delayMs === undefined) break;
+    await sleep(delayMs);
+  }
+
+  throw lastError ?? new Error("`omp models` failed.");
+}
+
+export async function discoverOMPModelsCached(input: {
+  command?: unknown;
+  cwd?: unknown;
+  env?: unknown;
+  forceRefresh?: boolean;
+} = {}): Promise<AdapterModel[]> {
+  const command = resolveOMPCommand(input.command);
+  const cwd = asString(input.cwd, process.cwd());
+  const env = normalizeEnv(input.env);
+  const key = discoveryCacheKey(command, cwd, env);
+  const now = Date.now();
+  pruneExpiredDiscoveryCache(now);
+  const cached = discoveryCache.get(key);
+  if (input.forceRefresh !== true && cached && cached.expiresAt > now) return cached.models;
+
+  const models = await discoverOMPModels({ command, cwd, env, forceRefresh: input.forceRefresh });
+  discoveryCache.set(key, { expiresAt: now + MODELS_CACHE_TTL_MS, models });
+  return models;
+}
+
+export function isTruthyEnvFlag(value: string | undefined): boolean {
+  if (value === undefined) return false;
+  const v = value.trim().toLowerCase();
+  return v === "true" || v === "1" || v === "yes";
+}
+
+export async function ensureOMPModelConfiguredAndAvailable(input: {
+  model?: unknown;
+  command?: unknown;
+  cwd?: unknown;
+  env?: unknown;
+}): Promise<AdapterModel[]> {
+  const model = requireOMPModelId(input.model);
+
+  // When the caller opts into OMP_ALLOW_ALL_MODELS, OMP accepts any
+  // provider/model at run time (e.g. gateway-routed models that never appear in
+  // `omp models` output). Honour that by skipping the availability probe;
+  // we still enforce the provider/model format above and do not second-guess
+  // the configured model. Prefer the explicit run env, then the process env.
+  const env = normalizeEnv(input.env);
+  if (isTruthyEnvFlag(env.OMP_ALLOW_ALL_MODELS ?? process.env.OMP_ALLOW_ALL_MODELS)) {
+    return [{ id: model, label: model }];
+  }
+
+  let models: AdapterModel[];
+  try {
+    models = await discoverOMPModelsCached({
+      command: input.command,
+      cwd: input.cwd,
+      env: input.env,
+    });
+  } catch (err) {
+    // The availability probe is a best-effort pre-flight guard, not a gate. If
+    // `omp models` itself cannot run — a transient CLI error, a timeout, a
+    // provider hiccup — do NOT abort the run. The real invocation is
+    // authoritative, so a probe that can't execute must never be fatal.
+    // (Previously this threw and crashed runs mid-flight, discarding the agent's
+    // completed work and its terminal disposition, which then reopened the issue.)
+    console.warn(
+      `[omp-local] Model availability probe could not run for "${model}" (${
+        err instanceof Error ? err.message : String(err)
+      }); proceeding with the configured model.`,
+    );
+    return [{ id: model, label: model }];
+  }
+
+  if (models.length === 0 || !models.some((entry) => entry.id === model)) {
+    const refreshedModels = await discoverOMPModelsCached({
+      command: input.command,
+      cwd: input.cwd,
+      env: input.env,
+      forceRefresh: true,
+    });
+    if (refreshedModels.length > 0 && refreshedModels.some((entry) => entry.id === model)) {
+      return refreshedModels;
+    }
+
+    if (refreshedModels.length === 0) {
+      console.warn(
+        `[omp-local] \`omp models\` returned no models after refresh; proceeding with the configured model "${model}".`,
+      );
+      return [{ id: model, label: model }];
+    }
+
+    const sample = refreshedModels.slice(0, 12).map((entry) => entry.id).join(", ");
+    throw new Error(
+      `Configured OMP model is unavailable: ${model}. Available models: ${sample}${refreshedModels.length > 12 ? ", ..." : ""}`,
+    );
+  }
+
+  return models;
+}
+
+export async function listOMPModels(): Promise<AdapterModel[]> {
+  try {
+    return await discoverOMPModelsCached();
+  } catch {
+    return [];
+  }
+}
+
+export async function refreshOMPModels(): Promise<AdapterModel[]> {
+  return discoverOMPModelsCached({ forceRefresh: true });
+}
+
+export function resetOMPModelsCacheForTests() {
+  discoveryCache.clear();
+}

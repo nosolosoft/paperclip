@@ -208,6 +208,23 @@ describe("adapter routes", () => {
       },
     });
 
+    const ompAdapter = res.body.find((adapter: { type?: string }) => adapter.type === "omp_local");
+    expect(ompAdapter).toBeDefined();
+    expect(ompAdapter.source).toBe("builtin");
+    expect(ompAdapter.capabilities).toMatchObject({
+      supportsInstructionsBundle: true,
+      supportsSkills: true,
+      supportsLocalAgentJwt: true,
+      requiresMaterializedRuntimeSkills: true,
+      supportsModelProfiles: true,
+      supportsAcp: true,
+    });
+    expect(ompAdapter.acp).toEqual({
+      agentId: "omp",
+      skillsMode: "unsupported",
+      prerequisites: {},
+    });
+
     const grokAdapter = res.body.find((a: any) => a.type === "grok_local");
     expect(grokAdapter).toBeDefined();
     expect(grokAdapter.capabilities).toMatchObject({

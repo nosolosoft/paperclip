@@ -3027,6 +3027,12 @@ describe("parseSessionCompactionPolicy", () => {
       maxRawInputTokens: 2_000_000,
       maxSessionAgeHours: 72,
     });
+    expect(parseSessionCompactionPolicy(buildAgent("omp_local"))).toEqual({
+      enabled: true,
+      maxSessionRuns: 200,
+      maxRawInputTokens: 2_000_000,
+      maxSessionAgeHours: 72,
+    });
   });
 
   it("lets explicit agent overrides win over adapter defaults", () => {

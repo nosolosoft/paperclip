@@ -45,6 +45,7 @@ import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "@paperclipai/a
 import { DEFAULT_CURSOR_LOCAL_MODEL } from "@paperclipai/adapter-cursor-local";
 import { DEFAULT_GEMINI_LOCAL_MODEL } from "@paperclipai/adapter-gemini-local";
 import { DEFAULT_OPENCODE_LOCAL_MODEL, isValidOpenCodeModelId } from "@paperclipai/adapter-opencode-local";
+import { isValidOmpModelSelector } from "@paperclipai/adapter-omp-local";
 import {
   canGoBackFromOnboardingStep,
   canJumpToOnboardingStep,
@@ -77,6 +78,16 @@ type Step = 0 | 1 | 2 | 3 | 4 | 5;
 // Plugin/external adapters use arbitrary type ids, so this mirrors the master
 // wizard's registry-driven approach rather than a fixed union.
 type AdapterType = string;
+const OMP_THINKING_OPTIONS = [
+  { value: "", label: "Auto" },
+  { value: "off", label: "Off" },
+  { value: "minimal", label: "Minimal" },
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "xhigh", label: "X-High" },
+  { value: "max", label: "Max" },
+] as const;
 
 const MISSION_PROMPT_CHIPS = [
   "Build a SaaS product",
@@ -389,6 +400,7 @@ function OnboardingWizardInner({
   const [adapterType, setAdapterType] = useState<AdapterType>((saved?.adapterType as AdapterType) ?? "claude_local");
   const [cwd, setCwd] = useState((saved?.cwd as string) ?? "");
   const [model, setModel] = useState((saved?.model as string) ?? "");
+  const [thinkingEffort, setThinkingEffort] = useState((saved?.thinkingEffort as string) ?? "");
   const [command, setCommand] = useState((saved?.command as string) ?? "");
   const [args, setArgs] = useState((saved?.args as string) ?? "");
   const [url, setUrl] = useState((saved?.url as string) ?? "");
@@ -396,6 +408,8 @@ function OnboardingWizardInner({
     useState<AdapterEnvironmentTestResult | null>(null);
   const [adapterEnvError, setAdapterEnvError] = useState<string | null>(null);
   const [adapterEnvLoading, setAdapterEnvLoading] = useState(false);
+  const [adapterModelsRefreshing, setAdapterModelsRefreshing] = useState(false);
+  const [adapterModelsRefreshError, setAdapterModelsRefreshError] = useState<string | null>(null);
   const [forceUnsetAnthropicApiKey, setForceUnsetAnthropicApiKey] =
     useState(false);
   const [unsetAnthropicLoading, setUnsetAnthropicLoading] = useState(false);
@@ -618,7 +632,7 @@ function OnboardingWizardInner({
     if (!effectiveOnboardingOpen) return;
     const state = {
       step, companyName, companyGoal, missionPath, missionConfirmed,
-      q1, q2, q3, q4, agentName, adapterType, cwd, model, command, args, url,
+      q1, q2, q3, q4, agentName, adapterType, cwd, model, thinkingEffort, command, args, url,
       createdCompanyId, createdCompanyPrefix, createdAgentId,
       createdCompanyGoalId, createdProjectId, createdIssueRef,
       onboardingPath, growWorkflows, growPainPoints, growAutomate,
@@ -626,26 +640,27 @@ function OnboardingWizardInner({
     onboardingDraftStorage.write(JSON.stringify(state));
   }, [
     effectiveOnboardingOpen, step, companyName, companyGoal, missionPath, missionConfirmed,
-    q1, q2, q3, q4, agentName, adapterType, cwd, model, command, args, url,
+    q1, q2, q3, q4, agentName, adapterType, cwd, model, thinkingEffort, command, args, url,
     createdCompanyId, createdCompanyPrefix, createdAgentId,
     createdCompanyGoalId, createdProjectId, createdIssueRef,
     onboardingPath, growWorkflows, growPainPoints, growAutomate,
   ]);
 
+  const adapterModelsQueryKey = createdCompanyId
+    ? queryKeys.agents.adapterModels(createdCompanyId, adapterType, null)
+    : ["agents", "none", "adapter-models", adapterType, null];
   const {
     data: adapterModels,
     error: adapterModelsError,
     isLoading: adapterModelsLoading,
-    isFetching: adapterModelsFetching
+    isFetching: adapterModelsFetching,
   } = useQuery({
     // The wizard doesn't expose an environment selector, so models always
     // resolve against the local Paperclip host (environmentId = null).
-    queryKey: createdCompanyId
-      ? queryKeys.agents.adapterModels(createdCompanyId, adapterType, null)
-      : ["agents", "none", "adapter-models", adapterType, null],
+    queryKey: adapterModelsQueryKey,
     queryFn: () => agentsApi.adapterModels(createdCompanyId!, adapterType, { environmentId: null }),
     // Models are picked on step 4 (Connect a model).
-    enabled: Boolean(createdCompanyId) && effectiveOnboardingOpen && step === 4
+    enabled: Boolean(createdCompanyId) && effectiveOnboardingOpen && step === 4,
   });
   const getCapabilities = useAdapterCapabilities();
   const adapterCaps = getCapabilities(adapterType);
@@ -659,6 +674,7 @@ function OnboardingWizardInner({
     adapterType === "codex_local" ||
     adapterType === "gemini_local" ||
     adapterType === "opencode_local" ||
+    adapterType === "omp_local" ||
     adapterType === "pi_local" ||
     adapterType === "cursor";
   // Build adapter grids dynamically from the UI registry + display metadata.
@@ -697,6 +713,7 @@ function OnboardingWizardInner({
     if (visible.some((a) => a.type === adapterType)) return;
     const next = visible[0].type as AdapterType;
     setAdapterType(next);
+    setThinkingEffort("");
     if (next === "codex_local") return;
     if (next === "opencode_local") {
       setModel(DEFAULT_OPENCODE_LOCAL_MODEL);
@@ -720,6 +737,7 @@ function OnboardingWizardInner({
     pi_local: "pi",
     cursor: "agent",
     opencode_local: "opencode",
+    omp_local: "omp",
   };
   const effectiveAdapterCommand =
     command.trim() ||
@@ -729,9 +747,30 @@ function OnboardingWizardInner({
     if (step !== 4) return;
     setAdapterEnvResult(null);
     setAdapterEnvError(null);
-  }, [step, adapterType, model, command, args, url]);
+  }, [step, adapterType, model, thinkingEffort, command, args, url]);
 
   const selectedModel = (adapterModels ?? []).find((m) => m.id === model);
+  const requiresExplicitModel = adapterType === "opencode_local" || adapterType === "omp_local";
+  const groupsModelsByProvider = requiresExplicitModel;
+
+  async function handleRefreshAdapterModels() {
+    if (!createdCompanyId || adapterType !== "omp_local") return;
+    setAdapterModelsRefreshing(true);
+    setAdapterModelsRefreshError(null);
+    try {
+      const refreshed = await agentsApi.adapterModels(createdCompanyId, adapterType, {
+        environmentId: null,
+        refresh: true,
+      });
+      queryClient.setQueryData(adapterModelsQueryKey, refreshed);
+    } catch (refreshError) {
+      setAdapterModelsRefreshError(
+        refreshError instanceof Error ? refreshError.message : "Failed to refresh OMP models.",
+      );
+    } finally {
+      setAdapterModelsRefreshing(false);
+    }
+  }
   const hasAnthropicApiKeyOverrideCheck =
     adapterEnvResult?.checks.some(
       (check) =>
@@ -754,7 +793,7 @@ function OnboardingWizardInner({
     });
   }, [adapterModels, modelSearch]);
   const groupedModels = useMemo(() => {
-    if (adapterType !== "opencode_local") {
+    if (!groupsModelsByProvider) {
       return [
         {
           provider: "models",
@@ -775,7 +814,7 @@ function OnboardingWizardInner({
         provider,
         entries: [...entries].sort((a, b) => a.id.localeCompare(b.id))
       }));
-  }, [filteredModels, adapterType]);
+  }, [filteredModels, groupsModelsByProvider]);
 
   function reset() {
     onboardingDraftStorage.clear();
@@ -799,12 +838,15 @@ function OnboardingWizardInner({
     setAgentName("Chief of staff");
     setAdapterType("claude_local");
     setModel("");
+    setThinkingEffort("");
     setCommand("");
     setArgs("");
     setUrl("");
     setAdapterEnvResult(null);
     setAdapterEnvError(null);
     setAdapterEnvLoading(false);
+    setAdapterModelsRefreshing(false);
+    setAdapterModelsRefreshError(null);
     setForceUnsetAnthropicApiKey(false);
     setUnsetAnthropicLoading(false);
     setCreatedCompanyId(null);
@@ -934,6 +976,7 @@ function OnboardingWizardInner({
             : adapterType === "opencode_local"
               ? model || DEFAULT_OPENCODE_LOCAL_MODEL
               : model,
+      thinkingEffort,
       command,
       args,
       url,
@@ -1147,6 +1190,34 @@ function OnboardingWizardInner({
             discoveredModels.length === 0
               ? "No OpenCode models discovered. Run `opencode models` and authenticate providers."
               : `Configured OpenCode model is unavailable: ${selectedModelId}`
+          );
+          return;
+        }
+      }
+      if (adapterType === "omp_local") {
+        const selectedModelId = model.trim();
+        if (!isValidOmpModelSelector(selectedModelId)) {
+          setError("OMP requires an explicit model in provider/model format.");
+          return;
+        }
+        if (adapterModelsError) {
+          setError(
+            adapterModelsError instanceof Error
+              ? adapterModelsError.message
+              : "Failed to load OMP models.",
+          );
+          return;
+        }
+        if (adapterModelsLoading || adapterModelsFetching) {
+          setError("OMP models are still loading. Please wait and try again.");
+          return;
+        }
+        const discoveredModels = adapterModels ?? [];
+        if (!discoveredModels.some((entry) => entry.id === selectedModelId)) {
+          setError(
+            discoveredModels.length === 0
+              ? "No OMP models discovered. Run `omp models --json` and configure a provider."
+              : `Configured OMP model is unavailable: ${selectedModelId}`,
           );
           return;
         }
@@ -1804,6 +1875,7 @@ function OnboardingWizardInner({
                           onClick={() => {
                             const nextType = opt.type;
                             setAdapterType(nextType);
+                            setThinkingEffort("");
                             if (nextType === "codex_local") {
                               return;
                             }
@@ -1859,6 +1931,7 @@ function OnboardingWizardInner({
                                if (opt.comingSoon) return;
                                const nextType = opt.type;
                               setAdapterType(nextType);
+                              setThinkingEffort("");
                               if (nextType === "gemini_local" && !model) {
                                 setModel(DEFAULT_GEMINI_LOCAL_MODEL);
                                 return;
@@ -1894,6 +1967,17 @@ function OnboardingWizardInner({
                         <label className="text-xs text-muted-foreground mb-1 block">
                           Model
                         </label>
+                        {adapterType === "omp_local" && (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            disabled={adapterModelsRefreshing}
+                            onClick={() => void handleRefreshAdapterModels()}
+                          >
+                            {adapterModelsRefreshing ? "Refreshing..." : "Refresh models"}
+                          </Button>
+                        )}
                         <Popover
                           open={modelOpen}
                           onOpenChange={(next) => {
@@ -1911,7 +1995,7 @@ function OnboardingWizardInner({
                                 {selectedModel
                                   ? selectedModel.label
                                   : model ||
-                                    (adapterType === "opencode_local"
+                                    (requiresExplicitModel
                                       ? "Select model (required)"
                                       : "Default")}
                               </span>
@@ -1929,7 +2013,7 @@ function OnboardingWizardInner({
                               onChange={(e) => setModelSearch(e.target.value)}
                               autoFocus
                             />
-                            {adapterType !== "opencode_local" && (
+                            {!requiresExplicitModel && (
                               <button
                                 className={cn(
                                   "flex items-center gap-2 w-full px-2 py-1.5 text-sm rounded hover:bg-accent/50",
@@ -1949,7 +2033,7 @@ function OnboardingWizardInner({
                                   key={group.provider}
                                   className="mb-1 last:mb-0"
                                 >
-                                  {adapterType === "opencode_local" && (
+                                  {groupsModelsByProvider && (
                                     <div className="px-2 py-1 text-(length:--text-nano) uppercase tracking-wide text-muted-foreground">
                                       {group.provider} ({group.entries.length})
                                     </div>
@@ -1970,7 +2054,7 @@ function OnboardingWizardInner({
                                         className="block w-full text-left truncate"
                                         title={m.id}
                                       >
-                                        {adapterType === "opencode_local"
+                                        {groupsModelsByProvider
                                           ? extractModelName(m.id)
                                           : m.label}
                                       </span>
@@ -1986,7 +2070,28 @@ function OnboardingWizardInner({
                             )}
                           </PopoverContent>
                         </Popover>
+                        {adapterModelsRefreshError && (
+                          <p className="text-xs text-destructive">{adapterModelsRefreshError}</p>
+                        )}
                       </div>
+                      {adapterType === "omp_local" && (
+                        <div>
+                          <label className="text-xs text-muted-foreground mb-1 block">
+                            Thinking
+                          </label>
+                          <select
+                            className="w-full rounded-md border border-border bg-transparent px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring"
+                            value={thinkingEffort}
+                            onChange={(event) => setThinkingEffort(event.target.value)}
+                          >
+                            {OMP_THINKING_OPTIONS.map((option) => (
+                              <option key={option.value || "auto"} value={option.value}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      )}
                     </div>
                   )}
 
@@ -2060,18 +2165,24 @@ function OnboardingWizardInner({
                             {adapterType === "cursor"
                               ? `${effectiveAdapterCommand} -p --mode ask --output-format json \"Respond with hello.\"`
                               : adapterType === "codex_local"
-                              ? `${effectiveAdapterCommand} exec --json -`
-                              : adapterType === "gemini_local"
-                                ? `${effectiveAdapterCommand} --output-format json "Respond with hello."`
-                              : adapterType === "opencode_local"
-                                ? `${effectiveAdapterCommand} run --format json "Respond with hello."`
-                              : `${effectiveAdapterCommand} --print - --output-format stream-json --verbose`}
+                                ? `${effectiveAdapterCommand} exec --json -`
+                                : adapterType === "gemini_local"
+                                  ? `${effectiveAdapterCommand} --output-format json "Respond with hello."`
+                                  : adapterType === "opencode_local"
+                                    ? `${effectiveAdapterCommand} run --format json "Respond with hello."`
+                                    : adapterType === "omp_local"
+                                      ? `acpx --format json --approve-all --agent \"${effectiveAdapterCommand} --model ${model} acp\" exec \"Respond with hello.\"`
+                                      : `${effectiveAdapterCommand} --print - --output-format stream-json --verbose`}
                           </p>
                           <p className="text-muted-foreground">
                             Prompt:{" "}
                             <span className="font-mono">Respond with hello.</span>
                           </p>
-                          {adapterType === "cursor" ||
+                          {adapterType === "omp_local" ? (
+                            <p className="text-muted-foreground">
+                              Verify <span className="font-mono">omp models --json</span> lists the selected model, then retry.
+                            </p>
+                          ) : adapterType === "cursor" ||
                           adapterType === "codex_local" ||
                           adapterType === "gemini_local" ||
                           adapterType === "opencode_local" ? (

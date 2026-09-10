@@ -44,6 +44,7 @@ export const LEGACY_SESSIONED_ADAPTER_TYPES = new Set([
   "gemini_local",
   "hermes_local",
   "opencode_local",
+  "omp_local",
   "pi_local",
 ]);
 
@@ -74,6 +75,11 @@ export const ADAPTER_SESSION_MANAGEMENT: Record<string, AdapterSessionManagement
     defaultSessionCompaction: DEFAULT_SESSION_COMPACTION_POLICY,
   },
   opencode_local: {
+    supportsSessionResume: true,
+    nativeContextManagement: "unknown",
+    defaultSessionCompaction: DEFAULT_SESSION_COMPACTION_POLICY,
+  },
+  omp_local: {
     supportsSessionResume: true,
     nativeContextManagement: "unknown",
     defaultSessionCompaction: DEFAULT_SESSION_COMPACTION_POLICY,

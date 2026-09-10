@@ -105,6 +105,11 @@ const adapterDisplayMap: Record<string, AdapterDisplayInfo> = {
     description: "OpenCode multi-provider harness",
     icon: OpenCodeLogoIcon,
   },
+  omp_local: {
+    label: "OMP",
+    description: "OMP local coding harness",
+    icon: Terminal,
+  },
   pi_local: {
     label: "Pi",
     description: "Pi harness",

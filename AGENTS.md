@@ -94,6 +94,32 @@ When your task produces a user-inspectable deliverable file, follow the Papercli
 7. Treat manual agent configuration as authoritative.
 A newer user-authored agent configuration revision always overrides backups, forensic manifests, baselines, defaults, and previously documented target values. Never "correct" `adapterConfig`, `runtimeConfig`, model selection, instructions, or workspace settings from historical evidence after a user has changed them. Recovery watchers and anomaly handlers are detect-only and must never remediate configuration. An agent may mutate configuration only when the current user request explicitly names the exact desired change; immediately before applying it, read the live configuration and latest revision again. If live user intent conflicts with recovery evidence, preserve the live value and report the conflict.
 
+8. Name the three data paths correctly.
+This repo has three separate data paths. Do not confuse them. Match a change to a path by its file path, not by the word "observability" or "telemetry" alone.
+
+- **Telemetry** is the Paperclip first-party event system. It is opt-out and it sends data to a Paperclip endpoint by default. Its paths are:
+  - `packages/shared/src/telemetry/`
+  - the generated contract `packages/shared/src/telemetry/generated/paperclip-telemetry.ts`
+  - each caller of `packages/shared/src/telemetry/events.ts` or `packages/shared/src/telemetry/client.ts`
+- **Observability** is the OpenTelemetry trace path. An operator must set an OTLP endpoint. Until an operator sets the endpoint, the tracer is a no-operation. Its paths are:
+  - `server/src/instrumentation.ts`
+  - `doc/observability.md`
+  - `packages/adapter-utils/src/duplex-observability.ts`
+  - `server/src/services/duplex-observability-recorder.ts`
+  - the span attributes in `packages/adapter-utils/src/acpx-engine/startup-timing.ts`
+- **The run log** holds rows in the local `heartbeat_run_events` table. The data stays in the instance database. Its paths are:
+  - `doc/run-log-events.md`
+  - `packages/db/src/schema/heartbeat_run_events.ts`
+  - the append path `appendRunEvent` in `server/src/services/heartbeat.ts`
+
+Apply a review level that matches the path:
+
+- **Telemetry change (strict review).** The author updates the generated contract first. The author updates `packages/shared/src/telemetry/README.md` in the same pull request. The author requests a privacy review. Reason: a Telemetry event goes to a Paperclip endpoint by default, so a mistake sends data immediately.
+- **Observability change (lighter review).** The operator endpoint gate stays in place. The no-operation behaviour stays when no endpoint is set. A privacy review is not necessary while the change stays inside the closed span-attribute allowlist.
+- **Run-log change (no extra review).** A run-log change needs neither review level above, because the data stays in the instance database.
+
+**Exclusion.** The word "observability" in a file such as `server/src/services/recovery-observability.ts` names a different concept. Apply this rule by path, not by word match.
+
 ## 6. Database Change Workflow
 
 When changing data model:

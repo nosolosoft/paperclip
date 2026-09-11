@@ -1,4 +1,12 @@
 export { decisionEffectTargetIssueIds } from "./decision.js";
+export {
+  NATIVE_FINALIZATION_SCHEMA,
+  type NativeFinalizationResult,
+  type NativeFinalizationResultV1,
+  type NativeReportedWorkDisposition,
+  type NativeRuntimeMode,
+  type NativeRunTerminalState,
+} from "./native-finalization.js";
 export type {
   Company,
   InteractionResolverGovernance,
@@ -57,6 +65,7 @@ export { DECISION_TRAINING_RETENTION_POLICY } from "./decision-training.js";
 export type {
   Environment,
   EnvironmentDeleteBlastRadius,
+  EnvironmentDeleteReusableLeaseHolder,
   EnvironmentDeleteBlockedReason,
   EnvironmentLease,
   EnvironmentProbeResult,
@@ -411,8 +420,6 @@ export type {
   WorkspaceRuntimeDesiredState,
   WorkspaceRealizationRecord,
   WorkspaceRealizationRequest,
-  WorkspaceRealizationSyncStrategy,
-  WorkspaceRealizationTransport,
   ExecutionWorkspaceStrategyType,
   ExecutionWorkspaceMode,
   SharedWorkspaceConcurrency,
@@ -428,6 +435,14 @@ export type {
   WorkspaceOperationPhase,
   WorkspaceOperationStatus,
 } from "./workspace-operation.js";
+export { WORKSPACE_READINESS_STATES } from "./workspace-readiness.js";
+export type {
+  WorkspaceLoginHandoffTicketResponse,
+  WorkspaceReadiness,
+  WorkspaceReadinessProbeResult,
+  WorkspaceReadinessState,
+  WorkspaceSeedReadinessState,
+} from "./workspace-readiness.js";
 export type {
   NormalizedWorkspaceFileAvailabilityQuery,
   WorkspaceFileAvailabilityQuery,
@@ -698,6 +713,9 @@ export type {
   SuggestTasksResult,
   AskUserQuestionsQuestionOption,
   AskUserQuestionsQuestion,
+  PaperclipQuestionSetOption,
+  PaperclipQuestionSetQuestion,
+  PaperclipQuestionSetPayload,
   AskUserQuestionsPayload,
   AskUserQuestionsAnswer,
   AskUserQuestionsResult,
@@ -708,6 +726,8 @@ export type {
   RequestConfirmationResult,
   RequestConfirmationToolActionPayload,
   RequestConfirmationToolActionResult,
+  RequestConfirmationSecretProposalPayload,
+  RequestConfirmationSecretProposalResult,
   RequestCheckboxConfirmationOption,
   RequestCheckboxConfirmationPayload,
   RequestCheckboxConfirmationResult,

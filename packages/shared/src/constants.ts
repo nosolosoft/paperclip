@@ -1,9 +1,6 @@
 export const COMPANY_STATUSES = ["active", "paused", "archived"] as const;
 export type CompanyStatus = (typeof COMPANY_STATUSES)[number];
 
-export const DEFAULT_COMPANY_ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
-export const MAX_COMPANY_ATTACHMENT_MAX_BYTES = 1024 * 1024 * 1024;
-
 export const DEPLOYMENT_MODES = ["local_trusted", "authenticated"] as const;
 export type DeploymentMode = (typeof DEPLOYMENT_MODES)[number];
 
@@ -32,11 +29,13 @@ export const AGENT_ADAPTER_TYPES = [
   "http",
   "claude_local",
   "codex_local",
+  "paperclip_runner",
   "cursor_cloud",
   "gemini_local",
   "grok_local",
   "hermes_gateway",
   "hermes_local",
+  "kimi_local",
   "opencode_local",
   "omp_local",
   "pi_local",
@@ -378,6 +377,7 @@ export type IssueSurfaceVisibility = (typeof ISSUE_SURFACE_VISIBILITIES)[number]
 
 export const ISSUE_RECOVERY_ACTION_KINDS = [
   "missing_disposition",
+  "deliberate_wait_without_target",
   "stranded_assigned_issue",
   "workspace_validation",
   "configuration_validation",
@@ -386,6 +386,8 @@ export const ISSUE_RECOVERY_ACTION_KINDS = [
   "github_ci_failure",
 ] as const;
 export type IssueRecoveryActionKind = (typeof ISSUE_RECOVERY_ACTION_KINDS)[number];
+
+export const ISSUE_DISPOSITION_REPAIR_RETRY_REASON = "issue_disposition_repair";
 
 export const ISSUE_RECOVERY_ACTION_STATUSES = [
   "active",
@@ -669,7 +671,10 @@ export type RoutineRunStatus = (typeof ROUTINE_RUN_STATUSES)[number];
 export const ROUTINE_RUN_SOURCES = ["schedule", "manual", "api", "webhook"] as const;
 export type RoutineRunSource = (typeof ROUTINE_RUN_SOURCES)[number];
 
-export const PAUSE_REASONS = ["manual", "budget", "system", "company_archived"] as const;
+// "import" marks agents parked by a company import (safety default) so the UI
+// can explain the pause and offer a scoped bulk-resume; "system" remains the
+// reason for platform-managed pauses (plugins, built-ins).
+export const PAUSE_REASONS = ["manual", "budget", "system", "company_archived", "import"] as const;
 export type PauseReason = (typeof PAUSE_REASONS)[number];
 
 export const PROJECT_COLORS = [

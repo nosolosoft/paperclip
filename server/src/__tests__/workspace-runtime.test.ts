@@ -8916,7 +8916,9 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
       expect(services[0]?.url).not.toBe(rootUrl);
       await expect(fetch(services[0]!.url!)).resolves.toMatchObject({ ok: true });
       await expect(fetch(healthUrl)).resolves.toMatchObject({ ok: false, status: 503 });
-      expect(await readLocalServicePortOwner(stalePort!)).toBe(staleProcess.pid);
+      const stalePortOwnerPid = await readLocalServicePortOwner(stalePort!);
+      expect(stalePortOwnerPid).toBeTypeOf("number");
+      expect(await isLocalServiceProcessOwnedBy(stalePortOwnerPid!, staleProcess.pid!)).toBe(true);
     } finally {
       leasedRunIds.delete(runId);
       await releaseRuntimeServicesForRun(runId);

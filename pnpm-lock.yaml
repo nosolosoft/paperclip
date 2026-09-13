@@ -11,7 +11,7 @@ overrides:
 
 patchedDependencies:
   acpx@0.15.1:
-    hash: kwqf4suqtdwlbwlco3nwjqnlmi
+    hash: mr7jho2ezcqlz7durzquc2yfb4
     path: patches/acpx@0.15.1.patch
   embedded-postgres@18.1.0-beta.16:
     hash: 55uhvnotpqyiy37rn3pqpukhei
@@ -126,7 +126,7 @@ importers:
     dependencies:
       acpx:
         specifier: 0.15.1
-        version: 0.15.1(patch_hash=kwqf4suqtdwlbwlco3nwjqnlmi)
+        version: 0.15.1(patch_hash=mr7jho2ezcqlz7durzquc2yfb4)
       picocolors:
         specifier: ^1.1.1
         version: 1.1.1
@@ -12149,7 +12149,7 @@ snapshots:
 
   acorn@8.18.0: {}
 
-  acpx@0.15.1(patch_hash=kwqf4suqtdwlbwlco3nwjqnlmi):
+  acpx@0.15.1(patch_hash=mr7jho2ezcqlz7durzquc2yfb4):
     dependencies:
       '@agentclientprotocol/sdk': 1.4.0(zod@4.6.1)
       commander: 15.0.0

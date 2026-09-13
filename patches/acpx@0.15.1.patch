@@ -1,8 +1,93 @@
 diff --git a/dist/live-checkpoint-sB7dFOYR.js b/dist/live-checkpoint-sB7dFOYR.js
-index 021c4e48b76c69d9f9b526e074d3698c6e42c134..25e74603ad5e0869d70ebff778e9ae7942649add 100644
+index 021c4e48b76c69d9f9b526e074d3698c6e42c134..189d1e3da7248a32714ff7b2c767b359791e88a4 100644
 --- a/dist/live-checkpoint-sB7dFOYR.js
 +++ b/dist/live-checkpoint-sB7dFOYR.js
-@@ -4295,6 +4295,10 @@ var AcpClient = class {
+@@ -3451,14 +3451,14 @@ function toCommandLine(command, args) {
+ 	const renderedArgs = (args ?? []).map((arg) => JSON.stringify(arg)).join(" ");
+ 	return renderedArgs.length > 0 ? `${command} ${renderedArgs}` : command;
+ }
+-function toEnvObject(env) {
+-	if (!env || env.length === 0) return;
+-	const merged = { ...process.env };
++function toEnvObject(env, baseEnv) {
++	if (!env || env.length === 0) return baseEnv ? { ...baseEnv } : void 0;
++	const merged = { ...baseEnv ?? process.env };
+ 	for (const entry of env) merged[entry.name] = entry.value;
+ 	return merged;
+ }
+-function buildTerminalSpawnOptions(command, cwd, env, platform = process.platform) {
+-	const resolvedEnv = toEnvObject(env);
++function buildTerminalSpawnOptions(command, cwd, env, platform = process.platform, agentEnv) {
++	const resolvedEnv = toEnvObject(env, agentEnv);
+ 	return buildSpawnCommandOptions(command, {
+ 		cwd,
+ 		env: resolvedEnv,
+@@ -3521,6 +3521,7 @@ var TerminalManager = class {
+ 	killGraceMs;
+ 	processHelperTimeoutMs;
+ 	outputCeilingBytes;
++	resolveAgentEnv;
+ 	terminals = /* @__PURE__ */ new Map();
+ 	constructor(options) {
+ 		this.outputCeilingBytes = readTerminalOutputCeiling();
+@@ -3532,6 +3533,7 @@ var TerminalManager = class {
+ 		this.confirmExecute = options.confirmExecute ?? defaultConfirmExecute;
+ 		this.killGraceMs = Math.max(0, Math.round(options.killGraceMs ?? DEFAULT_KILL_GRACE_MS));
+ 		this.processHelperTimeoutMs = Math.max(1, Math.round(options.processHelperTimeoutMs ?? 8e3));
++		this.resolveAgentEnv = options.resolveAgentEnv;
+ 	}
+ 	updatePermissionPolicy(permissionMode, nonInteractivePermissions) {
+ 		this.permissionMode = permissionMode;
+@@ -3550,7 +3552,7 @@ var TerminalManager = class {
+ 			if (!await this.isExecuteApproved(commandLine)) throw new PermissionDeniedError("Permission denied for terminal/create");
+ 			const requestedLimit = Math.max(0, Math.round(params.outputByteLimit ?? DEFAULT_TERMINAL_OUTPUT_LIMIT_BYTES));
+ 			const outputByteLimit = Math.min(requestedLimit, this.outputCeilingBytes ?? Number.POSITIVE_INFINITY);
+-			const { proc, spawnCommand } = await spawnTerminalProcess(params, this.cwd);
++			const { proc, spawnCommand } = await spawnTerminalProcess(params, this.cwd, this.resolveAgentEnv?.());
+ 			let resolveExit = () => {};
+ 			const exitPromise = new Promise((resolve) => {
+ 				resolveExit = resolve;
+@@ -3801,24 +3803,24 @@ var TerminalManager = class {
+ 		while (hasLivePid(terminal.descendantPids)) await waitMs(25);
+ 	}
+ };
+-async function spawnTerminalProcess(params, defaultCwd) {
++async function spawnTerminalProcess(params, defaultCwd, agentEnv) {
+ 	const directCommand = buildTerminalSpawnCommand(params.command, params.args);
+ 	try {
+ 		return {
+-			proc: await spawnAndWait(directCommand, params, defaultCwd),
++			proc: await spawnAndWait(directCommand, params, defaultCwd, agentEnv),
+ 			spawnCommand: directCommand
+ 		};
+ 	} catch (error) {
+ 		const fallbackCommand = params.args === void 0 && isNotFoundSpawnError(error) ? buildTerminalFallbackSpawnCommand(params.command, params.cwd ?? defaultCwd) : void 0;
+ 		if (!fallbackCommand) throw error;
+ 		return {
+-			proc: await spawnAndWait(fallbackCommand, params, defaultCwd),
++			proc: await spawnAndWait(fallbackCommand, params, defaultCwd, agentEnv),
+ 			spawnCommand: fallbackCommand
+ 		};
+ 	}
+ }
+-async function spawnAndWait(spawnCommand, params, defaultCwd) {
+-	const spawnOptions = buildTerminalSpawnOptions(spawnCommand.command, params.cwd ?? defaultCwd, params.env);
++async function spawnAndWait(spawnCommand, params, defaultCwd, agentEnv) {
++	const spawnOptions = buildTerminalSpawnOptions(spawnCommand.command, params.cwd ?? defaultCwd, params.env, process.platform, agentEnv);
+ 	if (spawnCommand.killProcessGroup) spawnOptions.detached = true;
+ 	const proc = spawn(spawnCommand.command, spawnCommand.args, spawnOptions);
+ 	await waitForSpawn(proc);
+@@ -4204,7 +4206,8 @@ var AcpClient = class {
+ 			nonInteractivePermissions: this.options.nonInteractivePermissions,
+ 			onOperation: (operation) => {
+ 				this.eventHandlers.onClientOperation?.(operation);
+-			}
++			},
++			resolveAgentEnv: () => buildAgentEnvironment(this.options.authCredentials, this.options.sessionOptions?.env, this.options.agentProcessEnv)
+ 		});
+ 	}
+ 	get initializeResult() {
+@@ -4295,6 +4298,10 @@ var AcpClient = class {
  		const startupStderr = [];
  		child.stderr.on("data", (chunk) => {
  			this.captureStartupStderr(startupStderr, chunk);
@@ -13,7 +98,7 @@ index 021c4e48b76c69d9f9b526e074d3698c6e42c134..25e74603ad5e0869d70ebff778e9ae79
  			if (!this.options.verbose) return;
  			process.stderr.write(chunk);
  		});
-@@ -4341,7 +4345,7 @@ var AcpClient = class {
+@@ -4341,7 +4348,7 @@ var AcpClient = class {
  			geminiAcp: isGeminiAcpCommand(spawnCommand, args),
  			copilotAcp: isCopilotAcpCommand(spawnCommand, args),
  			claudeAcp: isClaudeAcpCommand(spawnCommand, args),

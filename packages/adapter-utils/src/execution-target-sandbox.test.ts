@@ -1,3 +1,4 @@
+import { terminateFixturesUnder } from "../../../scripts/test-fixture-cleanup.mjs";
 import { createServer } from "node:http";
 import http2 from "node:http2";
 import net from "node:net";
@@ -130,6 +131,7 @@ describe("sandbox adapter execution targets", () => {
     while (cleanupDirs.length > 0) {
       const dir = cleanupDirs.pop();
       if (!dir) continue;
+      terminateFixturesUnder(dir);
       await rm(dir, { recursive: true, force: true }).catch(() => undefined);
     }
   });

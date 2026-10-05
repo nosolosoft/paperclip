@@ -1,3 +1,4 @@
+import { terminateFixturesUnder } from "../../../../scripts/test-fixture-cleanup.mjs";
 // Characterization baselines for ACP run settlement/teardown. These tests PIN
 // the current behavior of the engine's teardown orchestration (Layer A), the
 // `restoreWorkspace` internal order plus native-sync selection (Layer B), and
@@ -60,7 +61,7 @@ async function makeTempRoot() {
 afterEach(async () => {
   await Promise.all(
     tempRoots.splice(0).map((root) =>
-      fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }),
+      (terminateFixturesUnder(root), fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })),
     ),
   );
 });

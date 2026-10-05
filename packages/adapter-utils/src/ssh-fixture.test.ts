@@ -1,3 +1,4 @@
+import { terminateFixturesUnder } from "../../../scripts/test-fixture-cleanup.mjs";
 import { execFile, spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import net from "node:net";
@@ -67,6 +68,7 @@ async function drainFixtureTeardowns(): Promise<void> {
         continue;
       }
     }
+    terminateFixturesUnder(entry.rootDir);
     await rm(entry.rootDir, { recursive: true, force: true }).catch(() => undefined);
   }
 }

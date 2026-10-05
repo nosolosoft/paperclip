@@ -1,6 +1,7 @@
 #!/usr/bin/env node
+import { terminateFixturesUnder } from "./test-fixture-cleanup.mjs";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, statSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -289,6 +290,8 @@ function runVitest(args, label) {
     env,
     stdio: "inherit",
   });
+  terminateFixturesUnder(testRoot);
+  rmSync(testRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   if (result.error) {
     console.error(`[test:run] Failed to start Vitest: ${result.error.message}`);
     process.exit(1);

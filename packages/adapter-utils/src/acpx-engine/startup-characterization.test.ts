@@ -1,3 +1,4 @@
+import { terminateFixturesUnder } from "../../../../scripts/test-fixture-cleanup.mjs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -44,7 +45,7 @@ afterEach(async () => {
   // same way production tolerates it, instead of failing the just-passed test.
   await Promise.all(
     tempRoots.splice(0).map((root) =>
-      fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }),
+      (terminateFixturesUnder(root), fs.rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })),
     ),
   );
 });

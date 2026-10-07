@@ -14,7 +14,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Router } from "express";
 import type { Request } from "express";
-import { and, desc, eq, gt, inArray, isNotNull, isNull, lte, ne, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNotNull, isNull, lte, ne } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   assets,
@@ -47,7 +47,7 @@ import {
   PERMISSION_KEYS,
   isUuidLike,
 } from "@paperclipai/shared";
-import type { DeploymentExposure, DeploymentMode, HumanCompanyMembershipRole, PermissionKey } from "@paperclipai/shared";
+import type { DeploymentExposure, DeploymentMode, HumanCompanyMembershipRole } from "@paperclipai/shared";
 import {
   forbidden,
   conflict,
@@ -57,6 +57,7 @@ import {
   tooManyRequests
 } from "../errors.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
+import { runtimeCanonicalOrigin } from "../services/cloud-runtime-identity.js";
 
 /**
  * Floor: when the hosting operator hides the Instance Access surface
@@ -121,11 +122,6 @@ const INVITE_TOKEN_MAX_RETRIES = 5;
 const COMPANY_INVITE_TTL_MS = 72 * 60 * 60 * 1000;
 const INVITE_RESOLUTION_DNS_TIMEOUT_MS = 3_000;
 
-type MemberGrantPayload = {
-  permissionKey: PermissionKey;
-  scope?: Record<string, unknown> | null;
-};
-
 export function createInviteToken() {
   const suffix = randomBytes(INVITE_TOKEN_ENTROPY_BYTES).toString("base64url");
   return `${INVITE_TOKEN_PREFIX}${suffix}`;
@@ -158,6 +154,8 @@ function requestBaseUrl(req: Request) {
 }
 
 function resolveBaseUrl(req: Request, authPublicBaseUrl?: string): string {
+  const runtimeOrigin = runtimeCanonicalOrigin();
+  if (runtimeOrigin) return runtimeOrigin;
   if (authPublicBaseUrl) return authPublicBaseUrl.replace(/\/+$/, "");
   return requestBaseUrl(req);
 }
@@ -671,6 +669,17 @@ export function canReplayOpenClawGatewayInviteAccept(input: {
     input.existingJoinRequest.status === "pending_approval" ||
     input.existingJoinRequest.status === "approved"
   );
+}
+
+export function assertLegacyAgentInviteAdapterType(
+  adapterType: string | null | undefined,
+) {
+  if (adapterType === "paperclip_runner") {
+    throw badRequest(
+      "Paperclip Runner is not available through agent invite onboarding.",
+      { code: "paperclip_runner_invite_onboarding_disabled" },
+    );
+  }
 }
 
 function summarizeSecretForLog(
@@ -2783,12 +2792,13 @@ export function accessRoutes(
     const token =
       typeof req.query.token === "string" ? req.query.token.trim() : "";
     if (!id || !token) throw notFound("CLI auth challenge not found");
+    if (!isUuidLike(id)) throw badRequest("Invalid CLI auth challenge ID");
     const challenge = await boardAuth.describeCliAuthChallenge(id, token);
     if (!challenge) throw notFound("CLI auth challenge not found");
 
     const isSignedInBoardUser =
       req.actor.type === "board" &&
-      (req.actor.source === "session" || isLocalImplicit(req)) &&
+      (req.actor.source === "session" || req.actor.source === "cloud_tenant" || isLocalImplicit(req)) &&
       Boolean(req.actor.userId);
     const canApprove =
       isSignedInBoardUser &&
@@ -2815,6 +2825,7 @@ export function accessRoutes(
       ) {
         throw unauthorized("Sign in before approving CLI access");
       }
+      if (!isUuidLike(id)) throw badRequest("Invalid CLI auth challenge ID");
 
       const userId = req.actor.userId ?? "local-board";
       const approved = await boardAuth.approveCliAuthChallenge(
@@ -2862,6 +2873,7 @@ export function accessRoutes(
     validate(resolveCliAuthChallengeSchema),
     async (req, res) => {
       const id = (req.params.id as string).trim();
+      if (!isUuidLike(id)) throw badRequest("Invalid CLI auth challenge ID");
       const cancelled = await boardAuth.cancelCliAuthChallenge(id, req.body.token);
       res.json({
         status: cancelled.status,
@@ -3754,6 +3766,11 @@ export function accessRoutes(
           })
         );
       const adapterType = req.body.adapterType ?? null;
+      if (requestType === "agent") {
+        assertLegacyAgentInviteAdapterType(
+          adapterType ?? existingJoinRequestForInvite?.adapterType ?? null,
+        );
+      }
       if (
         inviteAlreadyAccepted &&
         !canReplayHumanInviteAccept &&
@@ -4233,6 +4250,7 @@ export function accessRoutes(
           req.actor.userId ?? null
         );
       } else {
+        assertLegacyAgentInviteAdapterType(existing.adapterType);
         const existingAgents = await agents.list(companyId);
         const managerId = resolveJoinRequestAgentManagerId(existingAgents);
         if (!managerId) {
@@ -4529,7 +4547,13 @@ export function accessRoutes(
       const updated = await access.updateMemberAndPermissions(
         companyId,
         memberId,
-        { ...req.body, grants: (req.body.grants ?? []) as MemberGrantPayload[] },
+        {
+          membershipRole: req.body.membershipRole,
+          status: req.body.status,
+          replacementResponsibleUserId: req.body.replacementResponsibleUserId,
+          apiKeyDisposition: req.body.apiKeyDisposition,
+          grants: req.body.grants ?? [],
+        },
         req.actor.userId ?? null,
       );
       if (!updated) throw notFound("Member not found");

@@ -1,7 +1,41 @@
 diff --git a/dist/live-checkpoint-sB7dFOYR.js b/dist/live-checkpoint-sB7dFOYR.js
-index 021c4e48b76c69d9f9b526e074d3698c6e42c134..189d1e3da7248a32714ff7b2c767b359791e88a4 100644
+index 021c4e48b76c69d9f9b526e074d3698c6e42c134..587a831463742b2880dc218315a8021a35098504 100644
 --- a/dist/live-checkpoint-sB7dFOYR.js
 +++ b/dist/live-checkpoint-sB7dFOYR.js
+@@ -2793,7 +2793,7 @@ function readCommandLineChar(state) {
+ 		escaping: false,
+ 		hasPart: true
+ 	};
+-	if (state.ch === "\\" && state.quote !== "'") return {
++	if (process.platform !== "win32" && state.ch === "\\" && state.quote !== "'") return {
+ 		current: state.current,
+ 		quote: state.quote,
+ 		escaping: true,
+@@ -3150,9 +3150,9 @@ function promotePrefixedAuthEnvironment(env) {
+ function validateAgentProcessEnv(agentProcessEnv) {
+ 	for (const [key, value] of Object.entries(agentProcessEnv ?? {})) if (typeof value !== "string" || key.includes("=") || key.includes("\0") || value.includes("\0")) throw new Error("Invalid agentProcessEnv: environment entries cannot contain NUL or names with '='");
+ }
+-function buildAgentEnvironment(authCredentials, sessionEnv, agentProcessEnv) {
++function buildAgentEnvironment(authCredentials, sessionEnv, agentProcessEnv, inheritProcessEnv = true) {
+ 	validateAgentProcessEnv(agentProcessEnv);
+-	const env = { ...process.env };
++	const env = inheritProcessEnv === false ? {} : { ...process.env };
+ 	const protectedAuthEnvKeys = promotePrefixedAuthEnvironment(env);
+ 	if (authCredentials) for (const [methodId, credential] of Object.entries(authCredentials)) {
+ 		addAuthCredentialEnvKeys(protectedAuthEnvKeys, methodId, credential);
+@@ -3194,10 +3194,10 @@ function resolveConfiguredAuthCredential(methodId, authCredentials) {
+ 	const configCredentials = authCredentials ?? {};
+ 	return configCredentials[methodId] ?? configCredentials[toEnvToken(methodId)];
+ }
+-function buildAgentSpawnOptions(cwd, authCredentials, sessionEnv, agentProcessEnv) {
++function buildAgentSpawnOptions(cwd, authCredentials, sessionEnv, agentProcessEnv, inheritProcessEnv) {
+ 	return {
+ 		cwd,
+-		env: buildAgentEnvironment(authCredentials, sessionEnv, agentProcessEnv),
++		env: buildAgentEnvironment(authCredentials, sessionEnv, agentProcessEnv, inheritProcessEnv),
+ 		stdio: [
+ 			"pipe",
+ 			"pipe",
 @@ -3451,14 +3451,14 @@ function toCommandLine(command, args) {
  	const renderedArgs = (args ?? []).map((arg) => JSON.stringify(arg)).join(" ");
  	return renderedArgs.length > 0 ? `${command} ${renderedArgs}` : command;
@@ -77,17 +111,39 @@ index 021c4e48b76c69d9f9b526e074d3698c6e42c134..189d1e3da7248a32714ff7b2c767b359
  	if (spawnCommand.killProcessGroup) spawnOptions.detached = true;
  	const proc = spawn(spawnCommand.command, spawnCommand.args, spawnOptions);
  	await waitForSpawn(proc);
-@@ -4204,7 +4206,8 @@ var AcpClient = class {
+@@ -4075,10 +4077,19 @@ function resolveClientCapabilities(params) {
+ 			...params.elicitationModes.includes("url") ? { url: {} } : {}
+ 		} } : {}
+ 	};
+-	if (!params.devinAcp) return baseCapabilities;
++	const typedSessionFailureMeta = {
++		jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } }
++	};
++	if (!params.devinAcp) return {
++		...baseCapabilities,
++		_meta: typedSessionFailureMeta
++	};
+ 	return {
+ 		...baseCapabilities,
+-		_meta: DEVIN_COMPATIBILITY_CLIENT_CAPABILITIES_META
++		_meta: {
++			...typedSessionFailureMeta,
++			...DEVIN_COMPATIBILITY_CLIENT_CAPABILITIES_META
++		}
+ 	};
+ }
+ function hasResponseField(response, field) {
+@@ -4204,7 +4215,8 @@ var AcpClient = class {
  			nonInteractivePermissions: this.options.nonInteractivePermissions,
  			onOperation: (operation) => {
  				this.eventHandlers.onClientOperation?.(operation);
 -			}
 +			},
-+			resolveAgentEnv: () => buildAgentEnvironment(this.options.authCredentials, this.options.sessionOptions?.env, this.options.agentProcessEnv)
++			resolveAgentEnv: () => buildAgentEnvironment(this.options.authCredentials, this.options.sessionOptions?.env, this.options.agentProcessEnv, this.options.inheritProcessEnv)
  		});
  	}
  	get initializeResult() {
-@@ -4295,6 +4298,10 @@ var AcpClient = class {
+@@ -4295,6 +4307,10 @@ var AcpClient = class {
  		const startupStderr = [];
  		child.stderr.on("data", (chunk) => {
  			this.captureStartupStderr(startupStderr, chunk);
@@ -98,20 +154,77 @@ index 021c4e48b76c69d9f9b526e074d3698c6e42c134..189d1e3da7248a32714ff7b2c767b359
  			if (!this.options.verbose) return;
  			process.stderr.write(chunk);
  		});
-@@ -4341,7 +4348,7 @@ var AcpClient = class {
+@@ -4341,7 +4357,7 @@ var AcpClient = class {
  			geminiAcp: isGeminiAcpCommand(spawnCommand, args),
  			copilotAcp: isCopilotAcpCommand(spawnCommand, args),
  			claudeAcp: isClaudeAcpCommand(spawnCommand, args),
 -			spawnOptions: buildAgentSpawnOptions(this.options.cwd, this.options.authCredentials, this.options.sessionOptions?.env, this.options.agentProcessEnv)
-+			spawnOptions: buildAgentSpawnOptions(this.options.spawnCwd ?? this.options.cwd, this.options.authCredentials, this.options.sessionOptions?.env, this.options.agentProcessEnv)
++			spawnOptions: buildAgentSpawnOptions(this.options.spawnCwd ?? this.options.cwd, this.options.authCredentials, this.options.sessionOptions?.env, this.options.agentProcessEnv, this.options.inheritProcessEnv)
  		};
  	}
  	logAgentLaunch(plan) {
+@@ -6655,6 +6671,27 @@ async function withConnectedSession(options) {
+ //#region src/runtime/engine/prompt-turn.ts
+ const SESSION_REPLY_IDLE_MS = 1e3;
+ const SESSION_REPLY_DRAIN_TIMEOUT_MS = 5e3;
++const TYPED_SESSION_FAILURE_CATEGORIES = /* @__PURE__ */ new Set([
++	"connection",
++	"access",
++	"limit",
++	"service",
++	"request",
++	"unknown"
++]);
++function typedTerminalSessionFailureCategory(response) {
++	if (response === null || typeof response !== "object" || Array.isArray(response)) return null;
++	const meta = response._meta;
++	if (meta === null || typeof meta !== "object" || Array.isArray(meta)) return null;
++	const jetbrains = meta.jetbrains;
++	if (jetbrains === null || typeof jetbrains !== "object" || Array.isArray(jetbrains)) return null;
++	const air = jetbrains.air;
++	if (air === null || typeof air !== "object" || Array.isArray(air)) return null;
++	if (!Number.isInteger(air.version) || air.version < 1) return null;
++	const failure = air.sessionFailure;
++	if (failure === null || typeof failure !== "object" || Array.isArray(failure) || failure.severity !== "error") return null;
++	return typeof failure.category === "string" && TYPED_SESSION_FAILURE_CATEGORIES.has(failure.category) ? failure.category : "unknown";
++}
+ function responseMetaField(meta) {
+ 	return meta === void 0 ? {} : { _meta: meta };
+ }
+@@ -6679,6 +6716,20 @@ async function runPromptTurn(params) {
+ 			idleMs: SESSION_REPLY_IDLE_MS,
+ 			timeoutMs: SESSION_REPLY_DRAIN_TIMEOUT_MS
+ 		}).catch(() => {});
++		const terminalFailureCategory = typedTerminalSessionFailureCategory(response);
++		if (terminalFailureCategory !== null) {
++			// Pass complete provider text to the diagnostic callback. Consumers redact
++			// before bounding it; truncating here can split and expose a credential.
++			const failure = response._meta.jetbrains.air.sessionFailure;
++			try {
++				params.onTerminalSessionFailure?.({
++					category: terminalFailureCategory,
++					...typeof failure.title === "string" ? { title: failure.title } : {},
++					...typeof failure.details === "string" ? { details: failure.details } : {}
++				});
++			} catch {}
++			throw new Error(`ACP agent reported a terminal ${terminalFailureCategory} failure.`);
++		}
+ 		recordPromptResponseUsage(params.conversation, response.usage, params.promptMessageId);
+ 		return {
+ 			stopReason: response.stopReason,
 diff --git a/dist/runtime.d.ts b/dist/runtime.d.ts
-index 05152b2465f2c97cc3407b3fb3e1ba44e4697430..3b59e85018c01e91a85c54734da94b169ba05522 100644
+index 05152b2465f2c97cc3407b3fb3e1ba44e4697430..166bcfc4eb13210b4d3fc34aedc5704b8616ba29 100644
 --- a/dist/runtime.d.ts
 +++ b/dist/runtime.d.ts
-@@ -313,6 +313,10 @@ type AcpRuntimeOptions = {
+@@ -44,6 +44,7 @@ type AcpRuntimeTurnAttachment = {
+   data: string;
+ };
+ type AcpRuntimeTurnInput = {
++  onTerminalSessionFailure?: (failure: { category: string; title?: string; details?: string }) => void;
+   handle: AcpRuntimeHandle;
+   text: string;
+   attachments?: AcpRuntimeTurnAttachment[];
+@@ -313,6 +314,12 @@ type AcpRuntimeOptions = {
    timeoutMs?: number;
    probeAgent?: string;
    verbose?: boolean;
@@ -119,29 +232,72 @@ index 05152b2465f2c97cc3407b3fb3e1ba44e4697430..3b59e85018c01e91a85c54734da94b16
 +  onAgentStderr?: (chunk: string) => void;
 +  /** Host-only: chdir for the spawned child, independent of the advertised ACP cwd. */
 +  spawnCwd?: string;
++  /** Host-only: when false the agent child does not inherit process.env; agentProcessEnv still applies last. */
++  inheritProcessEnv?: boolean;
    /** ACP elicitation modes the embedding host can render for prompt turns. */
    elicitationModes?: readonly AcpElicitationMode[];
    /** Optional lifecycle observer for ACP agent processes owned by this runtime. */
+@@ -375,6 +382,7 @@ declare class AcpRuntimeManager {
+   private prepareInitialRuntimeRecord;
+   private retainInitializedSessionOwner;
+   startTurn(input: {
++    onTerminalSessionFailure?: (failure: { category: string; title?: string; details?: string }) => void;
+     handle: AcpRuntimeHandle;
+     text: string;
+     attachments?: AcpRuntimeTurnAttachment[];
+@@ -418,6 +426,7 @@ declare class AcpRuntimeManager {
+   private cleanupRuntimeTurn;
+   private finalizeRuntimeTurnRecord;
+   runTurn(input: {
++    onTerminalSessionFailure?: (failure: { category: string; title?: string; details?: string }) => void;
+     handle: AcpRuntimeHandle;
+     text: string;
+     attachments?: AcpRuntimeTurnAttachment[];
 diff --git a/dist/runtime.js b/dist/runtime.js
-index 3888cc171910d0df938673143dd29b93949488a2..4f00f24d86475d55e2186b41ad2a8d86916ea66e 100644
+index 3888cc171910d0df938673143dd29b93949488a2..c435aa573578f372004fb93a1100a09df071f915 100644
 --- a/dist/runtime.js
 +++ b/dist/runtime.js
-@@ -791,7 +791,9 @@ var AcpRuntimeManager = class {
+@@ -791,7 +791,10 @@ var AcpRuntimeManager = class {
  	createClient(options) {
  		const clientOptions = {
  			...options,
 -			agentProcessEnv: this.options.agentProcessEnv
 +			agentProcessEnv: this.options.agentProcessEnv,
 +			onAgentStderr: this.options.onAgentStderr,
-+			spawnCwd: this.options.spawnCwd
++			spawnCwd: this.options.spawnCwd,
++			inheritProcessEnv: this.options.inheritProcessEnv
  		};
  		return this.deps.clientFactory?.(clientOptions) ?? new AcpClient(clientOptions);
  	}
+@@ -1279,6 +1282,7 @@ var AcpRuntimeManager = class {
+ 				client: turn.client,
+ 				sessionId,
+ 				prompt: task.promptInput,
++				onTerminalSessionFailure: task.input.onTerminalSessionFailure,
+ 				timeoutMs: task.input.timeoutMs ?? this.options.timeoutMs,
+ 				conversation: turn.conversation,
+ 				promptMessageId: turn.promptMessageId,
+@@ -2040,6 +2044,7 @@ var AcpxRuntime = class {
+ 		const turnPromise = this.getManager().then((manager) => manager.startTurn({
+ 			handle,
+ 			text: input.text,
++			onTerminalSessionFailure: input.onTerminalSessionFailure,
+ 			attachments: input.attachments,
+ 			mode: input.mode,
+ 			sessionMode: state.mode,
+@@ -2072,6 +2077,7 @@ var AcpxRuntime = class {
+ 		yield* (await this.getManager()).runTurn({
+ 			handle,
+ 			text: input.text,
++			onTerminalSessionFailure: input.onTerminalSessionFailure,
+ 			attachments: input.attachments,
+ 			mode: input.mode,
+ 			sessionMode: state.mode,
 diff --git a/dist/session-options-DyIGRNfu.d.ts b/dist/session-options-DyIGRNfu.d.ts
-index 0ffef0232ac4091fcad55933d357d9cfe1f8cc7f..9e94f595e81506c2cafcdf87bb74372807975762 100644
+index 0ffef0232ac4091fcad55933d357d9cfe1f8cc7f..d780df156f1647656f0c31f41141cb8463ff5200 100644
 --- a/dist/session-options-DyIGRNfu.d.ts
 +++ b/dist/session-options-DyIGRNfu.d.ts
-@@ -140,6 +140,10 @@ type AcpClientOptions = {
+@@ -140,6 +140,12 @@ type AcpClientOptions = {
    /** Trusted child-only environment overlay; never persisted as session options. */
    agentProcessEnv?: Record<string, string>;
    cwd: string;
@@ -149,6 +305,8 @@ index 0ffef0232ac4091fcad55933d357d9cfe1f8cc7f..9e94f595e81506c2cafcdf87bb743728
 +  onAgentStderr?: (chunk: string) => void;
 +  /** Host-only: chdir for the spawned child, independent of the advertised ACP cwd. */
 +  spawnCwd?: string;
++  /** Host-only: when false the agent child does not inherit process.env; agentProcessEnv still applies last. */
++  inheritProcessEnv?: boolean;
    mcpServers?: McpServer[];
    permissionMode: PermissionMode;
    nonInteractivePermissions?: NonInteractivePermissionPolicy;

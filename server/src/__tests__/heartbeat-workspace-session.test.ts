@@ -18,7 +18,6 @@ import {
   buildEffectiveRunWorkspaceConfigMetadata,
   buildWorkspaceConfigFreshnessOperation,
   deriveTaskKeyWithHeartbeatFallback,
-  extractWakeCommentIds,
   formatRuntimeWorkspaceWarningLog,
   mergeExecutionWorkspaceMetadataForPersistence,
   mergeCoalescedContextSnapshot,
@@ -27,6 +26,7 @@ import {
   parseSessionCompactionPolicy,
   provisionExecutionWorkspaceForFreshnessDecision,
   reconcileReusedExecutionWorkspaceProjectWorkspaceId,
+  resolveNativeRecoveryExecutionWorkspaceBinding,
   resolveExecutionWorkspaceBranchOwnership,
   resolveExecutionWorkspaceConfigFreshness,
   resolveExecutionWorkspaceReuseRequestForIssue,
@@ -44,6 +44,7 @@ import {
   stripConfiguredModelFromSessionParams,
   stripPaperclipSessionMetadataFromSessionParams,
   normalizeSessionParams,
+  isTaskSessionCredentialCompatible,
   shouldResetTaskSessionForWake,
   scrubGitCredentialText,
   buildAnchorFallbackWorkspaceNotes,
@@ -522,6 +523,17 @@ describe("assertGitSensitiveAdapterWorkspaceValid", () => {
       "has no .git metadata",
     );
   });
+  it("allows a repository-free project default workspace without Git metadata", async () => {
+    const input = buildWorkspaceValidationInput();
+    const cwd = "/tmp/paperclip-project-default-without-git";
+    await expect(assertGitSensitiveAdapterWorkspaceValid(buildWorkspaceValidationInput({
+      issue: { ...input.issue!, projectWorkspaceId: null },
+      resolvedWorkspace: buildResolvedWorkspace({ cwd, workspaceId: null }),
+      executionWorkspace: { ...input.executionWorkspace, baseCwd: cwd, cwd, workspaceId: null },
+      persistedExecutionWorkspace: { ...input.persistedExecutionWorkspace!, cwd, projectWorkspaceId: null },
+    }))).resolves.toBeUndefined();
+  });
+
 
   it("does not apply the git-sensitive workspace guard to non-local execution targets", async () => {
     const input = buildWorkspaceValidationInput();
@@ -1248,6 +1260,31 @@ describe("resolveWorkspaceAfterLowTrustPreflight", () => {
 });
 
 describe("resolveRuntimeSessionParamsForWorkspace", () => {
+  it("keeps a legacy projectless Codex session in the default agent workspace", () => {
+    const agentId = "agent-projectless-legacy";
+    const fallbackCwd = resolveDefaultAgentWorkspaceDir(agentId);
+    const previousSessionParams = {
+      sessionId: "legacy-session-1",
+      cwd: fallbackCwd,
+    };
+
+    const result = resolveRuntimeSessionParamsForWorkspace({
+      agentId,
+      previousSessionParams,
+      resolvedWorkspace: buildResolvedWorkspace({
+        cwd: fallbackCwd,
+        source: "agent_home",
+        projectId: null,
+        workspaceId: null,
+      }),
+    });
+
+    expect(result).toEqual({
+      sessionParams: previousSessionParams,
+      warning: null,
+    });
+  });
+
   it("migrates fallback workspace sessions to project workspace when project cwd becomes available", () => {
     const agentId = "agent-123";
     const fallbackCwd = resolveDefaultAgentWorkspaceDir(agentId);
@@ -1804,6 +1841,17 @@ describe("effective run execution workspace config freshness", () => {
     expect(realizeWorkspace).not.toHaveBeenCalled();
   });
 
+  it("does not mistake a projectless native run-id binding for a missing persisted workspace", () => {
+    expect(resolveNativeRecoveryExecutionWorkspaceBinding({
+      bindingId: "run-projectless",
+      persistedWorkspaceFound: false,
+    })).toBeNull();
+    expect(resolveNativeRecoveryExecutionWorkspaceBinding({
+      bindingId: "workspace-persisted",
+      persistedWorkspaceFound: true,
+    })).toBe("workspace-persisted");
+  });
+
   // Regression for the CEO-agent workspace-poisoning bug: a project issue's persisted
   // execution_workspace_id can itself already be a poisoned ambient scratch dir (no git
   // checkout) — observed in production with metadata.source "task_session", not just
@@ -2183,7 +2231,7 @@ describe("shouldResetTaskSessionForModelChange", () => {
         configuredModel: "gpt-5.4-mini",
         taskSessionParams: {
           sessionId: "thread-1",
-          __paperclipConfiguredModel: "gpt-5.4-mini",
+        __paperclipConfiguredModel: "gpt-5.4-mini",
         },
       }),
     ).toBe(false);
@@ -2242,7 +2290,6 @@ async function buildSessionConfigMetadata(
         maxConcurrentRuns: 1,
       },
     },
-    modelProfile: null,
     issueOverrides: null,
     workspaceConfig: {
       requestedMode: "agent_default",
@@ -2312,6 +2359,46 @@ function sessionParamsWithConfigMetadata(
 }
 
 describe("effective run session config freshness", () => {
+  it("reuses managed AI sessions across temporary credential homes while preserving configuration boundaries", async () => {
+    const config = (home: string) => ({
+      model: "gpt-5.4-mini",
+      approvalPolicy: "never",
+      managedAiConnection: { identity: "account-1:credential-generation-1" },
+      env: {
+        HOME: home,
+        XDG_CONFIG_HOME: path.join(home, "config"),
+        XDG_DATA_HOME: path.join(home, "data"),
+        CODEX_HOME: path.join(home, "provider"),
+        GROK_HOME: path.join(home, "provider"),
+        CLAUDE_CONFIG_DIR: path.join(home, "provider"),
+        CUSTOM_SETTING: "original",
+      },
+    });
+    const first = await buildSessionConfigMetadata({ effectiveAdapterConfig: config("/tmp/ai-first"), managedAiHome: "/tmp/ai-first" });
+    const nextConfig = config("/tmp/ai-next");
+    const next = await buildSessionConfigMetadata({ effectiveAdapterConfig: nextConfig, managedAiHome: "/tmp/ai-next" });
+    expect(next.fingerprint).toBe(first.fingerprint);
+    expect(nextConfig.env.HOME).toBe("/tmp/ai-next");
+    expect(resolveTaskSessionConfigFreshness({
+      hasTaskSession: true, configuredModel: "gpt-5.4-mini",
+      taskSessionParams: sessionParamsWithConfigMetadata(first), configMetadata: next,
+    }).reset).toBe(false);
+    for (const changed of [
+      { ...nextConfig, model: "different-model" },
+      { ...nextConfig, approvalPolicy: "on-request" },
+      { ...nextConfig, managedAiConnection: { identity: "account-2:credential-generation-1" } },
+      { ...nextConfig, managedAiConnection: { identity: "account-1:credential-generation-2" } },
+      { ...nextConfig, env: { ...nextConfig.env, CUSTOM_SETTING: "changed" } },
+      { ...nextConfig, env: { ...nextConfig.env, CODEX_HOME: "/custom/provider" } },
+    ]) {
+      const metadata = await buildSessionConfigMetadata({ effectiveAdapterConfig: changed, managedAiHome: "/tmp/ai-next" });
+      expect(metadata.fingerprint).not.toBe(first.fingerprint);
+    }
+    const unmanagedFirst = await buildSessionConfigMetadata({ effectiveAdapterConfig: config("/custom/first") });
+    const unmanagedNext = await buildSessionConfigMetadata({ effectiveAdapterConfig: config("/custom/next") });
+    expect(unmanagedFirst.fingerprint).not.toBe(unmanagedNext.fingerprint);
+  });
+
   it("resets when effective adapter config changes after model/profile/env resolution", async () => {
     const base = await buildSessionConfigMetadata();
     const next = await buildSessionConfigMetadata({
@@ -2387,6 +2474,45 @@ describe("effective run session config freshness", () => {
     });
   });
 
+  it("does not reset when a reusable execution workspace becomes realized", async () => {
+    const base = await buildSessionConfigMetadata({
+      workspaceConfig: {
+        requestedMode: "shared_workspace",
+        effectiveMode: "shared_workspace",
+        reusableExecutionWorkspaceConfig: null,
+        existingExecutionWorkspace: null,
+      },
+    });
+    const realized = await buildSessionConfigMetadata({
+      workspaceConfig: {
+        requestedMode: "shared_workspace",
+        effectiveMode: "shared_workspace",
+        reusableExecutionWorkspaceConfig: {
+          strategyType: "project_primary",
+          workspaceGeneration: 1,
+        },
+        existingExecutionWorkspace: {
+          id: "workspace-realized-after-first-turn",
+          mode: "shared_workspace",
+          strategyType: "project_primary",
+        },
+      },
+    });
+
+    expect(
+      resolveTaskSessionConfigFreshness({
+        hasTaskSession: true,
+        configuredModel: "gpt-5.4-mini",
+        taskSessionParams: sessionParamsWithConfigMetadata(base),
+        configMetadata: realized,
+      }),
+    ).toMatchObject({
+      reset: false,
+      changedCategories: [],
+      reasons: [],
+    });
+  });
+
   it("keeps model-only compatibility as an additional reset reason", async () => {
     const base = await buildSessionConfigMetadata();
 
@@ -2455,24 +2581,13 @@ describe("effective run session config freshness", () => {
     expect(decision.reasons).toEqual([]);
   });
 
-  it("names safe categories for model profile, issue override, env, secret, and runtime skill drift", async () => {
+  it("names safe categories for issue override, env, secret, and runtime skill drift", async () => {
     const base = await buildSessionConfigMetadata();
     const cases: Array<{
       name: string;
       category: string;
       metadata: SessionConfigMetadata;
     }> = [
-      {
-        name: "model profile",
-        category: "modelProfile",
-        metadata: await buildSessionConfigMetadata({
-          modelProfile: {
-            requested: "cheap",
-            applied: true,
-            configSource: "agent_runtime",
-          },
-        }),
-      },
       {
         name: "issue overrides",
         category: "issueOverrides",
@@ -2653,6 +2768,7 @@ describe("stripPaperclipSessionMetadataFromSessionParams", () => {
       stripPaperclipSessionMetadataFromSessionParams({
         sessionId: "thread-1",
         cwd: "/tmp/project",
+        paperclipAiCredentialIdentity: "grant:user:generation",
         __paperclipConfiguredModel: "gpt-5.4-mini",
         __paperclipConfigFingerprint: "v1:sha256:abc",
         __paperclipConfigFingerprintVersion: 1,
@@ -2663,6 +2779,30 @@ describe("stripPaperclipSessionMetadataFromSessionParams", () => {
       sessionId: "thread-1",
       cwd: "/tmp/project",
     });
+  });
+});
+
+describe("isTaskSessionCredentialCompatible", () => {
+  it("retains the server-owned identity even when the Codex codec drops it", () => {
+    const saved = { sessionId: "thread-1", paperclipAiCredentialIdentity: "grant:user:generation" };
+    const decoded = codexSessionCodec.deserialize(saved);
+    expect(decoded).toEqual({ sessionId: "thread-1" });
+    expect(isTaskSessionCredentialCompatible(saved, "grant:user:generation")).toBe(true);
+  });
+
+  it.each([
+    undefined,
+    null,
+    {},
+    { paperclipAiCredentialIdentity: "other-grant:user:generation" },
+    { paperclipAiCredentialIdentity: "grant:other-user:generation" },
+    { paperclipAiCredentialIdentity: "grant:user:new-generation" },
+  ])("requires the same saved grant, responsible user, and credential generation: %j", (saved) => {
+    expect(isTaskSessionCredentialCompatible(saved, "grant:user:generation")).toBe(false);
+  });
+
+  it("preserves unmanaged session behavior", () => {
+    expect(isTaskSessionCredentialCompatible({ sessionId: "thread-1" }, undefined)).toBe(true);
   });
 });
 
@@ -2711,7 +2851,7 @@ describe("deriveTaskKeyWithHeartbeatFallback", () => {
 });
 
 describe("comment wake batching", () => {
-  it("preserves ordered wake comment ids when coalescing queued follow-up wakes", () => {
+  it("updates the latest comment when coalescing queued follow-up wakes", () => {
     const merged = mergeCoalescedContextSnapshot(
       {
         issueId: "issue-1",
@@ -2729,7 +2869,7 @@ describe("comment wake batching", () => {
       },
     );
 
-    expect(extractWakeCommentIds(merged)).toEqual(["comment-1", "comment-2"]);
+    expect(merged.wakeCommentIds).toEqual(["comment-1", "comment-2"]);
     expect(merged.commentId).toBe("comment-2");
     expect(merged.wakeCommentId).toBe("comment-2");
     expect(merged.paperclipWake).toBeUndefined();

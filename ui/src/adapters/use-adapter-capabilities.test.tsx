@@ -46,7 +46,6 @@ describe("useAdapterCapabilities", () => {
       supportsSkills: true,
       supportsLocalAgentJwt: true,
       requiresMaterializedRuntimeSkills: true,
-      supportsModelProfiles: true,
       supportsAcp: true,
     });
 

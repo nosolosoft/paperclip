@@ -5,6 +5,7 @@
 ### Patch Changes
 
 - Allow the Paperclip host to route adapter sandbox-sync full-tree Git enumeration through its process-wide bounded scheduler.
+- Keep workspace Git diagnostics locale-independent so ordinary non-repository workspaces use directory sync and sandbox environment probes can prepare their managed configuration on localized hosts.
 
 ## 0.3.1
 

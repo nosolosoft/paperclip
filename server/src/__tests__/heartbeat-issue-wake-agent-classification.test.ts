@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { agentOwnsIssueDispositionContract, classifyIssueWakeAgent } from "../services/heartbeat.ts";
+import { agentOwnsIssueDispositionContract } from "../services/heartbeat.ts";
+import { classifyIssueWakeAgent } from "../modules/wake-queue/index.ts";
 import { resolveQaRouting } from "../services/qa-routing.ts";
 
 describe("classifyIssueWakeAgent", () => {

@@ -1,5 +1,3 @@
-import type { AdapterModelProfileDefinition } from "@paperclipai/adapter-utils";
-
 export const type = "omp_local";
 export const label = "OMP";
 
@@ -59,39 +57,6 @@ export const models: Array<{ id: string; label: string }> = [
   { id: DEFAULT_OMP_LOCAL_MODEL, label: DEFAULT_OMP_LOCAL_MODEL },
   { id: "cliproxy-openai/gpt-5.6-luna", label: "cliproxy-openai/gpt-5.6-luna" },
 ];
-
-export const DEFAULT_OMP_CHEAP_MODEL = "cliproxy-openai/gpt-5.6-luna";
-
-// The "cheap" budget profile (used for recovery retries and other low-cost lanes).
-// Defaults to OMP's Luna model, but is overridable so a deployment
-// routing through a gateway that does not serve that model (e.g. an EU LLM gateway)
-// can point the budget lane at a gateway-served model instead -- otherwise recovery
-// retries fail with "model not found". PAPERCLIP_OMP_CHEAP_MODEL takes priority;
-// PAPERCLIP_OMP_SMALL_MODEL (the auxiliary/title model) is reused as a sensible
-// fallback so a single setting covers both budget lanes. The default keeps the
-// upstream behaviour (with `variant: "low"`).
-//
-// This module is shared client/server code (the UI imports it for
-// DEFAULT_OMP_LOCAL_MODEL etc.), so it must not touch the global `process`
-// unguarded: in the browser (Vite dev middleware serves it untransformed)
-// a bare `process.env` throws ReferenceError at module load and takes the whole
-// app down. Guard with `typeof process` and fall back to an empty env.
-export function buildOMPModelProfiles(
-  env: NodeJS.ProcessEnv = typeof process === "undefined" ? {} : process.env,
-): AdapterModelProfileDefinition[] {
-  const override = (env.PAPERCLIP_OMP_CHEAP_MODEL ?? env.PAPERCLIP_OMP_SMALL_MODEL)?.trim();
-  return [
-    {
-      key: "cheap",
-      label: "Cheap",
-      description: "Budget lane model for recovery retries and other low-cost tasks.",
-      adapterConfig: { model: override || DEFAULT_OMP_CHEAP_MODEL },
-      source: "adapter_default",
-    },
-  ];
-}
-
-export const modelProfiles: AdapterModelProfileDefinition[] = buildOMPModelProfiles();
 
 export const agentConfigurationDoc = `# omp_local agent configuration
 

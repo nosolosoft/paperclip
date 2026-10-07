@@ -543,16 +543,39 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
       createdByRunId: seeded.qaRunId,
     });
 
-    await request(app)
+    // Reassignment revokes the previous run; requested changes execute in a new run.
+    const reworkRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: reworkRunId,
+      companyId: seeded.companyId,
+      agentId: seeded.engineerId,
+      issueId: seeded.issueId,
+      status: "running",
+      responsibleUserId: seeded.responsibleUserId,
+      contextSnapshot: { issueId: seeded.issueId },
+    });
+    const reworkToken = token(seeded.engineerId, seeded.companyId, reworkRunId, seeded.responsibleUserId);
+    const rehandoff = await request(app)
       .patch(`/api/issues/${seeded.issueId}`)
-      .set("Authorization", `Bearer ${engineerToken}`)
-      .set("X-Paperclip-Run-Id", seeded.engineerRunId)
-      .send({ status: "in_review", comment: "Reworked failed final QA criterion" })
-      .expect(200);
+      .set("Authorization", `Bearer ${reworkToken}`)
+      .set("X-Paperclip-Run-Id", reworkRunId)
+      .send({ status: "in_review", comment: "Reworked failed final QA criterion" });
+    expect(rehandoff.status, JSON.stringify(rehandoff.body)).toBe(200);
+    const freshQaRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: freshQaRunId,
+      companyId: seeded.companyId,
+      agentId: seeded.qaAgentId,
+      issueId: seeded.issueId,
+      status: "running",
+      responsibleUserId: seeded.responsibleUserId,
+      contextSnapshot: { issueId: seeded.issueId },
+    });
+    const freshQaToken = token(seeded.qaAgentId, seeded.companyId, freshQaRunId, seeded.responsibleUserId);
     const freshReview = await request(app)
       .get(`/api/issues/${seeded.issueId}`)
-      .set("Authorization", `Bearer ${qaToken}`)
-      .set("X-Paperclip-Run-Id", seeded.qaRunId)
+      .set("Authorization", `Bearer ${freshQaToken}`)
+      .set("X-Paperclip-Run-Id", freshQaRunId)
       .expect(200);
     expect(freshReview.body).toMatchObject({ status: "in_review", assigneeAgentId: seeded.qaAgentId, assigneeUserId: null });
     expect(freshReview.body.executionState).toMatchObject({
@@ -585,8 +608,8 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
     const passComment = "Fresh final QA PASS after requested changes";
     await request(app)
       .patch(`/api/issues/${seeded.issueId}`)
-      .set("Authorization", `Bearer ${qaToken}`)
-      .set("X-Paperclip-Run-Id", seeded.qaRunId)
+      .set("Authorization", `Bearer ${freshQaToken}`)
+      .set("X-Paperclip-Run-Id", freshQaRunId)
       .send({ status: "done", comment: passComment, qaVerdict: "pass", qaEvidence: freshEvidence })
       .expect(200);
 
@@ -598,12 +621,12 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
     expect(decisions).toHaveLength(2);
     expect(decisions.map((decision) => decision.outcome)).toEqual(["changes_requested", "approved"]);
     expect(decisions[0]).toMatchObject({ actorAgentId: seeded.qaAgentId, body: failComment, evidence: null });
-    expect(decisions[1]).toMatchObject({ actorAgentId: seeded.qaAgentId, body: passComment, evidence: freshEvidence });
+    expect(decisions[1]).toMatchObject({ actorAgentId: seeded.qaAgentId, body: passComment, evidence: freshEvidence, createdByRunId: freshQaRunId });
 
     const completed = await request(app)
       .get(`/api/issues/${seeded.issueId}`)
-      .set("Authorization", `Bearer ${qaToken}`)
-      .set("X-Paperclip-Run-Id", seeded.qaRunId)
+      .set("Authorization", `Bearer ${freshQaToken}`)
+      .set("X-Paperclip-Run-Id", freshQaRunId)
       .expect(200);
     expect(completed.body).toMatchObject({ status: "done", assigneeAgentId: null, assigneeUserId: null });
     expect(completed.body.executionState).toMatchObject({

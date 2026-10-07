@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyIssueWakeAgent } from "./heartbeat.js";
+import { classifyIssueWakeAgent } from "../modules/wake-queue/index.js";
 import {
   resolveQaRouting,
   serializeQaRoutingDecision,

@@ -12,7 +12,7 @@ export function buildOMPLocalConfig(v: CreateConfigValues): Record<string, unkno
   if (v.cwd) ac.cwd = v.cwd;
   if (v.instructionsFilePath) ac.instructionsFilePath = v.instructionsFilePath;
   if (v.model) ac.model = v.model;
-  if (v.thinkingEffort) ac.variant = v.thinkingEffort;
+  if (v.thinkingEffort) ac.thinking = v.thinkingEffort;
   ac.dangerouslySkipPermissions = v.dangerouslySkipPermissions;
   // OMP sessions can run until the CLI exits naturally; keep timeout disabled (0)
   // and rely on graceSec for termination handling when a timeout is configured elsewhere.

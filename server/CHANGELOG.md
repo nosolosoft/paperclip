@@ -5,6 +5,7 @@
 ### Patch Changes
 
 - Bound full-tree workspace Git scans with process-wide concurrency, queue, timeout, cancellation, coalescing, and short-lived changed-file caching. Saturated or timed-out changed-file requests now return a retryable degraded response, and hidden file-browser panels no longer initiate scans.
+- Preserve conversation review replies without requiring a project pull-request handoff, and declare environment runtime-tool delivery for the built-in OMP adapter.
 
 ## 0.3.1
 

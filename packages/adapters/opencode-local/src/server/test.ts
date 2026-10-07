@@ -33,7 +33,7 @@ import {
   validateAgentSelection,
 } from "./agent-selection.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
-import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
+import { prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes } from "./runtime-config.js";
 
 function summarizeStatus(checks: AdapterEnvironmentCheck[]): AdapterEnvironmentTestResult["status"] {
   if (checks.some((check) => check.level === "error")) return "fail";
@@ -120,7 +120,7 @@ export async function testEnvironment(
   }
 
   const openaiKeyOverride = "OPENAI_API_KEY" in envConfig ? asString(envConfig.OPENAI_API_KEY, "") : null;
-  if (openaiKeyOverride !== null && openaiKeyOverride.trim() === "") {
+  if (!config.managedAiConnection && openaiKeyOverride !== null && openaiKeyOverride.trim() === "") {
     checks.push({
       code: "opencode_openai_api_key_missing",
       level: "warn",
@@ -138,7 +138,7 @@ export async function testEnvironment(
     checks.push({
       code: "opencode_headless_permissions_enabled",
       level: "info",
-      message: "Headless OpenCode external-directory permissions are auto-approved for unattended runs.",
+      message: "Headless OpenCode permissions are auto-approved for all tools and connections.",
     });
   }
   let restoreWorkspace: (() => Promise<void>) | null = null;
@@ -177,6 +177,13 @@ export async function testEnvironment(
       if (localRuntimeConfigHome && preparedExecutionTargetRuntime.assetDirs.xdgConfig) {
         preparedRuntimeConfig.env.XDG_CONFIG_HOME = preparedExecutionTargetRuntime.assetDirs.xdgConfig;
       }
+      prepareManagedOpenCodeRemoteHomes({
+        env: preparedRuntimeConfig.env,
+        config,
+        runtimeRootDir: preparedExecutionTargetRuntime.runtimeRootDir,
+        runId,
+        configDir: preparedExecutionTargetRuntime.assetDirs.xdgConfig,
+      });
     }
     const runtimeEnv = normalizeEnv(ensurePathInEnv({ ...process.env, ...preparedRuntimeConfig.env }));
 

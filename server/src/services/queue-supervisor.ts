@@ -1,7 +1,7 @@
 import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests, agents, heartbeatRuns, issueComments, issues, projects } from "@paperclipai/db";
-import { classifyIssueWakeAgent } from "./heartbeat.js";
+import { classifyIssueWakeAgent } from "../modules/wake-queue/index.js";
 import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "./issue-execution-policy.js";
 import {
   resolveQaRoutingFromProjectPolicy,

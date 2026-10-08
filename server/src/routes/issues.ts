@@ -14110,7 +14110,18 @@ async function applyDefaultQaDispositionRouting(input: {
           issueId: existing.id,
           agentId: existing.assigneeAgentId,
         });
-        const runToStopForReassignment = await resolveActiveIssueRun(existing);
+        const activeRunForReassignment = await resolveActiveIssueRun(existing);
+        // Fork behavior: an assignee handing its own issue off (for example
+        // engineer -> final QA on in_review) keeps its run alive so it can
+        // finish normally. Cancelling the requesting run races adapter-owned
+        // finalization (acpx adapters) and loses the stop receipt, which
+        // rejected the handoff with 409 and reverted it.
+        const isOwnRunHandoff =
+          actor.actorType === "agent" &&
+          !!actor.runId &&
+          existing.assigneeAgentId === actor.agentId &&
+          activeRunForReassignment?.id === actor.runId;
+        const runToStopForReassignment = isOwnRunHandoff ? null : activeRunForReassignment;
         if (runToStopForReassignment) {
           const cancelled = await heartbeat.cancelRun(
             runToStopForReassignment.id,

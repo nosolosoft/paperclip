@@ -679,6 +679,34 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
     });
   });
 
+  it("hands a checked-out engineer run off to final QA without cancelling the requesting run", async () => {
+    const seeded = await seedScenario();
+    const app = authenticatedApp();
+    await db
+      .update(issues)
+      .set({
+        checkoutRunId: seeded.engineerRunId,
+        executionRunId: seeded.engineerRunId,
+        executionAgentNameKey: "opencode engineer",
+        executionLockedAt: new Date(),
+      })
+      .where(eq(issues.id, seeded.issueId));
+
+    const engineerToken = token(seeded.engineerId, seeded.companyId, seeded.engineerRunId, seeded.responsibleUserId);
+    const handoff = await request(app)
+      .patch(`/api/issues/${seeded.issueId}`)
+      .set("Authorization", `Bearer ${engineerToken}`)
+      .set("X-Paperclip-Run-Id", seeded.engineerRunId)
+      .send({ status: "in_review", comment: "## Implementado\n\nPR listo para QA final." });
+    expect(handoff.status, JSON.stringify(handoff.body)).toBe(200);
+
+    const [storedIssue] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    expect(storedIssue).toMatchObject({ status: "in_review", assigneeAgentId: seeded.qaAgentId });
+    const [engineerRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.engineerRunId));
+    expect(engineerRun?.status).toBe("running");
+    expect(engineerRun?.errorCode).toBeNull();
+  });
+
   it("rejects an agent opening a review stage that names itself as participant", async () => {
     const seeded = await seedScenario();
     const app = authenticatedApp();

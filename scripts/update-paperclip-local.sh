@@ -128,6 +128,14 @@ cd "$REPO"
 
 echo "==> Paperclip update ${TARGET_LABEL} @ ${TS}"
 
+# Sync dependencies with the current HEAD before running the backup CLI. After a
+# manually resolved merge commit, node_modules can lag behind the lockfile and the
+# CLI fails to resolve workspace packages. This does not touch the database;
+# migrations only run when the service restarts.
+CURRENT_STEP="syncing dependencies for current HEAD"
+echo "==> Syncing dependencies for current HEAD"
+pnpm install --frozen-lockfile
+
 CURRENT_STEP="creating explicit DB backup"
 echo "==> Creating explicit DB backup before source update"
 pnpm paperclipai db:backup --filename-prefix "paperclip-pre-local-update-${TS}" --json | tee "$DB_BACKUP_LOG"
@@ -204,6 +212,15 @@ check_pr6591_status
 CURRENT_STEP="installing dependencies"
 echo "==> Installing dependencies"
 pnpm install
+
+# The service runs server/src via tsx, but plugin-sdk and paperclip-runner are
+# consumed from their dist/ builds. A stale dist makes the restart crash on
+# missing exports, so rebuild them before restarting.
+CURRENT_STEP="building runtime workspace packages"
+echo "==> Building runtime workspace packages (plugin-sdk, paperclip-runner)"
+pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+pnpm --filter @paperclipai/plugin-sdk build
+pnpm --filter @paperclipai/server run prepare:runner-vendor
 
 # Agent models, instructions, workspaces, sessions, QA state, and wakeups are
 # never restored as part of an update. Any future recovery must be a separate,

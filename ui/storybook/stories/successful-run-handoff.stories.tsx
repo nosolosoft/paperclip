@@ -13,7 +13,9 @@ import {
   SUCCESSFUL_RUN_HANDOFF_RESOLVED_ACTION,
   successfulRunHandoffActivityTone,
 } from "@/lib/successful-run-handoff";
-import { createIssue, storybookAgents } from "../fixtures/paperclipData";
+import { createIssue, storybookAgents, storybookProjects } from "../fixtures/paperclipData";
+
+const projectById = new Map(storybookProjects.map((project) => [project.id, project]));
 
 function ActivityExample({ action }: { action: string }) {
   const tone = successfulRunHandoffActivityTone(action);
@@ -176,6 +178,7 @@ function IssueCardPanel() {
           }),
         ]}
         agents={storybookAgents}
+        projectById={projectById}
         onUpdateIssue={() => {}}
       />
     </div>

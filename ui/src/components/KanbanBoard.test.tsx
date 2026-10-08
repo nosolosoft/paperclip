@@ -91,6 +91,7 @@ function renderBoard(
     act(() => {
       root.render(
         <KanbanBoard
+          projectById={new Map()}
           agents={[{ id: "agent-1", name: "Codex" }]}
           liveIssueIds={new Set(["issue-todo-1"])}
           onUpdateIssue={vi.fn()}

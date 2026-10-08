@@ -457,6 +457,7 @@ Columns represent statuses: Backlog | Todo | In Progress | In Review | Done
 Each card shows:
 - Issue key (muted)
 - Title (primary text)
+- Project name and color indicator, when the project is available, in both comfortable and compact cards. Long names truncate, with the full name available on hover.
 - Priority icon (bottom-left)
 - Assignee avatar (bottom-right)
 

@@ -50,6 +50,7 @@ import {
   storybookAgents,
   storybookIssues,
   storybookLiveRuns,
+  storybookProjects,
 } from "../fixtures/paperclipData";
 
 const companyId = "company-storybook";
@@ -235,12 +236,14 @@ function ActivityChartsMatrix({ empty = false }: { empty?: boolean }) {
 function KanbanBoardDemo({ empty = false }: { empty?: boolean }) {
   const [issues, setIssues] = useState<Issue[]>(empty ? [] : kanbanIssues);
   const liveIssueIds = useMemo(() => new Set(["issue-storybook-1", "issue-kanban-backlog"]), []);
+  const projectById = useMemo(() => new Map(storybookProjects.map((project) => [project.id, project])), []);
 
   return (
     <StoryShell>
       <Section eyebrow="KanbanBoard" title={empty ? "Collapsed empty workflow columns" : "Draggable issue cards by status"}>
         <KanbanBoard
           issues={issues}
+          projectById={projectById}
           agents={storybookAgents}
           liveIssueIds={liveIssueIds}
           onUpdateIssue={(id, data) => {

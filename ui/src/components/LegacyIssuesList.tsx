@@ -1928,6 +1928,7 @@ export function IssuesList({
       {viewState.viewMode === "board" ? (
         <KanbanBoard
           issues={filtered}
+          projectById={projectById}
           agents={agents}
           liveIssueIds={liveIssueIds}
           compactCards={boardCompactCards}

@@ -11,7 +11,7 @@ export type ProjectWorkspaceVisibility = "default" | "advanced";
 
 export type ProjectQaPolicy =
   | { readonly mode: "staged" }
-  | { readonly mode: "final"; readonly finalQaAgentId: string };
+  | { readonly mode: "final"; readonly finalQaAgentId: string; readonly mergeApproverUserId?: string };
 
 export type QaCodeCheckKind = "diff" | "test" | "security" | "migration" | "contract";
 
@@ -66,6 +66,7 @@ export interface QaReviewHandoff {
   readonly kind: QaHandoffKind;
   readonly id: string;
   readonly url: string | null;
+  readonly headSha?: string;
 }
 
 export interface QaReviewEvidenceV1 {

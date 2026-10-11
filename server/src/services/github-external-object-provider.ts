@@ -201,6 +201,9 @@ function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string
   const headRef = asNestedString(body, "head", "ref");
   const headSha = asNestedString(body, "head", "sha");
   const baseRef = asNestedString(body, "base", "ref");
+  const baseSha = asNestedString(body, "base", "sha");
+  const mergeable = asBoolean(body.mergeable);
+  const mergeableState = asString(body.mergeable_state);
   const reviewDecision = asString(body.review_decision);
   const additions = asNonNegativeInteger(body.additions);
   const deletions = asNonNegativeInteger(body.deletions);
@@ -262,6 +265,9 @@ function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string
       ...(headRef ? { headRef } : {}),
       ...(headSha ? { headSha } : {}),
       ...(baseRef ? { baseRef } : {}),
+      baseSha,
+      mergeable,
+      mergeableState,
       ...(reviewDecision ? { reviewDecision } : {}),
       ...(additions !== null ? { additions } : {}),
       ...(deletions !== null ? { deletions } : {}),
@@ -317,7 +323,11 @@ async function safeJson(response: Response) {
   }
 }
 
-async function defaultTokenProvider(db: Db, companyId: string, secretNames: readonly string[]) {
+export async function resolveCompanyGitHubToken(
+  db: Db,
+  companyId: string,
+  secretNames: readonly string[] = DEFAULT_GITHUB_TOKEN_SECRET_NAMES,
+): Promise<string | null> {
   const secrets = secretService(db);
   for (const secretName of secretNames) {
     const secret = await secrets.getByName(companyId, secretName);
@@ -337,7 +347,7 @@ export function createGitHubExternalObjectProvider(
   const secretNames = opts.secretNames ?? DEFAULT_GITHUB_TOKEN_SECRET_NAMES;
   const tokenProvider = Object.prototype.hasOwnProperty.call(opts, "tokenProvider") && opts.tokenProvider !== undefined
     ? opts.tokenProvider
-    : ((companyId: string) => defaultTokenProvider(db, companyId, secretNames));
+    : ((companyId: string) => resolveCompanyGitHubToken(db, companyId, secretNames));
 
   const detector: ExternalObjectDetector = {
     key: "github",

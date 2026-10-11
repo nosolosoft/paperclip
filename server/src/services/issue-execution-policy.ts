@@ -416,21 +416,197 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
   };
 }
 
-export function buildFinalQaExecutionPolicy(finalQaAgentId: string): IssueExecutionPolicy {
-  return {
-    mode: "normal",
-    commentRequired: true,
-    stages: [{
+export function buildFinalQaExecutionPolicy(input: {
+  finalQaAgentId: string;
+  mergeApproverUserId?: string | null;
+}): IssueExecutionPolicy {
+  const stages: IssueExecutionPolicy["stages"] = [{
+    id: randomUUID(),
+    type: "review",
+    approvalsNeeded: 1,
+    participants: [{
       id: randomUUID(),
-      type: "review",
+      type: "agent",
+      agentId: input.finalQaAgentId,
+      userId: null,
+    }],
+  }];
+  if (input.mergeApproverUserId) {
+    stages.push({
+      id: randomUUID(),
+      type: "approval",
       approvalsNeeded: 1,
       participants: [{
         id: randomUUID(),
-        type: "agent",
-        agentId: finalQaAgentId,
-        userId: null,
+        type: "user",
+        agentId: null,
+        userId: input.mergeApproverUserId,
       }],
-    }],
+    });
+  }
+  return {
+    mode: "normal",
+    commentRequired: true,
+    stages,
+  };
+}
+
+export function buildMergeGateCompletionPatch(input: {
+  policy: IssueExecutionPolicy;
+  state: IssueExecutionState;
+  decisionId: string;
+}): {
+  status: "done";
+  assigneeAgentId: null;
+  assigneeUserId: null;
+  executionState: IssueExecutionState;
+} | null {
+  if (input.state.status !== "pending") return null;
+  const approvalStage = input.state.currentStageId
+    ? input.policy.stages.find((stage) => stage.id === input.state.currentStageId)
+    : null;
+  if (!approvalStage || approvalStage.type !== "approval") return null;
+  const executionState = {
+    ...buildCompletedState(input.state, approvalStage),
+    lastDecisionId: input.decisionId,
+  };
+  return {
+    status: "done",
+    assigneeAgentId: null,
+    assigneeUserId: null,
+    executionState,
+  };
+}
+
+export function buildMergeGateReturnToReviewPatch(input: {
+  policy: IssueExecutionPolicy;
+  state: IssueExecutionState;
+}): {
+  status: "in_review";
+  assigneeAgentId: string;
+  assigneeUserId: null;
+  executionState: IssueExecutionState;
+} | null {
+  const currentIndex = input.state.currentStageId
+    ? input.policy.stages.findIndex((stage) => stage.id === input.state.currentStageId)
+    : -1;
+  let reviewStageIndex = -1;
+  let reviewStage: IssueExecutionPolicy["stages"][number] | null = null;
+  for (let index = currentIndex - 1; index >= 0; index--) {
+    if (input.policy.stages[index].type === "review") {
+      reviewStageIndex = index;
+      reviewStage = input.policy.stages[index];
+      break;
+    }
+  }
+  if (!reviewStage || reviewStageIndex < 0) return null;
+  const participant = selectStageParticipant(reviewStage);
+  if (!participant || participant.type !== "agent" || !participant.agentId) return null;
+  const executionState = buildPendingState({
+    previous: {
+      ...input.state,
+      completedStageIds: input.state.completedStageIds.filter((id) => id !== reviewStage!.id),
+    },
+    stage: reviewStage,
+    stageIndex: reviewStageIndex,
+    participant,
+    returnAssignee: input.state.returnAssignee ?? null,
+  });
+  return {
+    status: "in_review",
+    assigneeAgentId: participant.agentId,
+    assigneeUserId: null,
+    executionState,
+  };
+}
+
+function buildMergeGateRewoundChangesRequestedState(input: {
+  policy: IssueExecutionPolicy;
+  state: IssueExecutionState;
+}): IssueExecutionState | null {
+  const currentIndex = input.state.currentStageId
+    ? input.policy.stages.findIndex((stage) => stage.id === input.state.currentStageId)
+    : -1;
+  if (currentIndex < 0) return null;
+  let reviewStage: IssueExecutionPolicy["stages"][number] | null = null;
+  let reviewStageIndex = -1;
+  for (let index = currentIndex; index >= 0; index--) {
+    if (input.policy.stages[index].type === "review") {
+      reviewStage = input.policy.stages[index];
+      reviewStageIndex = index;
+      break;
+    }
+  }
+  if (!reviewStage) return null;
+  const rewound: IssueExecutionState = {
+    ...input.state,
+    currentStageIndex: reviewStageIndex,
+    currentParticipant: selectStageParticipant(reviewStage) ?? input.state.currentParticipant,
+    completedStageIds: input.state.completedStageIds.filter((id) => id !== reviewStage!.id),
+  };
+  // A system-detected conflict is not a reviewer round: keep the counter.
+  return {
+    ...buildChangesRequestedState(rewound, reviewStage, input.state.changesRequestedCount ?? 0),
+    qaVerdict: null,
+    qaEvidence: null,
+  };
+}
+
+/**
+ * Builds the same state a QA changes-requested decision produces, for a system
+ * actor (merge conflict detected by the sweep). The engineer is the existing
+ * `returnAssignee`; the stage is rewound to the final review stage so a
+ * re-handoff goes back to QA. `qaVerdict`/`qaEvidence` are cleared so a later
+ * PASS is required. Returns null when the return assignee is not an agent.
+ */
+export function buildMergeGateChangesRequestedPatch(input: {
+  policy: IssueExecutionPolicy;
+  state: IssueExecutionState;
+}): {
+  status: "in_progress";
+  assigneeAgentId: string;
+  assigneeUserId: null;
+  executionState: IssueExecutionState;
+} | null {
+  const returnAssignee = input.state.returnAssignee;
+  if (!returnAssignee || returnAssignee.type !== "agent" || !returnAssignee.agentId) return null;
+  const executionState = buildMergeGateRewoundChangesRequestedState(input);
+  if (!executionState) return null;
+  return {
+    status: "in_progress",
+    assigneeAgentId: returnAssignee.agentId,
+    assigneeUserId: null,
+    executionState,
+  };
+}
+
+/**
+ * Parks a conflicting merge-gate issue as `blocked` on the merge approver when
+ * no automatic conflict context exists. The execution state is the same
+ * rewound changes-requested state (verdict/evidence cleared, so a fresh QA PASS
+ * is required after the approver resolves it); the issue is no longer
+ * `in_review`, so later sweeps ignore it (idempotent).
+ */
+export function buildMergeGateConflictBlockedPatch(input: {
+  policy: IssueExecutionPolicy;
+  state: IssueExecutionState;
+  mergeApproverUserId: string;
+  action: string;
+}): {
+  status: "blocked";
+  assigneeAgentId: null;
+  assigneeUserId: string;
+  unblockDescriptor: { owner: { userId: string }; action: string };
+  executionState: IssueExecutionState;
+} | null {
+  const executionState = buildMergeGateRewoundChangesRequestedState(input);
+  if (!executionState) return null;
+  return {
+    status: "blocked",
+    assigneeAgentId: null,
+    assigneeUserId: input.mergeApproverUserId,
+    unblockDescriptor: { owner: { userId: input.mergeApproverUserId }, action: input.action },
+    executionState,
   };
 }
 

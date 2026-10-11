@@ -20,6 +20,10 @@ export type PullRequestMergeDetails = {
   additions?: number | null;
   deletions?: number | null;
   changedFiles?: number | null;
+  baseSha?: string | null;
+  /** GitHub `mergeable`; null = not yet computed/unknown (take no action). */
+  mergeable?: boolean | null;
+  mergeableState?: string | null;
 };
 
 export type PullRequestMergeStateResolver = (
@@ -86,8 +90,11 @@ function readRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-export function createPullRequestMergeDetailsResolver(db: Db): PullRequestMergeDetailsResolver {
-  const resolver = createGitHubExternalObjectProvider(db).resolvers
+export function createPullRequestMergeDetailsResolver(
+  db: Db,
+  opts: { secretNames?: readonly string[] } = {},
+): PullRequestMergeDetailsResolver {
+  const resolver = createGitHubExternalObjectProvider(db, { secretNames: opts.secretNames }).resolvers
     .find((candidate) => candidate.objectType === "pull_request") ?? null;
 
   return async (companyId, reference) => {
@@ -119,6 +126,9 @@ export function createPullRequestMergeDetailsResolver(db: Db): PullRequestMergeD
       additions: typeof data?.additions === "number" ? data.additions : null,
       deletions: typeof data?.deletions === "number" ? data.deletions : null,
       changedFiles: typeof data?.changedFiles === "number" ? data.changedFiles : null,
+      baseSha: typeof data?.baseSha === "string" ? data.baseSha : null,
+      mergeable: typeof data?.mergeable === "boolean" ? data.mergeable : null,
+      mergeableState: typeof data?.mergeableState === "string" ? data.mergeableState : null,
     };
   };
 }

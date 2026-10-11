@@ -24,6 +24,7 @@ import { InlineEditor } from "./InlineEditor";
 import { EnvironmentVariablesEditor } from "./environment-variables-editor";
 import { Badge } from "@/components/ui/badge";
 import { ProjectQaPolicyControl } from "./ProjectQaPolicyControl";
+import { accessApi } from "../api/access";
 
 interface ProjectPropertiesProps {
   project: Project;
@@ -229,6 +230,11 @@ export function ProjectProperties({ project, repositories, onUpdate, onFieldUpda
   const { data: allAgents = [] } = useQuery({
     queryKey: selectedCompanyId ? queryKeys.agents.list(selectedCompanyId) : ["agents", "none"],
     queryFn: () => agentsApi.list(selectedCompanyId!),
+    enabled: Boolean(selectedCompanyId),
+  });
+  const { data: userDirectory } = useQuery({
+    queryKey: queryKeys.access.companyUserDirectory(selectedCompanyId ?? "none"),
+    queryFn: () => accessApi.listUserDirectory(selectedCompanyId!),
     enabled: Boolean(selectedCompanyId),
   });
   const { data: experimentalSettings } = useQuery({
@@ -490,6 +496,7 @@ export function ProjectProperties({ project, repositories, onUpdate, onFieldUpda
           <ProjectQaPolicyControl
             policy={project.qaPolicy ?? { mode: "staged" }}
             agents={allAgents}
+            users={userDirectory?.users ?? []}
             onChange={(data) => commitField("qa_policy", data)}
             saveState={fieldState("qa_policy")}
             editable={Boolean(onUpdate || onFieldUpdate)}

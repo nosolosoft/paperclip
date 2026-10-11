@@ -45,7 +45,11 @@ const projectWorkspaceVisibilitySchema = z.enum(["default", "advanced"]);
 
 export const projectQaPolicySchema = z.discriminatedUnion("mode", [
   z.object({ mode: z.literal("staged") }).strict(),
-  z.object({ mode: z.literal("final"), finalQaAgentId: z.string().uuid() }).strict(),
+  z.object({
+    mode: z.literal("final"),
+    finalQaAgentId: z.string().uuid(),
+    mergeApproverUserId: z.string().trim().min(1).optional(),
+  }).strict(),
 ]);
 
 const qaNonEmptyTextSchema = z.string().trim().min(1);
@@ -102,6 +106,7 @@ const qaReviewHandoffSchema = z.object({
   kind: z.enum(["pull_request", "work_product"]),
   id: qaNonEmptyTextSchema,
   url: z.string().url().nullable(),
+  headSha: z.string().regex(/^[0-9a-f]{40}$/i).optional(),
 }).strict();
 
 export const qaReviewEvidenceV1Schema = z.object({

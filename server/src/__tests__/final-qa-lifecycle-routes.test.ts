@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { asc, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agentWakeupRequests,
@@ -28,6 +28,18 @@ import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import type { StorageService } from "../storage/types.js";
+import { projectService } from "../services/projects.js";
+import type { PullRequestMergeDetailsResolver } from "../services/github-pull-request-merge.js";
+import type * as QaMergeGateModule from "../services/qa-merge-gate.js";
+
+const { publishQaCommitStatusMock } = vi.hoisted(() => ({
+  publishQaCommitStatusMock: vi.fn(async (..._args: unknown[]) => "published" as const),
+}));
+
+vi.mock("../services/qa-merge-gate.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof QaMergeGateModule>();
+  return { ...actual, publishQaCommitStatus: publishQaCommitStatusMock };
+});
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe.sequential : describe.skip;
@@ -106,16 +118,23 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
     else process.env.PAPERCLIP_IN_WORKTREE = previousInWorktree;
   });
 
-  function authenticatedApp() {
+  function authenticatedApp(opts: { resolvePullRequestDetails?: PullRequestMergeDetailsResolver } = {}) {
     const app = express();
     app.use(express.json());
     app.use(actorMiddleware(db, { deploymentMode: "authenticated" }));
-    app.use("/api", issueRoutes(db, storage));
+    app.use(
+      "/api",
+      issueRoutes(db, storage, {
+        resolvePullRequestDetails:
+          opts.resolvePullRequestDetails ??
+          (async () => ({ state: "unknown", headRef: null, headSha: null })),
+      }),
+    );
     app.use(errorHandler);
     return app;
   }
 
-  async function seedScenario() {
+  async function seedScenario(opts: { mergeApproverUserId?: string } = {}) {
     const companyId = randomUUID();
     const engineerId = randomUUID();
     const qaAgentId = randomUUID();
@@ -172,12 +191,35 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
       status: "active",
       membershipRole: "operator",
     });
+    if (opts.mergeApproverUserId) {
+      await db.insert(authUsers).values({
+        id: opts.mergeApproverUserId,
+        name: "Merge Approver",
+        email: `${opts.mergeApproverUserId}@example.com`,
+        emailVerified: true,
+        image: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      await db.insert(companyMemberships).values({
+        companyId,
+        principalType: "user",
+        principalId: opts.mergeApproverUserId,
+        status: "active",
+        membershipRole: "operator",
+      });
+    }
+
     await db.insert(projects).values({
       id: projectId,
       companyId,
       name: "Final QA Project",
       status: "in_progress",
-      qaPolicy: { mode: "final", finalQaAgentId: qaAgentId },
+      qaPolicy: {
+        mode: "final",
+        finalQaAgentId: qaAgentId,
+        ...(opts.mergeApproverUserId ? { mergeApproverUserId: opts.mergeApproverUserId } : {}),
+      },
     });
     await db.insert(issues).values({
       id: issueId,
@@ -252,6 +294,7 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
   function finalQaEvidence(
     seeded: Awaited<ReturnType<typeof seedScenario>>,
     criteria: Array<{ criterion: string; evidence: string }>,
+    handoff?: Record<string, unknown>,
   ) {
     return {
       version: 1,
@@ -270,7 +313,7 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
         },
         spec: { outcome: "pass", criteria },
       },
-      handoff: { kind: "pull_request", id: "PR-final-qa-criteria", url: null },
+      handoff: handoff ?? { kind: "pull_request", id: "PR-final-qa-criteria", url: null },
     };
   }
 
@@ -741,5 +784,388 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
     if (!storedIssue) throw new Error("Expected issue row after rejected self-assigned stage");
     expect(storedIssue.executionPolicy).toBeNull();
     expect(storedIssue.executionState).toBeNull();
+  });
+
+  describe("merge approval stage", () => {
+    const REVIEWED_SHA = "a".repeat(40);
+    const PR_URL = "https://github.com/example/final-qa-lifecycle/pull/1";
+    const criteria = ACCEPTANCE_CRITERIA.map((criterion) => ({ criterion, evidence: `verified: ${criterion}` }));
+
+    async function passWithApprover(input: {
+      resolvedHeadSha: string | null;
+      handoff: Record<string, unknown>;
+    }) {
+      const approverUserId = `approver-${randomUUID()}`;
+      const seeded = await seedScenario({ mergeApproverUserId: approverUserId });
+      const app = authenticatedApp({
+        resolvePullRequestDetails: async () => ({ state: "open", headRef: null, headSha: input.resolvedHeadSha }),
+      });
+      const { qaToken } = await handoffToFinalQa(app, seeded);
+      const response = await request(app)
+        .patch(`/api/issues/${seeded.issueId}`)
+        .set("Authorization", `Bearer ${qaToken}`)
+        .set("X-Paperclip-Run-Id", seeded.qaRunId)
+        .send({
+          status: "done",
+          comment: "Final QA PASS: all acceptance criteria verified",
+          qaVerdict: "pass",
+          qaEvidence: finalQaEvidence(seeded, criteria, input.handoff),
+        });
+      const get = () =>
+        request(app)
+          .get(`/api/issues/${seeded.issueId}`)
+          .set("Authorization", `Bearer ${qaToken}`)
+          .set("X-Paperclip-Run-Id", seeded.qaRunId);
+      return { seeded, approverUserId, response, get };
+    }
+
+    it("waits for the merge approver after PASS on the exact reviewed SHA", async () => {
+      const { seeded, approverUserId, response, get } = await passWithApprover({
+        resolvedHeadSha: REVIEWED_SHA,
+        handoff: { kind: "pull_request", id: "PR-1", url: PR_URL, headSha: REVIEWED_SHA },
+      });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+
+      const fetched = await get().expect(200);
+      expect(fetched.body).toMatchObject({
+        status: "in_review",
+        assigneeUserId: approverUserId,
+        assigneeAgentId: null,
+        executionState: {
+          status: "pending",
+          currentStageType: "approval",
+          qaVerdict: "pass",
+          qaEvidence: { handoff: { headSha: REVIEWED_SHA } },
+        },
+      });
+      const [stored] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+      expect(stored).toMatchObject({ status: "in_review", assigneeUserId: approverUserId, assigneeAgentId: null });
+    });
+
+    it("rejects a PASS whose SHA differs from the current pull request head and keeps the review stage", async () => {
+      const { seeded, response, get } = await passWithApprover({
+        resolvedHeadSha: "b".repeat(40),
+        handoff: { kind: "pull_request", id: "PR-1", url: PR_URL, headSha: REVIEWED_SHA },
+      });
+      expect(response.status, JSON.stringify(response.body)).toBe(422);
+      expect(response.body).toMatchObject({ code: "qa_review_evidence_head_mismatch" });
+
+      const fetched = await get().expect(200);
+      expect(fetched.body).toMatchObject({
+        status: "in_review",
+        assigneeAgentId: seeded.qaAgentId,
+        executionState: { status: "pending", currentStageType: "review" },
+      });
+    });
+
+    it("rejects a PASS without the reviewed head SHA", async () => {
+      const { seeded, response, get } = await passWithApprover({
+        resolvedHeadSha: REVIEWED_SHA,
+        handoff: { kind: "pull_request", id: "PR-1", url: PR_URL },
+      });
+      expect(response.status, JSON.stringify(response.body)).toBe(422);
+      expect(response.body).toMatchObject({ code: "qa_review_evidence_head_sha_required" });
+
+      const fetched = await get().expect(200);
+      expect(fetched.body).toMatchObject({
+        status: "in_review",
+        assigneeAgentId: seeded.qaAgentId,
+        executionState: { currentStageType: "review" },
+      });
+    });
+
+    it("rejects a PASS for a pull request that is not the issue's pull request", async () => {
+      const { seeded, response, get } = await passWithApprover({
+        resolvedHeadSha: REVIEWED_SHA,
+        handoff: {
+          kind: "pull_request",
+          id: "PR-2",
+          url: "https://github.com/example/final-qa-lifecycle/pull/2",
+          headSha: REVIEWED_SHA,
+        },
+      });
+      expect(response.status, JSON.stringify(response.body)).toBe(422);
+      expect(response.body).toMatchObject({ code: "qa_review_evidence_pull_request_mismatch" });
+
+      const fetched = await get().expect(200);
+      expect(fetched.body).toMatchObject({
+        status: "in_review",
+        assigneeAgentId: seeded.qaAgentId,
+        executionState: { currentStageType: "review" },
+      });
+    });
+
+    describe("paperclip/qa commit status publishing", () => {
+      const CURRENT_HEAD = "c".repeat(40);
+      const REFERENCE = { host: "github.com", owner: "example", repo: "final-qa-lifecycle", number: 1 };
+
+      beforeEach(() => {
+        publishQaCommitStatusMock.mockClear();
+      });
+
+      // Negative assertions: the scheduler is fire-and-forget, so yield several
+      // macrotask turns (setImmediate, not wall-clock) for DB + resolver awaits to settle.
+      const flushAsync = async () => {
+        for (let i = 0; i < 20; i += 1) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+      };
+
+      function statusApp(headSha: string | null) {
+        return authenticatedApp({
+          resolvePullRequestDetails: async () => ({ state: "open", headRef: null, headSha }),
+        });
+      }
+
+      async function passRequest(
+        app: express.Express,
+        seeded: Awaited<ReturnType<typeof seedScenario>>,
+        qaToken: string,
+        handoff: Record<string, unknown>,
+      ) {
+        return request(app)
+          .patch(`/api/issues/${seeded.issueId}`)
+          .set("Authorization", `Bearer ${qaToken}`)
+          .set("X-Paperclip-Run-Id", seeded.qaRunId)
+          .send({
+            status: "done",
+            comment: "Final QA PASS: all acceptance criteria verified",
+            qaVerdict: "pass",
+            qaEvidence: finalQaEvidence(seeded, criteria, handoff),
+          });
+      }
+
+      it("publishes one pending status at the current head on engineer handoff with an approver", async () => {
+        const seeded = await seedScenario({ mergeApproverUserId: `approver-${randomUUID()}` });
+        const app = statusApp(CURRENT_HEAD);
+        await handoffToFinalQa(app, seeded);
+
+        await vi.waitFor(() => expect(publishQaCommitStatusMock).toHaveBeenCalledTimes(1));
+        await flushAsync();
+        expect(publishQaCommitStatusMock).toHaveBeenCalledTimes(1);
+        expect(publishQaCommitStatusMock.mock.calls[0]?.[1]).toMatchObject({
+          companyId: seeded.companyId,
+          reference: REFERENCE,
+          sha: CURRENT_HEAD,
+          state: "pending",
+          description: "Final QA pending",
+        });
+      });
+
+      it("publishes success at the reviewed SHA on QA PASS", async () => {
+        const seeded = await seedScenario({ mergeApproverUserId: `approver-${randomUUID()}` });
+        const app = statusApp(REVIEWED_SHA);
+        const { qaToken } = await handoffToFinalQa(app, seeded);
+        await vi.waitFor(() => expect(publishQaCommitStatusMock).toHaveBeenCalledTimes(1));
+        publishQaCommitStatusMock.mockClear();
+
+        const response = await passRequest(app, seeded, qaToken, {
+          kind: "pull_request",
+          id: "PR-1",
+          url: PR_URL,
+          headSha: REVIEWED_SHA,
+        });
+        expect(response.status, JSON.stringify(response.body)).toBe(200);
+
+        await vi.waitFor(() => expect(publishQaCommitStatusMock).toHaveBeenCalledTimes(1));
+        await flushAsync();
+        expect(publishQaCommitStatusMock).toHaveBeenCalledTimes(1);
+        expect(publishQaCommitStatusMock.mock.calls[0]?.[1]).toMatchObject({
+          companyId: seeded.companyId,
+          reference: REFERENCE,
+          sha: REVIEWED_SHA,
+          state: "success",
+          description: "Final QA PASS",
+        });
+      });
+
+      it("publishes failure at the current head on QA FAIL", async () => {
+        const seeded = await seedScenario({ mergeApproverUserId: `approver-${randomUUID()}` });
+        const app = statusApp(CURRENT_HEAD);
+        const { qaToken } = await handoffToFinalQa(app, seeded);
+        await vi.waitFor(() => expect(publishQaCommitStatusMock).toHaveBeenCalledTimes(1));
+        publishQaCommitStatusMock.mockClear();
+
+        const response = await request(app)
+          .patch(`/api/issues/${seeded.issueId}`)
+          .set("Authorization", `Bearer ${qaToken}`)
+          .set("X-Paperclip-Run-Id", seeded.qaRunId)
+          .send({
+            qaVerdict: "fail",
+            comment:
+              "FAIL phase=spec check=criterion-1 criterion=Engineer handoff routes to the configured final QA agent expected=routed observed=not routed repro=handoff again",
+          });
+        expect(response.status, JSON.stringify(response.body)).toBe(200);
+
+        await vi.waitFor(() => expect(publishQaCommitStatusMock).toHaveBeenCalledTimes(1));
+        await flushAsync();
+        expect(publishQaCommitStatusMock).toHaveBeenCalledTimes(1);
+        expect(publishQaCommitStatusMock.mock.calls[0]?.[1]).toMatchObject({
+          reference: REFERENCE,
+          sha: CURRENT_HEAD,
+          state: "failure",
+          description: "Final QA FAIL",
+        });
+      });
+
+      it("rejects a conflicting PASS without publishing any commit status or recording a decision", async () => {
+        const seeded = await seedScenario({ mergeApproverUserId: `approver-${randomUUID()}` });
+        const app = authenticatedApp({ resolvePullRequestDetails: async () => ({
+          state: "open", headRef: "fix/conflict", headSha: REVIEWED_SHA,
+          mergeable: false, mergeableState: "dirty", baseRef: "main",
+        }) });
+        const { qaToken } = await handoffToFinalQa(app, seeded);
+        await vi.waitFor(() => expect(publishQaCommitStatusMock).toHaveBeenCalledTimes(1));
+        await flushAsync();
+        publishQaCommitStatusMock.mockClear();
+
+        const response = await passRequest(app, seeded, qaToken, {
+          kind: "pull_request", id: "PR-1", url: PR_URL, headSha: REVIEWED_SHA,
+        });
+        expect(response.status, JSON.stringify(response.body)).toBe(422);
+        expect(response.body).toMatchObject({ code: "qa_review_evidence_pull_request_conflicting" });
+        await flushAsync();
+        expect(publishQaCommitStatusMock).not.toHaveBeenCalled();
+        expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, seeded.issueId))).toHaveLength(0);
+        const [issue] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+        expect(issue).toMatchObject({ status: "in_review", assigneeAgentId: seeded.qaAgentId, executionState: { status: "pending", currentStageType: "review", qaVerdict: null } });
+      });
+
+      it("publishes pending for the changed head when the engineer re-hands off after FAIL", async () => {
+        const seeded = await seedScenario({ mergeApproverUserId: `approver-${randomUUID()}` });
+        let headSha = CURRENT_HEAD;
+        const app = authenticatedApp({ resolvePullRequestDetails: async () => ({ state: "open", headRef: "fix/review", headSha }) });
+        const { qaToken } = await handoffToFinalQa(app, seeded);
+        await vi.waitFor(() => expect(publishQaCommitStatusMock).toHaveBeenCalledTimes(1));
+        const failed = await request(app)
+          .patch(`/api/issues/${seeded.issueId}`)
+          .set("Authorization", `Bearer ${qaToken}`)
+          .set("X-Paperclip-Run-Id", seeded.qaRunId)
+          .send({ qaVerdict: "fail", comment: "FAIL phase=spec check=criterion-1 criterion=Engineer handoff routes to the configured final QA agent expected=routed observed=not routed repro=handoff again" });
+        expect(failed.status, JSON.stringify(failed.body)).toBe(200);
+        await vi.waitFor(() => expect(publishQaCommitStatusMock).toHaveBeenCalledTimes(2));
+        headSha = "d".repeat(40);
+        await handoffToFinalQa(app, seeded);
+        await vi.waitFor(() => expect(publishQaCommitStatusMock).toHaveBeenCalledTimes(3));
+        await flushAsync();
+        expect(publishQaCommitStatusMock.mock.calls.map((call) => call[1])).toEqual([
+          expect.objectContaining({ sha: CURRENT_HEAD, state: "pending" }),
+          expect.objectContaining({ sha: CURRENT_HEAD, state: "failure" }),
+          expect.objectContaining({ sha: headSha, state: "pending", description: "Final QA pending" }),
+        ]);
+      });
+
+      it("does not publish when the PASS is rejected for a stale SHA", async () => {
+        const seeded = await seedScenario({ mergeApproverUserId: `approver-${randomUUID()}` });
+        const app = statusApp("b".repeat(40));
+        const { qaToken } = await handoffToFinalQa(app, seeded);
+        await vi.waitFor(() => expect(publishQaCommitStatusMock).toHaveBeenCalledTimes(1));
+        publishQaCommitStatusMock.mockClear();
+
+        const response = await passRequest(app, seeded, qaToken, {
+          kind: "pull_request",
+          id: "PR-1",
+          url: PR_URL,
+          headSha: REVIEWED_SHA,
+        });
+        expect(response.status, JSON.stringify(response.body)).toBe(422);
+        expect(response.body).toMatchObject({ code: "qa_review_evidence_head_mismatch" });
+
+        await flushAsync();
+        expect(publishQaCommitStatusMock).not.toHaveBeenCalled();
+      });
+
+      it("does not publish for a project without a merge approver", async () => {
+        const seeded = await seedScenario();
+        const app = statusApp(CURRENT_HEAD);
+        const { qaToken } = await handoffToFinalQa(app, seeded);
+        const response = await passRequest(app, seeded, qaToken, {
+          kind: "pull_request",
+          id: "PR-final-qa-criteria",
+          url: null,
+        });
+        expect(response.status, JSON.stringify(response.body)).toBe(200);
+
+        await flushAsync();
+        expect(publishQaCommitStatusMock).not.toHaveBeenCalled();
+      });
+    });
+  });
+
+  describe("project QA policy merge approver validation", () => {
+    async function seedCompanyWithMember(role: "operator" | "viewer", status = "active") {
+      const companyId = randomUUID();
+      const userId = `approver-${randomUUID()}`;
+      const qaAgentId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Merge Approver Company",
+        issuePrefix: `MA${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values({
+        id: qaAgentId,
+        companyId,
+        name: "Final QA",
+        role: "qa",
+        status: "active",
+        adapterType: "opencode_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(authUsers).values({
+        id: userId,
+        name: "Merge Approver",
+        email: `${userId}@example.com`,
+        emailVerified: true,
+        image: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      await db.insert(companyMemberships).values({
+        companyId,
+        principalType: "user",
+        principalId: userId,
+        status,
+        membershipRole: role,
+      });
+      return { companyId, userId, qaAgentId };
+    }
+
+    const policy = (finalQaAgentId: string, mergeApproverUserId: string) => ({
+      mode: "final",
+      finalQaAgentId,
+      mergeApproverUserId,
+    });
+
+    it("accepts an active operator", async () => {
+      const fixture = await seedCompanyWithMember("operator");
+      await expect(
+        projectService(db).validateQaPolicy(fixture.companyId, policy(fixture.qaAgentId, fixture.userId)),
+      ).resolves.toBeUndefined();
+    });
+
+    it("rejects a user without membership", async () => {
+      const fixture = await seedCompanyWithMember("operator");
+      await expect(
+        projectService(db).validateQaPolicy(fixture.companyId, policy(fixture.qaAgentId, `missing-${randomUUID()}`)),
+      ).rejects.toMatchObject({ status: 422, details: { code: "project_qa_merge_approver_membership" } });
+    });
+
+    it("rejects a member of another company", async () => {
+      const fixture = await seedCompanyWithMember("operator");
+      const other = await seedCompanyWithMember("operator");
+      await expect(
+        projectService(db).validateQaPolicy(fixture.companyId, policy(fixture.qaAgentId, other.userId)),
+      ).rejects.toMatchObject({ status: 422, details: { code: "project_qa_merge_approver_membership" } });
+    });
+
+    it("rejects a viewer", async () => {
+      const fixture = await seedCompanyWithMember("viewer");
+      await expect(
+        projectService(db).validateQaPolicy(fixture.companyId, policy(fixture.qaAgentId, fixture.userId)),
+      ).rejects.toMatchObject({ status: 422, details: { code: "project_qa_merge_approver_membership" } });
+    });
   });
 });

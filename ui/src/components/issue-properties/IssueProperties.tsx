@@ -1066,7 +1066,11 @@ export function IssueProperties({
     if (issue.executionState.status === "changes_requested") {
       return `${stageLabel} requested changes${participantLabel ? ` by ${participantLabel}` : ""}`;
     }
-    return `${stageLabel} pending${participantLabel ? ` with ${participantLabel}` : ""}`;
+    const passHeadSha =
+      issue.executionState.currentStageType === "approval" && issue.executionState.qaVerdict === "pass"
+        ? issue.executionState.qaEvidence?.handoff.headSha
+        : null;
+    return `${stageLabel} pending${participantLabel ? ` with ${participantLabel}` : ""}${passHeadSha ? ` · QA PASS @ ${passHeadSha.slice(0, 12)}` : ""}`;
   })();
   useEffect(() => {
     setMonitorAtInput(toDateTimeLocalValue(issue.executionPolicy?.monitor?.nextCheckAt));

@@ -41,6 +41,7 @@ import {
   companies,
   companyMemberships,
   instanceUserRoles,
+  type Db,
 } from "@paperclipai/db";
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
@@ -75,6 +76,8 @@ import {
   executionWorkspaceService,
   heartbeatService,
   issueThreadInteractionService,
+  qaMergeGateService,
+  QA_MERGE_GATE_SWEEP_INTERVAL_MS,
   githubConnectionEventService,
   issueService,
   instanceSettingsService,
@@ -1339,6 +1342,43 @@ async function startServerWithDatabaseTeardown(
           logger.error({ err }, "merged pull-request confirmation sweep failed");
         }));
     };
+    // Merge gate sweep: completes in_review tasks whose QA PASS commit was
+    // merged, invalidates a PASS when new commits land first, and warns on
+    // head mismatches or closed PRs. Throttled to its interval and guarded
+    // against overlapping itself so a slow sweep cannot stack.
+    // Service-level Db alias differs from the composed server db handle used
+    // across this scheduler block; siblings need the same widening.
+    const qaMergeGate = qaMergeGateService(db as unknown as Db, {
+      wakeup: heartbeat.wakeup,
+    });
+    let lastQaMergeGateSweepAt = 0;
+    let qaMergeGateSweepInFlight = false;
+    const scheduleQaMergeGateSweep = () => {
+      if (heartbeatSchedulerStopped || qaMergeGateSweepInFlight) return;
+      if (Date.now() - lastQaMergeGateSweepAt < QA_MERGE_GATE_SWEEP_INTERVAL_MS) return;
+      lastQaMergeGateSweepAt = Date.now();
+      qaMergeGateSweepInFlight = true;
+      trackHeartbeatSchedulerWork(qaMergeGate
+        .sweep()
+        .then((result) => {
+          if (
+            result.completed > 0 ||
+            result.invalidated > 0 ||
+            result.conflicted > 0 ||
+            result.conflictNotices > 0 ||
+            result.mismatched > 0 ||
+            result.closed > 0
+          ) {
+            logger.info(result, "qa merge gate sweep changed tasks");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "qa merge gate sweep failed");
+        })
+        .finally(() => {
+          qaMergeGateSweepInFlight = false;
+        }));
+    };
     // Emit a periodic signal when the reaper inspects candidates but archives
     // none, so an inert reaper that skips every candidate is never fully silent.
     // The throttle keeps the 30s cadence from flooding the log.
@@ -1674,6 +1714,7 @@ async function startServerWithDatabaseTeardown(
 
         if (heartbeatSchedulerStopped) return;
         scheduleMergedPullRequestConfirmationSweep();
+        scheduleQaMergeGateSweep();
         scheduleGitHubConnectionEventPoll();
         scheduleGitHubConnectionContinuitySweep();
         scheduleTerminalWorkspaceSweep();

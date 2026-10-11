@@ -2,6 +2,7 @@ import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  companyMemberships,
   projects,
   projectGoals,
   goals,
@@ -125,6 +126,24 @@ async function validateProjectQaPolicy(db: Db, companyId: string, value: unknown
       finalQaAgentId: policy.finalQaAgentId,
       status: agent.status,
     });
+  }
+  if (policy.mergeApproverUserId) {
+    const membership = await db
+      .select({ membershipRole: companyMemberships.membershipRole })
+      .from(companyMemberships)
+      .where(and(
+        eq(companyMemberships.companyId, companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.principalId, policy.mergeApproverUserId),
+        eq(companyMemberships.status, "active"),
+      ))
+      .then((rows) => rows[0] ?? null);
+    if (!membership || membership.membershipRole === "viewer") {
+      throw unprocessable("Merge approver must be an active company member", {
+        code: "project_qa_merge_approver_membership",
+        mergeApproverUserId: policy.mergeApproverUserId,
+      });
+    }
   }
 }
 

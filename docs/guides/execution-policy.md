@@ -299,11 +299,78 @@ Each stage PASS advances to the next; only a **QA (Spec) PASS** closes the issue
 
 ### Final (single-gate, opt-in per project)
 
-`{ "mode": "final", "finalQaAgentId": "<uuid>" }`. The engineer handoff is routed to exactly one fixed final QA agent, identified **only by UUID**, never by agent name or role heuristics, even if that agent happens to be named `QA (Code)` or anything else. That authenticated QA reads every explicit acceptance criterion before review, then performs Code, Browser PASS or explicit Browser `"not_applicable"`, and Spec in that order. For each explicit criterion, QA must execute at least one command, test, or observable check, record concrete evidence in `phases.code.checks`, and add one `phases.spec.criteria` entry naming that check. Generic `reviewed` or `looks good` evidence is invalid:
+`{ "mode": "final", "finalQaAgentId": "<uuid>", "mergeApproverUserId": "<company user id>" }` (merge approver optional; see below). The engineer handoff is routed to exactly one fixed final QA agent, identified **only by UUID**, never by agent name or role heuristics, even if that agent happens to be named `QA (Code)` or anything else. That authenticated QA reads every explicit acceptance criterion before review, then performs Code, Browser PASS or explicit Browser `"not_applicable"`, and Spec in that order. For each explicit criterion, QA must execute at least one command, test, or observable check, record concrete evidence in `phases.code.checks`, and add one `phases.spec.criteria` entry naming that check. Generic `reviewed` or `looks good` evidence is invalid:
 
 ```
-Engineer → final QA (fixed UUID) → done | changes_requested
+Engineer → final QA (fixed UUID) → done (or approval hold when a merge approver is configured) | changes_requested
 ```
+**Without a merge approver**, PASS requires an authenticated PATCH carrying `qaVerdict: "pass"` and complete `qaEvidence`, followed immediately by an authenticated GET. QA must verify `status: "done"`, `executionState.qaVerdict: "pass"`, and matching `executionState.qaEvidence`; if GET fails or any value mismatches, do not report PASS. **With a merge approver configured**, the same PATCH/GET verification applies but the expected state is `status: "in_review"` with `executionState.currentStageType: "approval"` (see below), not `done`. The durable audit copy is `issue_execution_decisions.evidence`. A direct `status: "done"`, free-text "QA PASS" comment, or unverified verdict never closes the issue. Browser `"not_applicable"` requires a non-empty reason and empty evidence. A final FAIL uses an authenticated PATCH and actionable comment naming the phase, failed check or criterion, expected, observed, and reproducible evidence, then returns the issue to the original Engineer. After re-handoff, the same final QA agent must rerun Code, Browser PASS or explicit `"not_applicable"`, and Spec from scratch, with no stale evidence reuse.
+
+#### Merge approver (QA PASS → approval hold until merge)
+
+Final projects can additionally set `qaPolicy.mergeApproverUserId` (an active, non-viewer
+company member; rejected with `422 project_qa_merge_approver_membership` otherwise). With a merge
+approver configured, an authenticated final QA PATCH with `qaVerdict: "pass"` no longer closes the
+issue: the task stays `in_review` assigned to that person in an `approval` stage
+(`executionState.currentStageType: "approval"`) and the QA agent must verify that state — not
+`status: "done"` — in the post-PASS GET. The merge itself is still done by the approver manually in
+GitHub.
+
+To close the loop, final QA PASS evidence on a pull-request handoff **must** include the reviewed
+commit SHA in `qaEvidence.handoff`:
+
+```json
+{ "kind": "pull_request", "id": "PR-123", "url": "https://github.com/org/repo/pull/123", "headSha": "<full 40-character head commit SHA>" }
+```
+
+The server rejects the PASS with `422 qa_review_evidence_head_sha_required` when the SHA is
+missing, `qa_review_evidence_pull_request_required` when the URL is not a GitHub pull request,
+`qa_review_evidence_pull_request_mismatch` when no open PR work product on the issue matches the
+URL's owner/repo/number, and `422 qa_review_evidence_head_mismatch` when the PR's current head on
+GitHub no longer equals the reviewed SHA (QA must then re-review the new head).
+
+**Conflict detection.** On PASS the server also checks GitHub for mergeability. If the PR conflicts
+with its base, the PASS is rejected with `422 qa_review_evidence_pull_request_conflicting` and QA
+must submit a FAIL citing the merge conflicts. If a PR becomes conflicting while the task waits at
+the approval hold, the sweep marks the approval **blocked**: the execution state is rewound to a
+`changes_requested` review stage with the QA verdict and evidence cleared, so a fresh QA PASS is
+required after the engineer resolves the conflicts.
+
+**Context builder.** When a conflict is detected, the server posts a context comment on the issue
+that traces conflicting files/hunks to the origin tasks that introduced them. Engineers use it to
+trace each hunk to its origin task and resolve it; when the conflict is semantic or the origin is
+unknown, they escalate via human-input (ask the board/human) instead of guessing.
+
+**Advisory notice.** For tasks still `in_progress`/`todo` with an agent assignee whose primary open PR
+conflicts, the sweep posts one system comment (same context as above, headline "No status change;
+resolve before handing off to QA") per head/base SHA. It never changes status, assignee, or
+execution state, wakes no agent, and publishes no commit status.
+
+**Fallback blocked approver.** If no merge approver can be notified for the blocked conflict, the
+blocked state falls back to an approver so the conflict is never silently dropped.
+
+**PAT permissions.** Conflict detection reads PR mergeability, so the `PAPERCLIP_QA_GITHUB_TOKEN`
+PAT additionally needs *Contents: Read* on the target repositories.
+
+Phase 2 — automated merge polling and commit status (requires per-company PAT):
+
+- The company stores a fine-grained GitHub PAT in the company secret `PAPERCLIP_QA_GITHUB_TOKEN`
+  (never `GITHUB_TOKEN`/`GH_TOKEN`/`PAPERCLIP_GITHUB_TOKEN`, which are agent git credentials) with
+  *Pull requests: Read* and *Commit statuses: Read and write* on the target repositories.
+- A server sweep runs every 5 minutes over `in_review` tasks waiting at the approval stage with a
+  QA PASS + head SHA. If the PR is merged at exactly the reviewed SHA, the task is closed as
+  `done` with a system comment and an `issue.qa_merge_gate_completed` activity entry. If it is
+  merged at a different SHA, or closed without merging, the task stays open for the approver with
+  a warning comment (`issue.qa_merge_gate_head_mismatch` / `issue.qa_merge_gate_pr_closed`).
+- If new commits are pushed before the merge (open PR with a new head), the PASS is invalidated:
+  the issue returns to final QA (a wake run is triggered), and the commit status is reset.
+- Paperclip publishes a `paperclip/qa` commit status on the PR head: `pending` at QA handoff,
+  `success` on PASS, `failure` on FAIL, `pending` again on a post-PASS push.
+
+**Without the PAT** the feature degrades gracefully: PASS SHA validation falls back to the
+best-effort check at PATCH time (a PR whose head cannot be read is accepted), no commit status is
+published, and the merge is not tracked — the approver closes the task manually with `done` plus a
+comment, like any other approval stage.
 
 PASS requires an authenticated PATCH carrying `qaVerdict: "pass"` and complete `qaEvidence`, followed immediately by an authenticated GET. QA must verify `status: "done"`, `executionState.qaVerdict: "pass"`, and matching `executionState.qaEvidence`; if GET fails or any value mismatches, do not report PASS. The durable audit copy is `issue_execution_decisions.evidence`. A direct `status: "done"`, free-text "QA PASS" comment, or unverified verdict never closes the issue. Browser `"not_applicable"` requires a non-empty reason and empty evidence. A final FAIL uses an authenticated PATCH and actionable comment naming the phase, failed check or criterion, expected, observed, and reproducible evidence, then returns the issue to the original Engineer. After re-handoff, the same final QA agent must rerun Code, Browser PASS or explicit `"not_applicable"`, and Spec from scratch, with no stale evidence reuse.
 

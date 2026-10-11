@@ -1,5 +1,6 @@
 import type { Agent, ProjectQaPolicy } from "@paperclipai/shared";
 import { useEffect, useMemo, useState } from "react";
+import type { CompanyUserDirectoryEntry } from "../api/access";
 
 export type ProjectQaPolicySaveState = "idle" | "saving" | "saved" | "error";
 
@@ -16,36 +17,50 @@ export function filterAssignableQaAgents(agents: readonly Agent[]): Agent[] {
 
 export function projectQaPolicyPayload(policy: ProjectQaPolicy): { qaPolicy: ProjectQaPolicy } {
   if (policy.mode === "staged") return { qaPolicy: { mode: "staged" } };
-  return { qaPolicy: { mode: "final", finalQaAgentId: policy.finalQaAgentId } };
+  return {
+    qaPolicy: {
+      mode: "final",
+      finalQaAgentId: policy.finalQaAgentId,
+      ...(policy.mergeApproverUserId ? { mergeApproverUserId: policy.mergeApproverUserId } : {}),
+    },
+  };
 }
 
 export function ProjectQaPolicyControl({
   policy,
   agents,
+  users,
   onChange,
   saveState,
   editable = true,
 }: {
   policy: ProjectQaPolicy;
   agents: readonly Agent[];
+  users: readonly CompanyUserDirectoryEntry[];
   onChange: (data: { qaPolicy: ProjectQaPolicy }) => void;
   saveState: ProjectQaPolicySaveState;
   editable?: boolean;
 }) {
   const policyFinalQaAgentId = policy.mode === "final" ? policy.finalQaAgentId : null;
+  const policyMergeApproverUserId = policy.mode === "final" ? policy.mergeApproverUserId ?? null : null;
   const [draftMode, setDraftMode] = useState(policy.mode);
   const [draftFinalQaAgentId, setDraftFinalQaAgentId] = useState(
     policyFinalQaAgentId ?? "",
   );
+  const [draftMergeApproverUserId, setDraftMergeApproverUserId] = useState(
+    policyMergeApproverUserId ?? "",
+  );
   useEffect(() => {
     setDraftMode(policy.mode);
     setDraftFinalQaAgentId(policyFinalQaAgentId ?? "");
-  }, [policy.mode, policyFinalQaAgentId]);
+    setDraftMergeApproverUserId(policyMergeApproverUserId ?? "");
+  }, [policy.mode, policyFinalQaAgentId, policyMergeApproverUserId]);
   useEffect(() => {
     if (saveState !== "error") return;
     setDraftMode(policy.mode);
     setDraftFinalQaAgentId(policyFinalQaAgentId ?? "");
-  }, [policy.mode, policyFinalQaAgentId, saveState]);
+    setDraftMergeApproverUserId(policyMergeApproverUserId ?? "");
+  }, [policy.mode, policyFinalQaAgentId, policyMergeApproverUserId, saveState]);
   const assignableQaAgents = useMemo(() => filterAssignableQaAgents(agents), [agents]);
   const selectedAgentId = draftMode === "final" ? draftFinalQaAgentId : "";
   const selectedAgent = assignableQaAgents.find((agent) => agent.id === selectedAgentId);
@@ -54,24 +69,52 @@ export function ProjectQaPolicyControl({
   const finalSelectionRequired = draftMode === "final" && !selectedAgentId;
   const noAssignableAgents = draftMode === "final" && assignableQaAgents.length === 0;
 
+  const selectedMergeApproverUserId = draftMode === "final" ? draftMergeApproverUserId : "";
+  const mergeApproverKnown = users.some((entry) => entry.principalId === selectedMergeApproverUserId);
+
   const handleModeChange = (mode: string) => {
     if (mode === "staged") {
       setDraftMode("staged");
       setDraftFinalQaAgentId("");
+      setDraftMergeApproverUserId("");
       onChange(projectQaPolicyPayload({ mode: "staged" }));
       return;
     }
     if (mode === "final") {
       setDraftMode("final");
       if (!selectedAgentId) return;
-      onChange(projectQaPolicyPayload({ mode: "final", finalQaAgentId: selectedAgentId }));
+      onChange(
+        projectQaPolicyPayload({
+          mode: "final",
+          finalQaAgentId: selectedAgentId,
+          mergeApproverUserId: draftMergeApproverUserId || undefined,
+        }),
+      );
     }
   };
 
   const handleAgentChange = (agentId: string) => {
     if (!agentId) return;
     setDraftFinalQaAgentId(agentId);
-    onChange(projectQaPolicyPayload({ mode: "final", finalQaAgentId: agentId }));
+    onChange(
+      projectQaPolicyPayload({
+        mode: "final",
+        finalQaAgentId: agentId,
+        mergeApproverUserId: draftMergeApproverUserId || undefined,
+      }),
+    );
+  };
+
+  const handleMergeApproverChange = (userId: string) => {
+    if (!selectedAgentId) return;
+    setDraftMergeApproverUserId(userId);
+    onChange(
+      projectQaPolicyPayload({
+        mode: "final",
+        finalQaAgentId: selectedAgentId,
+        mergeApproverUserId: userId || undefined,
+      }),
+    );
   };
 
   return (
@@ -131,6 +174,30 @@ export function ProjectQaPolicyControl({
               Select an active, assignable QA agent before enabling Final QA.
             </p>
           ) : null}
+          <label htmlFor="project-merge-approver" className="text-xs text-muted-foreground">
+            Merge approver
+          </label>
+          <select
+            id="project-merge-approver"
+            aria-label="Merge approver"
+            value={selectedMergeApproverUserId}
+            onChange={(event) => handleMergeApproverChange(event.target.value)}
+            disabled={!editable || !selectedAgentId}
+            className="w-full rounded-md border border-border bg-transparent px-2 py-1 text-sm outline-none focus-visible:border-ring focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <option value="">No merge approval</option>
+            {selectedMergeApproverUserId && !mergeApproverKnown ? (
+              <option value={selectedMergeApproverUserId}>{selectedMergeApproverUserId}</option>
+            ) : null}
+            {users.map((entry) => (
+              <option key={entry.principalId} value={entry.principalId}>
+                {entry.user?.name ?? entry.user?.email ?? entry.principalId}
+              </option>
+            ))}
+          </select>
+          <p className="text-xs text-muted-foreground">
+            After QA PASS the task waits in review for this person until the PR is merged.
+          </p>
         </div>
       ) : null}
       {saveState === "error" ? (

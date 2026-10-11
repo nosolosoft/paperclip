@@ -15,6 +15,13 @@ import {
 
 const mockAgentsApi = vi.hoisted(() => ({ list: vi.fn() }));
 vi.mock("../api/agents", () => ({ agentsApi: mockAgentsApi }));
+vi.mock("../api/access", () => ({
+  accessApi: {
+    listUserDirectory: vi.fn().mockResolvedValue({
+      users: [{ principalId: "user-1", status: "active", user: { id: "user-1", email: "m@example.com", name: "Manu", image: null } }],
+    }),
+  },
+}));
 vi.mock("../api/goals", () => ({ goalsApi: { list: vi.fn().mockResolvedValue([]) } }));
 vi.mock("../api/instanceSettings", () => ({ instanceSettingsApi: { getExperimental: vi.fn().mockResolvedValue({}) } }));
 vi.mock("../api/secrets", () => ({ secretsApi: { list: vi.fn().mockResolvedValue([]), listUserSecretDefinitions: vi.fn().mockResolvedValue([]) } }));
@@ -141,6 +148,7 @@ describe("Project QA policy", () => {
         <ProjectQaPolicyControl
           policy={{ mode: "staged" }}
           agents={[agent()]}
+          users={[]}
           onChange={onChange}
           saveState="idle"
         />,
@@ -170,6 +178,7 @@ describe("Project QA policy", () => {
         <ProjectQaPolicyControl
           policy={{ mode: "final", finalQaAgentId: "missing-agent" }}
           agents={[agent({ id: FINAL_QA_ID, name: "Final QA" })]}
+          users={[]}
           onChange={onChange}
           saveState="idle"
         />,
@@ -195,6 +204,7 @@ describe("Project QA policy", () => {
         <ProjectQaPolicyControl
           policy={{ mode: "final", finalQaAgentId: "" }}
           agents={[agent({ id: "paused", status: "paused", name: "Paused QA" })]}
+          users={[]}
           onChange={vi.fn()}
           saveState="idle"
         />,
@@ -212,6 +222,7 @@ describe("Project QA policy", () => {
         <ProjectQaPolicyControl
           policy={{ mode: "staged" }}
           agents={[agent()]}
+          users={[]}
           onChange={vi.fn()}
           saveState="error"
         />,
@@ -260,6 +271,93 @@ describe("Project QA policy", () => {
     });
     expect(onFieldUpdate).toHaveBeenCalledWith("qa_policy", {
       qaPolicy: { mode: "final", finalQaAgentId: FINAL_QA_ID },
+    });
+  });
+
+  describe("merge approver", () => {
+    const USERS = [
+      { principalId: "user-1", status: "active" as const, user: { id: "user-1", email: "a@example.com", name: "Ana", image: null } },
+      { principalId: "user-2", status: "active" as const, user: { id: "user-2", email: "b@example.com", name: null, image: null } },
+    ];
+    const AGENT_2 = "22222222-2222-4222-8222-222222222222";
+
+    function renderControl(policy: ProjectQaPolicy, onChange = vi.fn()) {
+      flushSync(() => {
+        root = createRoot(container);
+        root.render(
+          <ProjectQaPolicyControl
+            policy={policy}
+            agents={[agent({ id: FINAL_QA_ID, name: "Final QA" }), agent({ id: AGENT_2, name: "Second QA" })]}
+            users={USERS}
+            onChange={onChange}
+            saveState="idle"
+          />,
+        );
+      });
+      return onChange;
+    }
+
+    function change(select: HTMLSelectElement | null, value: string) {
+      if (!select) throw new Error("select not rendered");
+      flushSync(() => {
+        select.value = value;
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+    }
+
+    it("includes mergeApprover in the payload only when set", () => {
+      expect(
+        projectQaPolicyPayload({ mode: "final", finalQaAgentId: FINAL_QA_ID, mergeApproverUserId: "user-1" }),
+      ).toEqual({ qaPolicy: { mode: "final", finalQaAgentId: FINAL_QA_ID, mergeApproverUserId: "user-1" } });
+      expect(
+        projectQaPolicyPayload({ mode: "final", finalQaAgentId: FINAL_QA_ID, mergeApproverUserId: undefined }),
+      ).toEqual({ qaPolicy: { mode: "final", finalQaAgentId: FINAL_QA_ID } });
+    });
+
+    it("is hidden in staged mode and lists company users in final mode", () => {
+      renderControl({ mode: "staged" });
+      expect(container.querySelector("#project-merge-approver")).toBeNull();
+      const policySelect = container.querySelector<HTMLSelectElement>("#project-qa-policy");
+      change(policySelect, "final");
+      const approver = container.querySelector<HTMLSelectElement>("#project-merge-approver");
+      expect(approver?.getAttribute("aria-label")).toBe("Merge approver");
+      expect(approver?.disabled).toBe(true);
+      expect(Array.from(approver?.options ?? []).map((o) => [o.value, o.textContent])).toEqual([
+        ["", "No merge approval"],
+        ["user-1", "Ana"],
+        ["user-2", "b@example.com"],
+      ]);
+    });
+
+    it("selects the approver and keeps the current QA agent", () => {
+      const onChange = renderControl({ mode: "final", finalQaAgentId: FINAL_QA_ID });
+      change(container.querySelector("#project-merge-approver"), "user-1");
+      expect(onChange).toHaveBeenLastCalledWith({
+        qaPolicy: { mode: "final", finalQaAgentId: FINAL_QA_ID, mergeApproverUserId: "user-1" },
+      });
+    });
+
+    it("removes the approver with No merge approval", () => {
+      const onChange = renderControl({ mode: "final", finalQaAgentId: FINAL_QA_ID, mergeApproverUserId: "user-1" });
+      expect(container.querySelector<HTMLSelectElement>("#project-merge-approver")?.value).toBe("user-1");
+      change(container.querySelector("#project-merge-approver"), "");
+      expect(onChange).toHaveBeenLastCalledWith({ qaPolicy: { mode: "final", finalQaAgentId: FINAL_QA_ID } });
+      expect(onChange.mock.lastCall?.[0].qaPolicy).not.toHaveProperty("mergeApproverUserId");
+    });
+
+    it("preserves the approver when the QA agent changes", () => {
+      const onChange = renderControl({ mode: "final", finalQaAgentId: FINAL_QA_ID, mergeApproverUserId: "user-2" });
+      change(container.querySelector("#project-final-qa-agent"), AGENT_2);
+      expect(onChange).toHaveBeenLastCalledWith({
+        qaPolicy: { mode: "final", finalQaAgentId: AGENT_2, mergeApproverUserId: "user-2" },
+      });
+    });
+
+    it("drops the approver when switching to staged", () => {
+      const onChange = renderControl({ mode: "final", finalQaAgentId: FINAL_QA_ID, mergeApproverUserId: "user-1" });
+      change(container.querySelector("#project-qa-policy"), "staged");
+      expect(onChange).toHaveBeenLastCalledWith({ qaPolicy: { mode: "staged" } });
+      expect(container.querySelector("#project-merge-approver")).toBeNull();
     });
   });
 });

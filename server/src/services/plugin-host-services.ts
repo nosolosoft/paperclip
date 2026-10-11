@@ -2118,7 +2118,15 @@ export function buildHostServices(
                   browserScope: "required",
                 }));
                 if (decision.kind === "project_final") {
-                  const executionPolicy = buildFinalQaExecutionPolicy(decision.participant.id);
+                  const issueProject = existing.projectId
+                    ? await projects.getById(existing.projectId)
+                    : null;
+                  const executionPolicy = buildFinalQaExecutionPolicy({
+                    finalQaAgentId: decision.participant.id,
+                    mergeApproverUserId: issueProject?.qaPolicy?.mode === "final"
+                      ? issueProject.qaPolicy.mergeApproverUserId ?? null
+                      : null,
+                  });
                   const transition = applyIssueExecutionPolicyTransition({
                     issue: existing,
                     policy: executionPolicy,

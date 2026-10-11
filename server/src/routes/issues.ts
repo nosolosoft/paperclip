@@ -317,6 +317,13 @@ import {
   resolveQaFailureReturnEngineer,
   setIssueExecutionPolicyMonitorScheduledBy,
 } from "../services/issue-execution-policy.js";
+import {
+  createQaMergeGatePullRequestResolver,
+  publishQaCommitStatus,
+  pullRequestReferenceFromUrl,
+} from "../services/qa-merge-gate.js";
+import type { GitHubPullRequestReference } from "../services/github-pull-request-merge.js";
+import type { PullRequestMergeDetailsResolver } from "../services/github-pull-request-merge.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import {
@@ -435,7 +442,7 @@ function resolveQaEvidenceForDecision(input: {
   const currentStage = currentStageIndex >= 0 ? policy.stages[currentStageIndex] : null;
   if (
     !currentStage
-    || currentStageIndex !== policy.stages.length - 1
+    || policy.stages.slice(currentStageIndex + 1).some((stage) => stage.type !== "approval")
     || state.currentStageIndex !== currentStageIndex
     || currentStage.type !== "review"
     || !currentStage.participants.some(
@@ -444,6 +451,18 @@ function resolveQaEvidenceForDecision(input: {
   ) {
     throw unprocessable("QA review evidence requires the authenticated actor to be the active final QA participant", {
       code: "qa_review_evidence_final_participant_required",
+    });
+  }
+  if (
+    policy.stages.slice(currentStageIndex + 1).some((stage) => stage.type === "approval")
+    && (
+      parsed.data.handoff.kind !== "pull_request"
+      || !parsed.data.handoff.url
+      || !parsed.data.handoff.headSha
+    )
+  ) {
+    throw unprocessable("Final QA PASS before a merge approval stage requires the reviewed pull request URL and head SHA", {
+      code: "qa_review_evidence_head_sha_required",
     });
   }
 
@@ -3638,8 +3657,11 @@ export function issueRoutes(
       proposalId: string;
       actor: { agentId?: string | null; userId?: string | null };
     }) => Promise<unknown>;
+    resolvePullRequestDetails?: PullRequestMergeDetailsResolver;
   } = {},
 ) {
+  const resolveQaMergeGatePullRequest =
+    opts.resolvePullRequestDetails ?? createQaMergeGatePullRequestResolver(db);
   const router = Router();
   const svc = issueService(db);
   const runRedactions = createRunSecretRedactionRegistry(db);
@@ -4691,6 +4713,75 @@ export function issueRoutes(
     });
   }
 
+  async function scheduleQaMergeGateStatus(input: {
+    issue: { id: string; companyId: string };
+    qaVerdict: unknown;
+    reviewedHandoff: { kind: string; url?: string | null; headSha?: string | null } | null;
+    previousPolicy: NormalizedExecutionPolicy | null;
+    nextPolicy: NormalizedExecutionPolicy | null;
+    enteredReviewStage?: boolean;
+  }): Promise<void> {
+    const hasApprovalAfterReview = (policy: NormalizedExecutionPolicy | null) => {
+      if (!policy) return false;
+      const reviewIndex = policy.stages.findIndex((stage) => stage.type === "review");
+      return reviewIndex >= 0
+        && policy.stages.slice(reviewIndex + 1).some((stage) => stage.type === "approval");
+    };
+    const publish = (
+      ref: GitHubPullRequestReference,
+      sha: string,
+      state: "pending" | "success" | "failure",
+      description: string,
+    ) => publishQaCommitStatus(db, {
+      companyId: input.issue.companyId,
+      reference: ref,
+      sha,
+      state,
+      description,
+    });
+
+    const handoff = input.reviewedHandoff;
+    if (
+      input.qaVerdict === "pass"
+      && handoff?.kind === "pull_request"
+      && handoff.headSha
+    ) {
+      const ref = pullRequestReferenceFromUrl(handoff.url);
+      if (ref) await publish(ref, handoff.headSha, "success", "Final QA PASS");
+      return;
+    }
+
+    let state: "pending" | "failure" | null = null;
+    let description = "";
+    if (input.qaVerdict === "fail" && hasApprovalAfterReview(input.nextPolicy)) {
+      state = "failure";
+      description = "Final QA FAIL";
+    } else if (
+      hasApprovalAfterReview(input.nextPolicy)
+      && (
+        !hasApprovalAfterReview(input.previousPolicy)
+        || input.enteredReviewStage === true
+      )
+    ) {
+      state = "pending";
+      description = "Final QA pending";
+    }
+    if (!state) return;
+
+    const products = await workProductsSvc.listForIssue(input.issue.id);
+    const pullRequests = products.filter((product) =>
+      product.type === "pull_request" &&
+      product.status !== "closed" &&
+      product.status !== "archived" &&
+      product.status !== "failed");
+    const primary = pullRequests.find((product) => product.isPrimary) ?? pullRequests[0] ?? null;
+    const ref = pullRequestReferenceFromUrl(primary?.url);
+    if (!ref) return;
+    const details = await resolveQaMergeGatePullRequest(input.issue.companyId, ref);
+    if (!details.headSha) return;
+    await publish(ref, details.headSha, state, description);
+  }
+
   async function materializeFinalQaHandoff(input: {
     existing: IssueRouteSnapshot;
     updateFields: Record<string, unknown>;
@@ -4717,7 +4808,15 @@ export function issueRoutes(
     });
     if (decision.kind === "final_qa_unavailable") throwFinalQaUnavailable(decision);
     if (decision.kind !== "project_final") return;
-    input.updateFields.executionPolicy = buildFinalQaExecutionPolicy(decision.participant.id);
+    const issueProject = input.existing.projectId
+      ? await projectsSvc.getById(input.existing.projectId)
+      : null;
+    input.updateFields.executionPolicy = buildFinalQaExecutionPolicy({
+      finalQaAgentId: decision.participant.id,
+      mergeApproverUserId: issueProject?.qaPolicy?.mode === "final"
+        ? issueProject.qaPolicy.mergeApproverUserId ?? null
+        : null,
+    });
   }
 
   async function issueUsesFinalQaPolicy(issue: { projectId?: string | null }): Promise<boolean> {
@@ -4786,6 +4885,14 @@ async function applyDefaultQaDispositionRouting(input: {
     }
 
     if (input.qaVerdict === "pass") {
+      const nextState = parseIssueExecutionState(
+        input.updateFields.executionState === undefined
+          ? input.existing.executionState
+          : input.updateFields.executionState,
+      );
+      if (nextState?.status === "pending" && nextState.currentStageType === "approval") {
+        return;
+      }
       const decision = await resolveQaRoute({
         issue: {
           ...input.existing,
@@ -13444,6 +13551,60 @@ async function applyDefaultQaDispositionRouting(input: {
         executionPolicy: existing.executionPolicy,
         executionState: existing.executionState,
       });
+      if (
+        qaEvidenceForDecision
+        && qaEvidenceForDecision.handoff.kind === "pull_request"
+        && qaEvidenceForDecision.handoff.url
+        && qaEvidenceForDecision.handoff.headSha
+      ) {
+        const reviewedHandoff = qaEvidenceForDecision.handoff;
+        const reviewedRef = pullRequestReferenceFromUrl(reviewedHandoff.url);
+        if (!reviewedRef) {
+          throw unprocessable("QA review evidence handoff URL is not a GitHub pull request", {
+            code: "qa_review_evidence_pull_request_required",
+            handoffUrl: reviewedHandoff.url,
+          });
+        }
+        const issueWorkProducts = await workProductsSvc.listForIssue(existing.id);
+        const matchingWorkProduct = issueWorkProducts.find((product) => {
+          if (
+            product.type !== "pull_request"
+            || product.status === "closed"
+            || product.status === "archived"
+            || product.status === "failed"
+          ) return false;
+          const productRef = pullRequestReferenceFromUrl(product.url);
+          return productRef !== null
+            && productRef.owner.toLowerCase() === reviewedRef.owner.toLowerCase()
+            && productRef.repo.toLowerCase() === reviewedRef.repo.toLowerCase()
+            && productRef.number === reviewedRef.number;
+        });
+        if (!matchingWorkProduct) {
+          throw unprocessable("QA review evidence pull request does not match the issue's pull request work product", {
+            code: "qa_review_evidence_pull_request_mismatch",
+            handoffUrl: reviewedHandoff.url,
+          });
+        }
+        const reviewedPullRequest = await resolveQaMergeGatePullRequest(existing.companyId, reviewedRef);
+        const reviewedHeadSha = reviewedHandoff.headSha;
+        if (
+          reviewedPullRequest.headSha
+          && reviewedHeadSha
+          && reviewedPullRequest.headSha.toLowerCase() !== reviewedHeadSha.toLowerCase()
+        ) {
+          throw unprocessable("QA review evidence head SHA does not match the pull request's current head commit", {
+            code: "qa_review_evidence_head_mismatch",
+            reviewedHeadSha,
+            currentHeadSha: reviewedPullRequest.headSha,
+          });
+        }
+        if (reviewedPullRequest.mergeable === false) {
+          throw unprocessable("Pull request has merge conflicts with its base branch; submit a FAIL citing the conflicts instead of a PASS", {
+            code: "qa_review_evidence_pull_request_conflicting",
+            mergeableState: reviewedPullRequest.mergeableState ?? null,
+          });
+        }
+      }
       if (existing.conversationAgentId && req.actor.type === "board" && commentBody) {
         throw unprocessable("Send conversation messages through the comments endpoint with a clientRequestId");
       }
@@ -14086,6 +14247,18 @@ async function applyDefaultQaDispositionRouting(input: {
       }
 
       const finalExecutionState = parseIssueExecutionState(transition.patch.executionState);
+      const finalAdvancedToMergeApproval =
+        finalExecutionState?.status === "pending"
+        && finalExecutionState.currentStageType === "approval"
+        && nextExecutionPolicy !== null
+        && finalExecutionState.currentStageId !== null
+        && (() => {
+          const stageIndex = nextExecutionPolicy.stages.findIndex(
+            (stage) => stage.id === finalExecutionState.currentStageId,
+          );
+          return stageIndex > 0
+            && nextExecutionPolicy.stages.slice(stageIndex).every((stage) => stage.type === "approval");
+        })();
       if (
         qaEvidenceForDecision
         && (
@@ -14093,7 +14266,7 @@ async function applyDefaultQaDispositionRouting(input: {
           || !decisionId
           || transition.decision.stageType !== "review"
           || transition.decision.outcome !== "approved"
-          || finalExecutionState?.status !== "completed"
+          || !(finalExecutionState?.status === "completed" || finalAdvancedToMergeApproval)
         )
       ) {
         throw unprocessable("Final QA evidence requires an active final execution participant", {
@@ -14474,6 +14647,23 @@ async function applyDefaultQaDispositionRouting(input: {
       for (const publication of postCommitActivityPublications)
         publishActivity(publication);
       await flushIssuePostCommitActions(postCommitIssueActions);
+      const previousGateState = parseIssueExecutionState(existing.executionState);
+      const nextGateState = parseIssueExecutionState(issue.executionState);
+      const nextInPendingReview =
+        nextGateState?.status === "pending" && nextGateState.currentStageType === "review";
+      const previousInSamePendingReview =
+        previousGateState?.status === "pending"
+        && previousGateState.currentStageType === "review"
+        && previousGateState.currentStageId === nextGateState?.currentStageId;
+      void scheduleQaMergeGateStatus({
+        issue,
+        qaVerdict,
+        reviewedHandoff: qaEvidenceForDecision?.handoff ?? null,
+        previousPolicy: previousExecutionPolicy,
+        nextPolicy: nextExecutionPolicy,
+        enteredReviewStage: nextInPendingReview && !previousInSamePendingReview,
+      }).catch((err) =>
+        logger.warn({ err, issueId: id }, "qa merge gate status scheduling failed"));
 
       if (enteringBlocked) {
         const blockedIssue = issue;

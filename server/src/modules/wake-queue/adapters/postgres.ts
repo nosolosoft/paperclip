@@ -1036,6 +1036,33 @@ export function createWakeAdmissionWriter(): WakeAdmissionWriter {
   return {
     async coalesceIntoActiveExecutionRun(scope, input) {
       const tx = requireAdmissionTx(scope, input.companyId);
+      if (input.idempotencyKey) {
+        // Legacy deployments also enforce global key uniqueness. Serialize
+        // that boundary while keeping receipt reads company/agent scoped.
+        const lockKey = `paperclip:wake-receipt:${input.idempotencyKey}`;
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
+        const receipt = await tx.select().from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.companyId, input.companyId),
+          eq(agentWakeupRequests.agentId, input.agentId),
+          eq(agentWakeupRequests.idempotencyKey, input.idempotencyKey),
+        )).orderBy(asc(agentWakeupRequests.createdAt), asc(agentWakeupRequests.id))
+          .limit(1).then((rows) => rows[0] ?? null);
+        if (receipt) {
+          if (receipt.requestedByActorType !== input.requestedByActorType ||
+              receipt.requestedByActorId !== input.requestedByActorId ||
+              receipt.status !== "coalesced" || !receipt.runId) {
+            throw new HttpError(409, "Wake idempotency key belongs to another receipt");
+          }
+          const originalRun = await tx.select().from(heartbeatRuns).where(and(
+            eq(heartbeatRuns.companyId, input.companyId),
+            eq(heartbeatRuns.id, receipt.runId),
+          )).limit(1).then((rows) => rows[0] ?? null);
+          if (!originalRun) {
+            throw new HttpError(409, "Coalesced wake receipt no longer has its original run");
+          }
+          return originalRun as unknown as Record<string, unknown>;
+        }
+      }
       const now = new Date();
       const mergedRun = await tx
         .update(heartbeatRuns)
@@ -1056,7 +1083,7 @@ export function createWakeAdmissionWriter(): WakeAdmissionWriter {
           "wake-queue: the coalesce target run was not found for this company",
         );
       }
-      await tx.insert(agentWakeupRequests).values({
+      const receipt = await tx.insert(agentWakeupRequests).values({
         ...input.durableReceipt,
         companyId: input.companyId,
         agentId: input.agentId,
@@ -1071,7 +1098,13 @@ export function createWakeAdmissionWriter(): WakeAdmissionWriter {
         idempotencyKey: input.idempotencyKey,
         runId: mergedRun.id,
         finishedAt: now,
-      });
+      }).onConflictDoNothing().returning({ id: agentWakeupRequests.id });
+      if (receipt.length === 0) {
+        // A scoped replay was already handled above. A remaining unique
+        // collision is not ours to replay; roll back the run merge and reveal
+        // neither another company's receipt nor its run.
+        throw new HttpError(409, "Wake idempotency key belongs to another receipt");
+      }
       return mergedRun as unknown as Record<string, unknown>;
     },
 

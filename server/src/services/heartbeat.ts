@@ -102,6 +102,7 @@ import {
   sql,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { boundedRunResultText } from "./heartbeat-result-prefix.js";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
   CHAT_PROVIDERS,
@@ -3462,22 +3463,22 @@ const heartbeatRunListContextColumns = {
 const heartbeatRunListResultColumns = {
   resultSummary: sql<
     string | null
-  >`left(${heartbeatRuns.resultJson} ->> 'summary', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS})`.as(
+  >`${boundedRunResultText(sql`${heartbeatRuns.resultJson} ->> 'summary'`, HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS)}`.as(
     "resultSummary",
   ),
   resultResult: sql<
     string | null
-  >`left(${heartbeatRuns.resultJson} ->> 'result', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS})`.as(
+  >`${boundedRunResultText(sql`${heartbeatRuns.resultJson} ->> 'result'`, HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS)}`.as(
     "resultResult",
   ),
   resultMessage: sql<
     string | null
-  >`left(${heartbeatRuns.resultJson} ->> 'message', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS})`.as(
+  >`${boundedRunResultText(sql`${heartbeatRuns.resultJson} ->> 'message'`, HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS)}`.as(
     "resultMessage",
   ),
   resultError: sql<
     string | null
-  >`left(${heartbeatRuns.resultJson} ->> 'error', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS})`.as(
+  >`${boundedRunResultText(sql`${heartbeatRuns.resultJson} ->> 'error'`, HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS)}`.as(
     "resultError",
   ),
   resultTotalCostUsd: sql<
@@ -3499,7 +3500,7 @@ const diagnosticRetrievalDetailsBytes = 8192;
 function boundedRunDiagnosticText(field: "title" | "details", maxBytes: number) {
   const value = sql`${heartbeatRuns.resultJson} #>> ARRAY['terminalSessionFailure', ${field}]`;
   return sql`case when octet_length(${value}) <= ${maxBytes} then ${value}
-    else left(${value}, ${Math.floor((maxBytes - 100) / 4)})
+    else ${boundedRunResultText(value, Math.floor((maxBytes - 100) / 4))}
       || E'\\n[truncated for run retrieval; full text in run error/transcript]' end`;
 }
 
@@ -3510,15 +3511,15 @@ const heartbeatRunSafeResultJsonColumn = sql<Record<string, unknown> | null>`
       then ${heartbeatRuns.resultJson}
     else jsonb_strip_nulls(
       jsonb_build_object(
-        'summary', left(${heartbeatRuns.resultJson} ->> 'summary', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS}),
-        'result', left(${heartbeatRuns.resultJson} ->> 'result', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS}),
-        'message', left(${heartbeatRuns.resultJson} ->> 'message', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS}),
-        'error', left(${heartbeatRuns.resultJson} ->> 'error', ${HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS}),
-        'stdout', left(${heartbeatRuns.resultJson} ->> 'stdout', ${HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS}),
-        'stderr', left(${heartbeatRuns.resultJson} ->> 'stderr', ${HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS}),
+        'summary', ${boundedRunResultText(sql`${heartbeatRuns.resultJson} ->> 'summary'`, HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS)},
+        'result', ${boundedRunResultText(sql`${heartbeatRuns.resultJson} ->> 'result'`, HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS)},
+        'message', ${boundedRunResultText(sql`${heartbeatRuns.resultJson} ->> 'message'`, HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS)},
+        'error', ${boundedRunResultText(sql`${heartbeatRuns.resultJson} ->> 'error'`, HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS)},
+        'stdout', ${boundedRunResultText(sql`${heartbeatRuns.resultJson} ->> 'stdout'`, HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS)},
+        'stderr', ${boundedRunResultText(sql`${heartbeatRuns.resultJson} ->> 'stderr'`, HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS)},
         'terminalSessionFailure', case when jsonb_typeof(${heartbeatRuns.resultJson} -> 'terminalSessionFailure') = 'object'
           then jsonb_strip_nulls(jsonb_build_object(
-            'category', left(${heartbeatRuns.resultJson} #>> '{terminalSessionFailure,category}', 32),
+            'category', ${boundedRunResultText(sql`${heartbeatRuns.resultJson} #>> '{terminalSessionFailure,category}'`, 32)},
             'title', ${boundedRunDiagnosticText("title", diagnosticRetrievalTitleBytes)},
             'details', ${boundedRunDiagnosticText("details", diagnosticRetrievalDetailsBytes)},
             'retrievalTruncated', case when
@@ -3531,12 +3532,12 @@ const heartbeatRunSafeResultJsonColumn = sql<Record<string, unknown> | null>`
           )) end,
         'instructionSave', case when jsonb_typeof(${heartbeatRuns.resultJson} -> 'instructionSave') = 'object'
           then jsonb_strip_nulls(jsonb_build_object(
-            'state', left(${heartbeatRuns.resultJson} #>> '{instructionSave,state}', 32),
-            'contract', left(${heartbeatRuns.resultJson} #>> '{instructionSave,contract}', 32),
-            'entryFile', left(${heartbeatRuns.resultJson} #>> '{instructionSave,entryFile}', 512),
-            'errorCode', left(${heartbeatRuns.resultJson} #>> '{instructionSave,errorCode}', 128),
-            'errorMessage', left(${heartbeatRuns.resultJson} #>> '{instructionSave,errorMessage}', 1024),
-            'storageWarning', left(${heartbeatRuns.resultJson} #>> '{instructionSave,storageWarning}', 1024)
+            'state', ${boundedRunResultText(sql`${heartbeatRuns.resultJson} #>> '{instructionSave,state}'`, 32)},
+            'contract', ${boundedRunResultText(sql`${heartbeatRuns.resultJson} #>> '{instructionSave,contract}'`, 32)},
+            'entryFile', ${boundedRunResultText(sql`${heartbeatRuns.resultJson} #>> '{instructionSave,entryFile}'`, 512)},
+            'errorCode', ${boundedRunResultText(sql`${heartbeatRuns.resultJson} #>> '{instructionSave,errorCode}'`, 128)},
+            'errorMessage', ${boundedRunResultText(sql`${heartbeatRuns.resultJson} #>> '{instructionSave,errorMessage}'`, 1024)},
+            'storageWarning', ${boundedRunResultText(sql`${heartbeatRuns.resultJson} #>> '{instructionSave,storageWarning}'`, 1024)}
           )) end,
         'workspaceRestoreFailure', case when ${heartbeatRuns.resultJson} ->> 'workspaceRestoreFailure'
           in ('restore_permission_denied', 'restore_lock_timeout', 'restore_unsafe_archive', 'restore_failed')
@@ -3545,11 +3546,11 @@ const heartbeatRunSafeResultJsonColumn = sql<Record<string, unknown> | null>`
           then ${heartbeatRuns.resultJson} -> 'finalResponseRecorded' end,
         'executionBeforeRestore', case when jsonb_typeof(${heartbeatRuns.resultJson} -> 'executionBeforeRestore') = 'object'
           then jsonb_strip_nulls(jsonb_build_object(
-            'errorCode', left(${heartbeatRuns.resultJson} #>> '{executionBeforeRestore,errorCode}', 128),
+            'errorCode', ${boundedRunResultText(sql`${heartbeatRuns.resultJson} #>> '{executionBeforeRestore,errorCode}'`, 128)},
             'exitCode', case when jsonb_typeof(${heartbeatRuns.resultJson} #> '{executionBeforeRestore,exitCode}') = 'number'
               and length(${heartbeatRuns.resultJson} #>> '{executionBeforeRestore,exitCode}') < 16
               then ${heartbeatRuns.resultJson} #> '{executionBeforeRestore,exitCode}' end,
-            'signal', left(${heartbeatRuns.resultJson} #>> '{executionBeforeRestore,signal}', 50),
+            'signal', ${boundedRunResultText(sql`${heartbeatRuns.resultJson} #>> '{executionBeforeRestore,signal}'`, 50)},
             'timedOut', case when jsonb_typeof(${heartbeatRuns.resultJson} #> '{executionBeforeRestore,timedOut}') = 'boolean'
               then ${heartbeatRuns.resultJson} #> '{executionBeforeRestore,timedOut}' end
           )) end,
@@ -12408,7 +12409,7 @@ export function heartbeatService(
         error: heartbeatRuns.error,
         terminalFailureCategory: sql<string | null>`case
           when jsonb_typeof(${heartbeatRuns.resultJson} -> 'terminalSessionFailure') = 'object'
-          then coalesce(left(${heartbeatRuns.resultJson} #>> '{terminalSessionFailure,category}', 32), 'unknown') end`,
+          then coalesce(${boundedRunResultText(sql`${heartbeatRuns.resultJson} #>> '{terminalSessionFailure,category}'`, 32)}, 'unknown') end`,
         ...heartbeatRunListResultColumns,
       })
       .from(heartbeatRuns)

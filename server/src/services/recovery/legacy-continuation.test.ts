@@ -5,6 +5,7 @@ const input: LegacyContinuationInput = {
   issue: { id: "issue", companyId: "company", status: "in_progress", assigneeAgentId: "agent" },
   agent: { id: "agent", companyId: "company", status: "idle" },
   episode: { id: "run", attempt: 0, maxAttempts: 2 },
+  blockedSelfWaitRepair: false,
   gates: { stopped: false, paused: false, budgetBlocked: false, pendingWait: false, activeExecution: false, ownedLifecycle: false, conversation: false, agentInvokable: true },
 };
 describe("legacy continuation authority", () => {
@@ -13,6 +14,15 @@ describe("legacy continuation authority", () => {
   });
   it.each(["done", "cancelled", "blocked", "in_review"])("respects persisted %s disposition", status => {
     expect(decideLegacyContinuation({ ...input, issue: { ...input.issue!, status } }).kind).toBe("skip");
+  });
+  it("repairs a blocked source only for an owned unrouted self-wait and keeps every gate", () => {
+    const blocked = { ...input, blockedSelfWaitRepair: true, issue: { ...input.issue!, status: "blocked" } };
+    expect(decideLegacyContinuation(blocked)).toMatchObject({ kind: "enqueue", nextAttempt: 1 });
+    expect(decideLegacyContinuation({ ...blocked, episode: { ...input.episode, attempt: 2 } }).kind).toBe("exhausted");
+    for (const gate of ["stopped", "paused", "budgetBlocked", "pendingWait", "activeExecution", "ownedLifecycle", "conversation"] as const) {
+      expect(decideLegacyContinuation({ ...blocked, gates: { ...blocked.gates, [gate]: true } }).kind).toBe("skip");
+    }
+    expect(decideLegacyContinuation({ ...blocked, issue: { ...blocked.issue, status: "in_review" } }).kind).toBe("skip");
   });
   it.each(["failed", "cancelled", "interrupted", "timed_out", "running"])("does not convert a %s process into repair", status => {
     expect(decideLegacyContinuation({ ...input, run: { ...input.run, status } }).kind).toBe("skip");

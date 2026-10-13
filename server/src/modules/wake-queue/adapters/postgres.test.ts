@@ -1,6 +1,7 @@
 import { instanceSettingsService } from "../../../services/instance-settings.js";
+import { filterZombieCoalesceTarget, mergeCoalescedContextSnapshot, shouldDeferFollowupWakeForSameIssue, shouldQueueFollowupForRunningIssueWake } from "../../../services/heartbeat.js";
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { Db } from "@paperclipai/db";
 import {
@@ -22,9 +23,10 @@ import {
   createAdmissionTransactionScope,
   createPostgresWakeQueueAdapter,
   createWakeAdmissionWriter,
+  createWakeAdmissionReader,
 } from "./postgres.js";
 import type { WakeQueuePostgresAdapterDeps } from "./postgres.js";
-import { createReleaseIssueExecution } from "../application/use-cases.js";
+import { createAdmitWakeBehindIssueExecution, createReleaseIssueExecution } from "../application/use-cases.js";
 import type { TransactionScope } from "../application/ports.js";
 
 // Proves the atomicity and company-scope properties the security review
@@ -753,6 +755,118 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
   // owns it. These tests drive the admission writer directly against a
   // transaction they open themselves, the same way `heartbeat.ts` will.
   describe("wake admission", () => {
+    it.each([false, true])("replays an active self-agent coalesced receipt without repeating effects (concurrent=%s)", async (concurrent) => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent({ companyId });
+      const runId = await seedRun({ companyId, agentId, status: "running" });
+      const issueId = await seedIssue({ companyId, assigneeAgentId: agentId, executionRunId: runId, checkoutRunId: runId });
+      const [originalIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const writer = createWakeAdmissionWriter();
+      const admission = createAdmitWakeBehindIssueExecution({
+        reader: createWakeAdmissionReader(), writer,
+        helpers: { filterZombieCoalesceTarget, mergeCoalescedContextSnapshot, shouldDeferFollowupWakeForSameIssue, shouldQueueFollowupForRunningIssueWake },
+      });
+      const input = {
+        companyId, agentId, activeExecutionRunId: runId,
+        mergedContextSnapshot: { issueId, taskKey: issueId, source: "issue.recovery_action_resolution", wakeReason: "issue_unblock_requested" },
+        source: "automation", triggerDetail: "callback",
+        payload: { issueId }, requestedByActorType: "agent", requestedByActorId: agentId,
+        idempotencyKey: `nss735-standard-retry-${runId}`,
+      };
+      const admit = async (mergedContextSnapshot = input.mergedContextSnapshot) => {
+        return db.transaction(async (tx) => {
+          const result = await admission(createAdmissionTransactionScope(companyId, tx as unknown as Db), {
+            ...input, issueId, agentNameKey: "codexcoder", issueExecutionAgentNameKey: "codexcoder",
+            activeExecutionRun: { id: runId, agentId, status: "running", contextSnapshot: {} },
+            liveRunExecutions: { has: (id: string) => id === runId }, wakeCommentId: null, forceFreshSession: false,
+            contextSnapshot: mergedContextSnapshot,
+          });
+          expect(result.kind).toBe("coalesced");
+          if (result.kind !== "coalesced") throw new Error("Expected coalesced admission");
+          return result.run;
+        });
+      };
+      const [first, repeated] = concurrent
+        ? await Promise.all([admit(), admit()])
+        : [await admit(), await admit()];
+      expect(first.id).toBe(runId);
+      expect(repeated).toEqual(first);
+      const [receipt] = await db.select().from(agentWakeupRequests);
+      expect(receipt).toMatchObject({ companyId, agentId, runId, status: "coalesced", coalescedCount: 1, reason: "issue_execution_same_name", idempotencyKey: input.idempotencyKey, requestedByActorType: "agent", requestedByActorId: agentId, payload: { issueId } });
+      // A replay must not apply a fresh merge, even if the caller's current
+      // context has changed since the original admission.
+      expect(await admit({ ...input.mergedContextSnapshot, source: "must-not-replace-original" })).toEqual(first);
+      expect(await db.select().from(agentWakeupRequests)).toEqual([receipt]);
+      expect(await db.select().from(heartbeatRuns)).toEqual([first]);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(issue).toMatchObject({ assigneeAgentId: agentId, executionRunId: runId, checkoutRunId: runId, status: "in_progress" });
+      expect(issue).toEqual(originalIssue);
+      expect(await db.select().from(activityLog)).toEqual([]);
+      await expect(db.transaction(async (tx) => writer.coalesceIntoActiveExecutionRun(
+        createAdmissionTransactionScope(companyId, tx as unknown as Db), { ...input, requestedByActorId: randomUUID() },
+      ))).rejects.toThrow("Wake idempotency key belongs to another receipt");
+      expect(await db.select().from(agentWakeupRequests)).toEqual([receipt]);
+      expect(await db.select().from(heartbeatRuns)).toEqual([first]);
+      const laterRunId = await seedRun({ companyId, agentId, status: "running" });
+      const originalReplay = await db.transaction(async (tx) => writer.coalesceIntoActiveExecutionRun(
+        createAdmissionTransactionScope(companyId, tx as unknown as Db), { ...input, activeExecutionRunId: laterRunId },
+      ));
+      expect(originalReplay).toEqual(first);
+      const [laterRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, laterRunId));
+      expect(laterRun.contextSnapshot).toEqual({});
+      expect(await db.select().from(agentWakeupRequests)).toEqual([receipt]);
+    });
+
+    it("keeps legacy globally unique key collisions isolated across companies and agents", async () => {
+      await db.execute(sql`create unique index wake_receipt_legacy_test_uq on agent_wakeup_requests (idempotency_key)`);
+      try {
+        const companyId = await seedCompany();
+        const otherCompanyId = await seedCompany();
+        const agentId = await seedAgent({ companyId });
+        const otherAgentId = await seedAgent({ companyId: otherCompanyId });
+        const runId = await seedRun({ companyId, agentId, status: "running" });
+        const otherRunId = await seedRun({ companyId: otherCompanyId, agentId: otherAgentId, status: "running" });
+        const writer = createWakeAdmissionWriter();
+        const input = {
+          companyId, agentId, activeExecutionRunId: runId,
+          mergedContextSnapshot: { receiptOwner: agentId }, source: "automation", triggerDetail: "callback",
+          payload: null, requestedByActorType: "agent", requestedByActorId: agentId,
+          idempotencyKey: `legacy-self-wake-${randomUUID()}`,
+        };
+        const results = await Promise.allSettled([
+          db.transaction(async (tx) => writer.coalesceIntoActiveExecutionRun(createAdmissionTransactionScope(companyId, tx as unknown as Db), input)),
+          db.transaction(async (tx) => writer.coalesceIntoActiveExecutionRun(createAdmissionTransactionScope(otherCompanyId, tx as unknown as Db), {
+            ...input, companyId: otherCompanyId, agentId: otherAgentId, activeExecutionRunId: otherRunId,
+            requestedByActorId: otherAgentId, mergedContextSnapshot: { receiptOwner: otherAgentId },
+          })),
+        ]);
+        expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+        const failure = results.find((result) => result.status === "rejected");
+        expect(failure).toMatchObject({ reason: { status: 409, message: "Wake idempotency key belongs to another receipt" } });
+        const receipts = await db.select().from(agentWakeupRequests);
+        expect(receipts).toHaveLength(1);
+        const runs = await db.select().from(heartbeatRuns);
+        const losingRun = runs.find((run) => run.id !== receipts[0]!.runId);
+        expect(losingRun?.contextSnapshot).toEqual({});
+        const winningRun = runs.find((run) => run.id === receipts[0]!.runId);
+        expect(winningRun?.companyId).toBe(receipts[0]!.companyId);
+        expect(winningRun?.agentId).toBe(receipts[0]!.agentId);
+        const thirdAgentId = await seedAgent({ companyId: receipts[0]!.companyId });
+        const thirdRunId = await seedRun({ companyId: receipts[0]!.companyId, agentId: thirdAgentId, status: "running" });
+        await expect(db.transaction(async (tx) => writer.coalesceIntoActiveExecutionRun(
+          createAdmissionTransactionScope(receipts[0]!.companyId, tx as unknown as Db), {
+            ...input, companyId: receipts[0]!.companyId, agentId: thirdAgentId,
+            activeExecutionRunId: thirdRunId, requestedByActorId: thirdAgentId,
+          },
+        ))).rejects.toMatchObject({ status: 409, message: "Wake idempotency key belongs to another receipt" });
+        const [thirdRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, thirdRunId));
+        expect(thirdRun.contextSnapshot).toEqual({});
+        expect(await db.select().from(agentWakeupRequests)).toEqual(receipts);
+      } finally {
+        await db.execute(sql`drop index wake_receipt_legacy_test_uq`);
+      }
+    });
+
     it("rolls back a deferred merge when its own durable receipt insert fails", async () => {
       const companyId = await seedCompany();
       const agentId = await seedAgent({ companyId });

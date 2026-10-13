@@ -19,6 +19,16 @@ That's it. On first start the server:
 
 Data persists across restarts in `~/.paperclip/instances/default/db/`. To reset local dev data, delete that directory.
 
+New embedded clusters are initialized with UTF-8 encoding. Existing data directories
+retain their original PostgreSQL encoding; initialization flags do not re-encode
+stored data. In particular, legacy `SQL_ASCII` clusters count bytes rather than
+characters in SQL text prefixes, even when clients send valid UTF-8. Heartbeat
+history projections preserve their bounded read sizes by trimming an incomplete
+trailing UTF-8 code point on those clusters; native encoded databases keep their
+character-based limits. Invalid bytes already inside a prefix remain a visible
+database error rather than being replaced or silently discarded. This does not
+reset sessions, rewrite history, or migrate an existing database's encoding.
+
 If you need to apply pending migrations manually, run:
 
 ```sh

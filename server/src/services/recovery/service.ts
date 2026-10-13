@@ -39,6 +39,7 @@ import {
   requiresExecutionReconciliation,
   type IssueCommentMetadata,
   type IssueCommentPresentation,
+  type IssueRecoveryAction,
 } from "@paperclipai/shared";
 import {
   agents,
@@ -3009,20 +3010,26 @@ export function recoveryService(
   async function resolveDispositionRepairActionAsCovered(
     issue: typeof issues.$inferSelect,
     reason: string,
+    expectedAgentAction?: IssueRecoveryAction,
   ) {
-    const active = await recoveryActionsSvc.getActiveForIssue(
-      issue.companyId,
-      issue.id,
-    );
-    if (!active || active.kind !== "deliberate_wait_without_target") return;
-    await recoveryActionsSvc.resolveActiveForIssue({
-      companyId: issue.companyId,
-      sourceIssueId: issue.id,
-      actionId: active.id,
-      status: "resolved",
-      outcome: "restored",
-      resolutionNote: reason,
-    });
+    const active = expectedAgentAction ?? await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
+    if (!active || active.kind !== "deliberate_wait_without_target") return false;
+    const resolveInput = {
+      companyId: issue.companyId, sourceIssueId: issue.id, actionId: active.id,
+      status: "resolved" as const, outcome: "restored" as const, resolutionNote: reason,
+    };
+    const resolved = expectedAgentAction
+      ? await db.transaction(async tx => {
+        const [locked] = await tx.select().from(issueRecoveryActions).where(and(
+          eq(issueRecoveryActions.id, active.id), eq(issueRecoveryActions.companyId, issue.companyId),
+          eq(issueRecoveryActions.sourceIssueId, issue.id),
+        )).for("update").limit(1);
+        if (!locked || locked.ownerType !== "agent" || locked.ownerAgentId !== active.ownerAgentId ||
+          locked.fingerprint !== active.fingerprint || locked.revision !== active.revision) return null;
+        return recoveryActionsSvc.resolveActiveForIssue(resolveInput, tx);
+      })
+      : await recoveryActionsSvc.resolveActiveForIssue(resolveInput);
+    if (!resolved) return false;
     await logActivity(db, {
       companyId: issue.companyId,
       actorType: "system",
@@ -3038,6 +3045,7 @@ export function recoveryService(
         reason,
       },
     });
+    return true;
   }
 
   async function ensureDispositionRepairAction(input: {
@@ -3509,6 +3517,13 @@ export function recoveryService(
         }
 
         const latestRun = await latestRecoveryActionRun(action);
+        // A canonical legacy fingerprint retains its episode budget even when
+        // its bound run is missing. Generic disposition repairs still support
+        // reconciliation without a run, using their existing source-state path.
+        if (!latestRun && action.fingerprint.startsWith("legacy_disposition:v1:")) {
+          result.skipped += 1;
+          continue;
+        }
         const persistedAttempt = Math.max(
           action.attemptCount,
           Math.max(
@@ -3685,6 +3700,12 @@ export function recoveryService(
     return updated;
   }
 
+  /** A blocked source is an unrouted self-wait when it has no descriptor or the descriptor names the running assignee. */
+  function blockedRouteIsSelf(issue: typeof issues.$inferSelect, agentId: string) {
+    const owner = issue.unblockDescriptor?.owner;
+    return !owner || (typeof owner === "object" && "agentId" in owner && owner.agentId === agentId);
+  }
+
   async function decidePersistedLegacyContinuation(
     issue: typeof issues.$inferSelect,
     runId: string,
@@ -3713,8 +3734,23 @@ export function recoveryService(
       parseObject(context.paperclipWorkspace).mode === "shared_workspace" ? healthyOpenChildIssues(issue, true) : Promise.resolve([]),
     ]);
     const ownsRepair = active?.kind === "deliberate_wait_without_target" && active.ownerType === "agent";
+    // A blocked source grants authority only to the repair slot for this owner
+    // and episode. Dispatch checks the reserved successor's binding, not the
+    // original source run (which can predate creation of the action).
+    if (issue.status === "blocked" && ownsRepair) {
+      const [dispatchRun] = dispatchRunId
+        ? await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, dispatchRunId), eq(heartbeatRuns.companyId, issue.companyId))).limit(1)
+        : [];
+      const bindingContext = dispatchRunId ? parseObject(dispatchRun?.contextSnapshot) : context;
+      if (
+        active.ownerAgentId !== run.agentId ||
+        active.id !== readNonEmptyString(bindingContext.recoveryActionId) ||
+        active.fingerprint !== legacyDispositionFingerprint(issue.companyId, issue.id, run.agentId, episode.id)
+      ) return { kind: "skip" as const, reason: "invalid_repair_binding" };
+    }
+    const blockedSelfWaitRepair = ownsRepair && issue.status === "blocked" && blockedRouteIsSelf(issue, run.agentId);
     return decideLegacyContinuation({
-      run, issue, agent, episode,
+      run, issue, agent, episode, blockedSelfWaitRepair,
       gates: {
         stopped: stop.kind !== "clear" || isOperatorCancelledRun(run, run.agentId),
         paused: pause, budgetBlocked: budget,
@@ -3799,6 +3835,17 @@ export function recoveryService(
     if (episode) {
       if (!latestRun) return "skipped";
       const decision = await decidePersistedLegacyContinuation(current, latestRun.id, state, episode);
+      if (current.status === "blocked" && decision.kind === "skip" && decision.reason === "recorded_disposition") {
+        const blockedAction = await recoveryActionsSvc.getActiveForIssue(current.companyId, current.id);
+        if (
+          blockedAction?.kind === "deliberate_wait_without_target" &&
+          blockedAction.ownerType === "agent" &&
+          !blockedRouteIsSelf(current, latestRun.agentId)
+        ) {
+          const covered = await resolveDispositionRepairActionAsCovered(current, "blocked_route_recorded", blockedAction);
+          return covered ? "covered" : "skipped";
+        }
+      }
       if (decision.kind === "skip") return "skipped";
       state.fingerprint = legacyDispositionFingerprint(current.companyId, current.id, latestRun.agentId, episode.id);
     }

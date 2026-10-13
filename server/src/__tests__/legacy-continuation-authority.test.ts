@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issueThreadInteractions, issues } from "@paperclipai/db";
 import { heartbeatService } from "../services/heartbeat.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { legacyDispositionFingerprint } from "../services/recovery/legacy-continuation.js";
 
 describe("legacy continuation persisted authority", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -250,5 +251,103 @@ describe("legacy continuation persisted authority", () => {
     expect(await f.runs()).toHaveLength(2);
     const repair = (await f.runs()).find(r => r.id !== f.runId)!;
     expect(repair.contextSnapshot).toMatchObject({ legacyDispositionEpisode: { id: f.runId, attempt: 1 } });
+  });
+  describe("blocked self-wait repair through the periodic active-action reconciler", () => {
+    async function blockedFixture(attempt: number, descriptor: unknown) {
+      const f = await fixture();
+      const [action] = await db.insert(issueRecoveryActions).values({
+        companyId: f.companyId, sourceIssueId: f.issueId, kind: "deliberate_wait_without_target", ownerType: "agent",
+        ownerAgentId: f.agentId, previousOwnerAgentId: f.agentId, returnOwnerAgentId: f.agentId, cause: "deliberate_wait_without_target",
+        fingerprint: legacyDispositionFingerprint(f.companyId, f.issueId, f.agentId, f.runId), evidence: {}, nextAction: "Record a disposition.",
+        wakePolicy: { type: "bounded_owner_disposition_repair", retryAgentId: f.agentId, attempt, maxAttempts: 2 }, maxAttempts: 2, attemptCount: attempt,
+      }).returning();
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, recoveryActionId: action.id, legacyDispositionEpisode: { id: f.runId, attempt, maxAttempts: 2 } } }).where(eq(heartbeatRuns.id, f.runId));
+      await db.update(issues).set({ status: "blocked", unblockDescriptor: descriptor as never }).where(eq(issues.id, f.issueId));
+      const issue = () => db.select().from(issues).where(eq(issues.id, f.issueId)).then(r => r[0]);
+      return { ...f, action, issue };
+    }
+    it.each([null, "self"])("repairs below the limit while source stays blocked (%s descriptor)", async kind => {
+      const f = await blockedFixture(1, null);
+      if (kind === "self") await db.update(issues).set({ unblockDescriptor: { owner: { agentId: f.agentId }, action: "Close the action." } }).where(eq(issues.id, f.issueId));
+      await f.createRecovery().reconcileStrandedAssignedIssues();
+      expect(await f.runs()).toHaveLength(2);
+      expect((await f.issue()).status).toBe("blocked");
+    });
+    it.each(["old_episode", "different_owner", "different_action"])("does not consume the active repair with %s binding", async mismatch => {
+      const f = await blockedFixture(1, null);
+      if (mismatch === "different_owner") {
+        const [other] = await db.insert(agents).values({ companyId: f.companyId, name: "Different repair owner", role: "engineer", status: "idle", adapterType: "codex_local" }).returning();
+        await db.update(issueRecoveryActions).set({ ownerAgentId: other.id }).where(eq(issueRecoveryActions.id, f.action.id));
+      } else {
+        await db.update(heartbeatRuns).set({ contextSnapshot: {
+          issueId: f.issueId,
+          recoveryActionId: mismatch === "different_action" ? randomUUID() : f.action.id,
+          legacyDispositionEpisode: { id: mismatch === "old_episode" ? randomUUID() : f.runId, attempt: 1, maxAttempts: 2 },
+        } }).where(eq(heartbeatRuns.id, f.runId));
+      }
+      const before = await f.actions();
+      expect(await f.createRecovery().reconcileLegacyContinuation(f.runId)).toBe("skipped");
+      await f.createRecovery().reconcileStrandedAssignedIssues();
+      expect(await f.actions()).toEqual(before);
+      expect(await f.runs()).toHaveLength(1);
+      expect(await f.issue()).toMatchObject({ status: "blocked", assigneeAgentId: f.agentId });
+    });
+    it("does not fold an action escalated to the board between route classification and resolution", async () => {
+      const f = await blockedFixture(2, { owner: "board", action: "Decide." });
+      const transaction = db.transaction.bind(db);
+      const intercepted = vi.spyOn(db, "transaction").mockImplementationOnce(async callback => {
+        await db.update(issueRecoveryActions).set({ ownerType: "board", ownerAgentId: null, revision: f.action.revision + 1,
+          wakePolicy: { type: "board_escalation", maxAttempts: 2 } }).where(eq(issueRecoveryActions.id, f.action.id));
+        return transaction(callback);
+      });
+      try {
+        expect(await f.createRecovery().reconcileLegacyContinuation(f.runId)).toBe("skipped");
+        expect(intercepted).toHaveBeenCalledOnce();
+        expect((await f.actions())[0]).toMatchObject({ id: f.action.id, status: "active", ownerType: "board", attemptCount: 2 });
+        expect(await f.issue()).toMatchObject({ status: "blocked", assigneeAgentId: f.agentId });
+      } finally {
+        intercepted.mockRestore();
+      }
+    });
+    it.each([null, "self"])("escalates once at the limit preserving counter, owner and blocked source (%s descriptor)", async kind => {
+      const f = await blockedFixture(2, null);
+      if (kind === "self") await db.update(issues).set({ unblockDescriptor: { owner: { agentId: f.agentId }, action: "Close the action." } }).where(eq(issues.id, f.issueId));
+      const result = await f.createRecovery().reconcileStrandedAssignedIssues();
+      expect(result.escalated).toBe(1);
+      expect(await f.runs()).toHaveLength(1);
+      expect((await f.actions()).find(a => a.status === "active")).toMatchObject({ ownerType: "board", attemptCount: 2, returnOwnerAgentId: f.agentId });
+      expect(await f.issue()).toMatchObject({ status: "blocked", assigneeAgentId: f.agentId });
+      const again = await f.createRecovery().reconcileStrandedAssignedIssues();
+      expect(again.escalated).toBe(0);
+      expect((await f.actions()).find(a => a.status === "active")).toMatchObject({ ownerType: "board" });
+    });
+    it.each([[{ owner: "board", action: "Decide." }], [{ owner: { userId: "someone" }, action: "Decide." }], [{ owner: { agentId: randomUUID() }, action: "Do it." }]])("folds only the agent repair for a routed descriptor %#", async descriptor => {
+      const f = await blockedFixture(2, null);
+      const owner = descriptor.owner as { agentId?: string };
+      if (owner.agentId) {
+        const [other] = await db.insert(agents).values({ companyId: f.companyId, name: "Other", role: "engineer", status: "idle", adapterType: "codex_local" }).returning();
+        descriptor = { ...descriptor, owner: { agentId: other.id } };
+      }
+      await db.update(issues).set({ unblockDescriptor: descriptor as never }).where(eq(issues.id, f.issueId));
+      await f.createRecovery().reconcileStrandedAssignedIssues();
+      expect(await f.runs()).toHaveLength(1);
+      expect((await f.actions()).find(a => a.status === "active")).toBeUndefined();
+      expect((await f.actions())[0]).toMatchObject({ status: "resolved", outcome: "restored" });
+      expect((await f.issue()).status).toBe("blocked");
+    });
+    it("keeps an existing board-owned action active for a routed blocked source", async () => {
+      const f = await blockedFixture(2, { owner: "board", action: "Decide." });
+      await db.update(issueRecoveryActions).set({ ownerType: "board", ownerAgentId: null }).where(eq(issueRecoveryActions.id, f.action.id));
+      await f.createRecovery().reconcileStrandedAssignedIssues();
+      expect((await f.actions()).find(a => a.status === "active")).toMatchObject({ ownerType: "board" });
+    });
+    it.each(["stopped-pause", "budget", "approval"])("still skips a blocked self-wait under %s", async gate => {
+      const f = await blockedFixture(1, null);
+      if (gate === "stopped-pause") await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.agentId));
+      if (gate === "budget") await db.update(companies).set({ status: "paused", pauseReason: "budget" }).where(eq(companies.id, f.companyId));
+      if (gate === "approval") await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, kind: "request_confirmation", status: "pending", requestedResolverPolicy: "anyone", effectiveResolverPolicy: "anyone", payload: { version: 1, prompt: "Approve?" } });
+      await f.createRecovery().reconcileStrandedAssignedIssues();
+      expect(await f.runs()).toHaveLength(1);
+    });
   });
 });

@@ -183,6 +183,17 @@ The active-lock lifecycle is part of the checkout contract:
 
 Stale-lock recovery is crash recovery, not a retry loop. Paperclip must not clear or adopt locks held by non-terminal runs. After stale cleanup, a checkout `409` should mean a real live owner, status/assignee mismatch, unresolved blocker, or active gate still prevents checkout. Agents must treat that `409` as an ownership conflict and stop rather than retrying the same checkout.
 
+### Idempotent active-run wake coalescing
+
+A keyed wake that coalesces into an active run persists one receipt. Repeating
+that key for the same company, agent and requesting actor returns the original
+receipt's run without merging context again or inserting another receipt,
+including concurrent repeats. Replay does not adopt a newer active run or alter
+issue ownership, checkout or dispatch gates. An incompatible receipt, actor
+mismatch or missing original run produces a conflict rather than a duplicate
+execution. This admission guarantee does not suppress per-request API audit
+entries.
+
 ### Known execution waits at admission
 
 A known execution hold is a waiting condition, not a new execution attempt. Every issue wake must read the current effective reconciliation hold under the issue admission lock before creating a run. Resolved recovery bookkeeping can still carry a no-replay hold; only clearing the effective hold makes admission eligible again. The final dispatch gate remains required for changes after admission.
@@ -678,6 +689,29 @@ Recovery rule for a parked-for-review continuation:
 An accepted interaction supersedes a continuation park recorded before that acceptance. A queued continuation carrying a parseable `interactionResolvedAt` must not be cancelled solely because an older continuation summary says to wait for review or approval. Interaction-continuation recovery is bounded: after three consecutive continuation wakes are cancelled without a run starting, recovery converts a real dependency wait when one exists or escalates the missing execution path visibly instead of requeueing forever.
 
 This keeps the post-decomposition umbrella (§7) on a real waiting path instead of relying on `parentId` rollup, which §6 does not treat as a dependency.
+
+#### Legacy successful-run disposition repair
+
+A successful legacy run without a recorded disposition uses its own bounded
+two-attempt repair episode, separate from the five-attempt parked-review policy
+above. A blocked source is still eligible for that repair when its active action
+is agent-owned and its unblock descriptor is absent or names the same agent.
+The action owner, action id and episode fingerprint must match the recorded run;
+dispatch checks the reserved successor's binding. Stop, pause, budget, durable
+wait, active execution and other admission gates still apply.
+
+An eligible self-wait continues only within the existing attempt allowance.
+At exhaustion, the same action escalates to the board without changing the
+blocked source's assignee, episode fingerprint or consumed attempt count.
+A descriptor addressed to the board, a user or another agent covers only the
+agent-owned repair action. Folding locks and revalidates that exact action so
+it cannot resolve a concurrent board escalation. Board-owned actions remain
+explicit waits; the guarded board restore path is unchanged.
+
+A legacy action with no bound run does not enter the generic parked-review
+policy or acquire a new five-attempt budget. Its action and consumed allowance
+remain intact for explicit reconciliation.
+
 
 ### 9.3 Recovery work classes
 

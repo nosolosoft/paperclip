@@ -43,12 +43,42 @@ export const projectWorkspaceRuntimeConfigSchema = z.object({
 const projectWorkspaceSourceTypeSchema = z.enum(["local_path", "git_repo", "remote_managed", "non_git_path"]);
 const projectWorkspaceVisibilitySchema = z.enum(["default", "advanced"]);
 
+export const projectQaIntegrationCommandSchema = z.object({
+  name: z.string().trim().min(1).max(60).regex(/^[A-Za-z0-9 ._-]+$/),
+  command: z.string().trim().min(1).max(2000),
+  timeoutSeconds: z.number().int().min(30).max(3600).optional(),
+}).strict();
+
+const relativePathSegment = /^(?!\.{1,2}$)[A-Za-z0-9._-]+$/;
+
+export const projectQaIntegrationConfigSchema = z.object({
+  commands: z.array(projectQaIntegrationCommandSchema).min(1).max(10).default([]),
+  migrationDirectories: z.array(z.string().refine((value) =>
+    value.split("/").every((segment) => segment === "*" || relativePathSegment.test(segment)),
+  "Expected a relative POSIX path without parent traversal")).max(20).optional(),
+  autoResolveAdditivePaths: z.array(z.string().refine((value) =>
+    value.split("/").every((segment) => relativePathSegment.test(segment)),
+  "Expected an exact relative POSIX path without parent traversal")).max(20).optional(),
+}).strict().superRefine((integration, ctx) => {
+  if (!integration.commands.length) {
+    ctx.addIssue({ code: "custom", path: ["commands"], message: "Integration requires at least one command" });
+  }
+  if (integration.autoResolveAdditivePaths?.length && !integration.commands?.length) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["autoResolveAdditivePaths"],
+      message: "autoResolveAdditivePaths requires integration commands",
+    });
+  }
+});
+
 export const projectQaPolicySchema = z.discriminatedUnion("mode", [
   z.object({ mode: z.literal("staged") }).strict(),
   z.object({
     mode: z.literal("final"),
     finalQaAgentId: z.string().uuid(),
     mergeApproverUserId: z.string().trim().min(1).optional(),
+    integration: projectQaIntegrationConfigSchema.optional(),
   }).strict(),
 ]);
 

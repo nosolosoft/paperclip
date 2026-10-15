@@ -22,6 +22,7 @@ export function projectQaPolicyPayload(policy: ProjectQaPolicy): { qaPolicy: Pro
       mode: "final",
       finalQaAgentId: policy.finalQaAgentId,
       ...(policy.mergeApproverUserId ? { mergeApproverUserId: policy.mergeApproverUserId } : {}),
+      ...(policy.integration ? { integration: policy.integration } : {}),
     },
   };
 }
@@ -43,6 +44,7 @@ export function ProjectQaPolicyControl({
 }) {
   const policyFinalQaAgentId = policy.mode === "final" ? policy.finalQaAgentId : null;
   const policyMergeApproverUserId = policy.mode === "final" ? policy.mergeApproverUserId ?? null : null;
+  const integration = policy.mode === "final" ? policy.integration : undefined;
   const [draftMode, setDraftMode] = useState(policy.mode);
   const [draftFinalQaAgentId, setDraftFinalQaAgentId] = useState(
     policyFinalQaAgentId ?? "",
@@ -88,6 +90,7 @@ export function ProjectQaPolicyControl({
           mode: "final",
           finalQaAgentId: selectedAgentId,
           mergeApproverUserId: draftMergeApproverUserId || undefined,
+          integration,
         }),
       );
     }
@@ -101,6 +104,7 @@ export function ProjectQaPolicyControl({
         mode: "final",
         finalQaAgentId: agentId,
         mergeApproverUserId: draftMergeApproverUserId || undefined,
+        integration,
       }),
     );
   };
@@ -113,6 +117,7 @@ export function ProjectQaPolicyControl({
         mode: "final",
         finalQaAgentId: selectedAgentId,
         mergeApproverUserId: userId || undefined,
+        integration,
       }),
     );
   };
@@ -198,6 +203,14 @@ export function ProjectQaPolicyControl({
           <p className="text-xs text-muted-foreground">
             After QA PASS the task waits in review for this person until the PR is merged.
           </p>
+          {integration ? (
+            <p className="text-xs text-muted-foreground">
+              Integration checks: {integration.commands.length} command(s)
+              {integration.migrationDirectories?.length ? ", migration check" : ""}
+              {integration.autoResolveAdditivePaths?.length ? ", additive auto-resolve" : ""}
+              {". Edit via API."}
+            </p>
+          ) : null}
         </div>
       ) : null}
       {saveState === "error" ? (

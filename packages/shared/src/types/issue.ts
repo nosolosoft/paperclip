@@ -533,9 +533,12 @@ export interface IssueBlockedInboxAttention {
 
 export type IssueUnblockOwner = { agentId: string } | { userId: string } | "board";
 
+export type IssueUnblockCondition = { type: "pull_request_merged"; url: string };
+
 export interface IssueUnblockDescriptor {
   owner: IssueUnblockOwner;
   action: string;
+  condition?: IssueUnblockCondition | null;
 }
 
 export interface IssueRecoveryAction {

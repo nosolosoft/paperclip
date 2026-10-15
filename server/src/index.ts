@@ -117,6 +117,10 @@ import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
 import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
 import { ensureDecisionSigningSecret } from "./services/decision-signing.js";
+import { qaBaseWatcherService, QA_BASE_WATCHER_INTERVAL_MS } from "./services/qa-base-watcher.js";
+import { qaIntegrationRunnerService } from "./services/qa-integration-runner.js";
+import { pullRequestMergeWaitService, PULL_REQUEST_MERGE_WAIT_INTERVAL_MS } from "./services/pull-request-merge-waits.js";
+import type { QaMergeGateSweepScope } from "./services/qa-merge-gate.js";
 import { createDecisionRetentionNotifyOriginAgent, createDecisionWakeOriginAgent } from "./services/decision-wakeup.js";
 import {
   closeHttpListenerForShutdown,
@@ -1348,36 +1352,127 @@ async function startServerWithDatabaseTeardown(
     // against overlapping itself so a slow sweep cannot stack.
     // Service-level Db alias differs from the composed server db handle used
     // across this scheduler block; siblings need the same widening.
+    const qaBaseWatcher = qaBaseWatcherService(db as unknown as Db, {
+      onBaseAdvanced: (scope) => {
+        requestQaMergeGateSweep(scope);
+        setTimeout(() => requestQaMergeGateSweep(scope), 30_000).unref();
+        setTimeout(() => requestQaMergeGateSweep(scope), 90_000).unref();
+      },
+    });
     const qaMergeGate = qaMergeGateService(db as unknown as Db, {
       wakeup: heartbeat.wakeup,
+      onTrackBase: qaBaseWatcher.track,
+      onPullRequestMerged: (scope) => requestQaMergeGateSweep(scope),
+      onIntegrationRunQueued: () => kickQaIntegrationDrain(),
     });
-    let lastQaMergeGateSweepAt = 0;
-    let qaMergeGateSweepInFlight = false;
-    const scheduleQaMergeGateSweep = () => {
-      if (heartbeatSchedulerStopped || qaMergeGateSweepInFlight) return;
-      if (Date.now() - lastQaMergeGateSweepAt < QA_MERGE_GATE_SWEEP_INTERVAL_MS) return;
-      lastQaMergeGateSweepAt = Date.now();
-      qaMergeGateSweepInFlight = true;
-      trackHeartbeatSchedulerWork(qaMergeGate
+    const qaIntegrationRunner = qaIntegrationRunnerService(db as unknown as Db, {
+      onRunFinished: (scope) => requestQaMergeGateSweep(scope),
+    });
+    let qaIntegrationDrainInFlight = false;
+    let qaIntegrationDrainPending = false;
+    const kickQaIntegrationDrain = (): void => {
+      if (heartbeatSchedulerStopped) return;
+      if (qaIntegrationDrainInFlight) {
+        qaIntegrationDrainPending = true;
+        return;
+      }
+      qaIntegrationDrainInFlight = true;
+      trackHeartbeatSchedulerWork(qaIntegrationRunner
+        .drain()
+        .then((result) => {
+          if (result.ran > 0) {
+            logger.info(result, "qa integration runner drained runs");
+            qaIntegrationDrainPending = true; // drain() runs one run per call; continue until empty
+          }
+        })
+        .catch((err) => logger.error({ err }, "qa integration runner drain failed"))
+        .finally(() => {
+          qaIntegrationDrainInFlight = false;
+          if (qaIntegrationDrainPending) {
+            qaIntegrationDrainPending = false;
+            kickQaIntegrationDrain();
+          }
+        }));
+    };
+    const pullRequestMergeWaits = pullRequestMergeWaitService(db as unknown as Db, {
+      wakeup: heartbeat.wakeup,
+    });
+    let lastPullRequestMergeWaitSweepAt = 0;
+    let pullRequestMergeWaitSweepInFlight = false;
+    const schedulePullRequestMergeWaitSweep = (): void => {
+      if (heartbeatSchedulerStopped || pullRequestMergeWaitSweepInFlight
+        || Date.now() - lastPullRequestMergeWaitSweepAt < PULL_REQUEST_MERGE_WAIT_INTERVAL_MS) return;
+      lastPullRequestMergeWaitSweepAt = Date.now();
+      pullRequestMergeWaitSweepInFlight = true;
+      trackHeartbeatSchedulerWork(pullRequestMergeWaits
         .sweep()
         .then((result) => {
-          if (
-            result.completed > 0 ||
-            result.invalidated > 0 ||
-            result.conflicted > 0 ||
-            result.conflictNotices > 0 ||
-            result.mismatched > 0 ||
-            result.closed > 0
-          ) {
+          if (result.resolved > 0 || result.closedUnmerged > 0) {
+            logger.info(result, "pull request merge wait sweep changed tasks");
+          }
+        })
+        .catch((err) => logger.error({ err }, "pull request merge wait sweep failed"))
+        .finally(() => { pullRequestMergeWaitSweepInFlight = false; }));
+    };
+    // Hold the drain slot during recovery so no job is claimed before stale
+    // `running` rows from a previous process are requeued.
+    qaIntegrationDrainInFlight = true;
+    trackHeartbeatSchedulerWork(qaIntegrationRunner
+      .recoverInterrupted()
+      .catch((err) => logger.error({ err }, "qa integration runner recovery failed"))
+      .finally(() => {
+        qaIntegrationDrainInFlight = false;
+        qaIntegrationDrainPending = false;
+        kickQaIntegrationDrain();
+      }));
+    let lastQaMergeGateSweepAt = 0;
+    let qaMergeGateSweepInFlight = false;
+    let pendingFull = false;
+    const pendingScopes = new Map<string, QaMergeGateSweepScope>();
+    const requestQaMergeGateSweep = (scope: QaMergeGateSweepScope | "full"): void => {
+      if (heartbeatSchedulerStopped) return;
+      if (qaMergeGateSweepInFlight) {
+        if (scope === "full") pendingFull = true;
+        else pendingScopes.set(`${scope.companyId}|${scope.owner}|${scope.repo}`.toLowerCase(), scope);
+        return;
+      }
+      if (scope === "full" && Date.now() - lastQaMergeGateSweepAt < QA_MERGE_GATE_SWEEP_INTERVAL_MS) return;
+      if (scope === "full") lastQaMergeGateSweepAt = Date.now();
+      qaMergeGateSweepInFlight = true;
+      trackHeartbeatSchedulerWork(qaMergeGate
+        .sweep(scope === "full" ? undefined : scope)
+        .then((result) => {
+          if (result.completed || result.invalidated || result.conflicted || result.conflictNotices || result.mismatched || result.closed
+            || result.integrationQueued || result.integrationPassed || result.integrationFailed || result.conflictDeferrals) {
             logger.info(result, "qa merge gate sweep changed tasks");
           }
         })
-        .catch((err) => {
-          logger.error({ err }, "qa merge gate sweep failed");
-        })
+        .catch((err) => logger.error({ err }, "qa merge gate sweep failed"))
         .finally(() => {
           qaMergeGateSweepInFlight = false;
+          if (pendingFull) {
+            pendingFull = false;
+            pendingScopes.clear();
+            lastQaMergeGateSweepAt = 0;
+            requestQaMergeGateSweep("full");
+          } else {
+            const next = pendingScopes.entries().next().value;
+            if (next) {
+              pendingScopes.delete(next[0]);
+              requestQaMergeGateSweep(next[1]);
+            }
+          }
         }));
+    };
+    let lastQaBaseWatcherPollAt = 0;
+    let qaBaseWatcherPollInFlight = false;
+    const scheduleQaBaseWatcherPoll = () => {
+      if (heartbeatSchedulerStopped || qaBaseWatcherPollInFlight || Date.now() - lastQaBaseWatcherPollAt < QA_BASE_WATCHER_INTERVAL_MS) return;
+      lastQaBaseWatcherPollAt = Date.now();
+      qaBaseWatcherPollInFlight = true;
+      trackHeartbeatSchedulerWork(qaBaseWatcher.poll()
+        .catch((err) => logger.error({ err }, "qa base watcher poll failed"))
+        .finally(() => { qaBaseWatcherPollInFlight = false; }));
     };
     // Emit a periodic signal when the reaper inspects candidates but archives
     // none, so an inert reaper that skips every candidate is never fully silent.
@@ -1714,7 +1809,10 @@ async function startServerWithDatabaseTeardown(
 
         if (heartbeatSchedulerStopped) return;
         scheduleMergedPullRequestConfirmationSweep();
-        scheduleQaMergeGateSweep();
+        requestQaMergeGateSweep("full");
+        schedulePullRequestMergeWaitSweep();
+        kickQaIntegrationDrain();
+        scheduleQaBaseWatcherPoll();
         scheduleGitHubConnectionEventPoll();
         scheduleGitHubConnectionContinuitySweep();
         scheduleTerminalWorkspaceSweep();

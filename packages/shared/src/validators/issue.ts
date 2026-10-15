@@ -171,6 +171,7 @@ const executionWorkspaceStrategySchema = z
       })
       .optional()
       .nullable(),
+    existingBranchRemoteRepository: z.string().regex(/^github\.com\/[a-z0-9_.-]+\/[a-z0-9_.-]+$/).optional().nullable(),
     worktreeParentDir: z.string().optional().nullable(),
     provisionCommand: z.string().optional().nullable(),
     runtimeProvisionCommand: z.string().optional().nullable(),
@@ -178,6 +179,13 @@ const executionWorkspaceStrategySchema = z
   })
   .strict()
   .superRefine((strategy, ctx) => {
+    if (strategy.existingBranchRemoteRepository && !strategy.existingBranch) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["existingBranchRemoteRepository"],
+        message: "existingBranchRemoteRepository requires existingBranch",
+      });
+    }
     if (!strategy.existingBranch) return;
     if (strategy.type !== "git_worktree") {
       ctx.addIssue({
@@ -707,6 +715,10 @@ const createIssueBaseSchema = z.object({
         z.literal("board"),
       ]),
       action: multilineTextSchema.pipe(z.string().trim().min(1).max(2_000)),
+      condition: z.object({
+        type: z.literal("pull_request_merged"),
+        url: z.string().url(),
+      }).strict().optional().nullable(),
     })
     .strict()
     .optional()

@@ -10406,6 +10406,50 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
     expect(await readGit(repoRoot, ["rev-parse", "feature/preexisting-work"])).toBe(branchTip);
   });
 
+  it("fetches a remote-only linked pull request branch from the matching repository", async () => {
+    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
+    const branch = "feature/linked-pull-request";
+    const branchTip = await pushRemoteOnlyBranch(sourceRepo, remotePath, branch, "linked-pr.txt");
+    await runGit(repoRoot, ["remote", "rename", "origin", "pull-request"]);
+    await runGit(repoRoot, ["remote", "add", "origin", "https://github.com/another/repository.git"]);
+
+    const workspace = await realizeExistingBranch(repoRoot, branch, {
+      existingBranchRemoteRepository: remotePath,
+    });
+
+    expect(workspace.branchName).toBe(branch);
+    expect(workspace.created).toBe(true);
+    expect(workspace.branchCreatedByRuntime).toBe(false);
+    expect(await readGit(workspace.cwd, ["branch", "--show-current"])).toBe(branch);
+    expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(branchTip);
+    expect(await readGit(repoRoot, ["rev-parse", `refs/heads/${branch}`])).toBe(branchTip);
+    expect(await readGit(repoRoot, ["for-each-ref", "--format=%(upstream)", `refs/heads/${branch}`])).toBe("");
+    expect(workspace.warnings).toContain(
+      `Created local branch ${branch} from pull-request/${branch} for the linked pull request.`,
+    );
+  });
+
+  it("fails closed when no remote matches the linked pull request repository", async () => {
+    const { repoRoot } = await createClonedRepoWithRemote();
+    const branch = "feature/linked-pull-request";
+    const repository = "github.com/acme/linked-repository";
+
+    await expect(realizeExistingBranch(repoRoot, branch, {
+      existingBranchRemoteRepository: repository,
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      message: `Workspace strategy pins pull request branch "${branch}" from ${repository}, but no git remote in "${repoRoot}" points to that repository.`,
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          reason: "existing_branch_remote_not_found",
+          requestedExistingBranch: branch,
+        }),
+      },
+    });
+    expect(await readGit(repoRoot, ["branch", "--list", branch])).toBe("");
+    expect(existsSync(path.join(repoRoot, ".paperclip", "worktrees"))).toBe(false);
+  });
+
   it("reuses a registered legacy worktree that already has the branch checked out", async () => {
     const repoRoot = await createTempRepo();
     const branchTip = await createBranchWithCommit(repoRoot, "feature/legacy-checkout", "legacy.txt");

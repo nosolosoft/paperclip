@@ -239,6 +239,9 @@ export function projectRoutes(db: Db) {
     };
 
     const { workspace, repositoryIds, repositoryUrls, idempotencyKey, ...projectData } = req.body as CreateProjectPayload & { idempotencyKey?: string; repositoryUrls?: string[] };
+    if (projectData.qaPolicy?.mode === "final" && projectData.qaPolicy.integration !== undefined) {
+      assertNoAgentHostWorkspaceCommandMutation(req, ["qaPolicy.integration"]);
+    }
     await svc.validateQaPolicy(companyId, projectData.qaPolicy);
     const runContext = req.actor.type === "agent" && req.actor.source === "agent_jwt" && req.actor.runId
       ? await projectToolContext(db, req.actor, true) : null;
@@ -327,6 +330,13 @@ export function projectRoutes(db: Db) {
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
     if (!existing) return;
     const body = { ...req.body };
+    if (body.qaPolicy !== undefined) {
+      const integration = body.qaPolicy?.mode === "final" ? body.qaPolicy.integration : undefined;
+      const existingIntegration = existing.qaPolicy?.mode === "final" ? existing.qaPolicy.integration : undefined;
+      if (JSON.stringify(integration ?? null) !== JSON.stringify(existingIntegration ?? null)) {
+        assertNoAgentHostWorkspaceCommandMutation(req, ["qaPolicy.integration"]);
+      }
+    }
     if (body.qaPolicy !== undefined) {
       await svc.validateQaPolicy(existing.companyId, body.qaPolicy);
     }

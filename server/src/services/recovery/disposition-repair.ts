@@ -28,6 +28,7 @@ type DispositionRepairIssue = Pick<
   | "executionPolicy"
   | "executionState"
   | "monitorNextCheckAt"
+  | "unblockDescriptor"
 >;
 
 export type DispositionRepairSourceState = {
@@ -193,7 +194,9 @@ export async function collectDispositionRepairSourceState(
   const pendingApproval = linkedApprovals.some((row) =>
     row.status === "pending" || row.status === "revision_requested",
   );
-  const durablePathReason = issue.assigneeUserId
+  const durablePathReason = issue.status === "blocked" && issue.unblockDescriptor?.condition?.type === "pull_request_merged"
+    ? "pull_request_wait"
+    : issue.assigneeUserId
     ? "user_owner"
     : blockers.length > 0
       ? "blocker"
@@ -215,6 +218,7 @@ export async function collectDispositionRepairSourceState(
       executionPolicy: issue.executionPolicy,
       executionState: issue.executionState,
       monitorNextCheckAt: issue.monitorNextCheckAt?.toISOString() ?? null,
+      unblockDescriptor: issue.unblockDescriptor,
     },
     blockers: blockers.sort((a, b) => a.id.localeCompare(b.id)),
     children: children.sort((a, b) => a.id.localeCompare(b.id)),

@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  normalizeRepositoryIdentityForWorkspaceSelection,
   resolveProjectWorkspacePreferenceForPrimaryWorkProductRepo,
 } from "../services/heartbeat.ts";
+import { normalizeRepositoryIdentityForWorkspaceSelection } from "../services/repository-identity.ts";
 
 describe("primary work product repository workspace selection", () => {
   it("selects the unique project workspace matching the primary PR repository", () => {

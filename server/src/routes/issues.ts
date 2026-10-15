@@ -1,3 +1,5 @@
+import { pinIssueWorkspaceToLinkedPullRequest } from "../services/issue-pull-request-workspace.js";
+import { normalizeRepositoryIdentityForWorkspaceSelection } from "../services/repository-identity.js";
 import { setIssueTitle } from "../services/issue-title.js";
 import { setIssueTitleSchema } from "@paperclipai/shared";
 import { resolveConfirmationFromComment } from "../services/confirmation-comment-resolution.js";
@@ -3664,6 +3666,22 @@ export function issueRoutes(
     opts.resolvePullRequestDetails ?? createQaMergeGatePullRequestResolver(db);
   const router = Router();
   const svc = issueService(db);
+  const assertUnblockConditionInCompanyRepository = async (
+    companyId: string,
+    descriptor: { condition?: { type: string; url: string } | null } | null | undefined,
+  ): Promise<boolean> => {
+    if (!descriptor?.condition) return true;
+    const reference = pullRequestReferenceFromUrl(descriptor.condition.url);
+    if (!reference) return false;
+    const identity = normalizeRepositoryIdentityForWorkspaceSelection(
+      `https://github.com/${reference.owner}/${reference.repo}`,
+    );
+    const workspaces = await db.select({ repoUrl: projectWorkspaces.repoUrl })
+      .from(projectWorkspaces)
+      .where(eq(projectWorkspaces.companyId, companyId));
+    return workspaces.some((workspace) =>
+      normalizeRepositoryIdentityForWorkspaceSelection(workspace.repoUrl) === identity);
+  };
   const runRedactions = createRunSecretRedactionRegistry(db);
   const access = accessService(db);
   const secretProposals = createSecretProposalsService(db);
@@ -11417,6 +11435,9 @@ async function applyDefaultQaDispositionRouting(input: {
         res.status(422).json({ error: "Invalid work product payload" });
         return;
       }
+      if (product.type === "pull_request") {
+        await pinIssueWorkspaceToLinkedPullRequest(db, issue.id);
+      }
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
@@ -12220,6 +12241,10 @@ async function applyDefaultQaDispositionRouting(input: {
     async (req, res) => {
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
+      if (!(await assertUnblockConditionInCompanyRepository(companyId, req.body.unblockDescriptor))) {
+        res.status(422).json({ error: "unblockDescriptor.condition must reference a GitHub pull request in a repository of this company's projects" });
+        return;
+      }
       if (isSkillTestScopedActor(req)) {
         res.status(403).json({
           error: "Skill-test run tokens cannot create issues.",
@@ -12532,6 +12557,7 @@ async function applyDefaultQaDispositionRouting(input: {
       }
       await issueReferencesSvc.syncIssue(issue.id);
       await externalObjectsSvc.syncIssueSafely(issue.id);
+      await pinIssueWorkspaceToLinkedPullRequest(db, issue.id);
       const referenceSummary =
         await issueReferencesSvc.listIssueReferenceSummary(issue.id);
       const referenceDiff = issueReferencesSvc.diffIssueReferenceSummary(
@@ -14023,6 +14049,10 @@ async function applyDefaultQaDispositionRouting(input: {
         throw unprocessable("unblockDescriptor requires blocked status");
       }
       const descriptor = updateFields.unblockDescriptor ?? null;
+      if (!(await assertUnblockConditionInCompanyRepository(existing.companyId, descriptor))) {
+        res.status(422).json({ error: "unblockDescriptor.condition must reference a GitHub pull request in a repository of this company's projects" });
+        return;
+      }
       if (descriptor && typeof descriptor === "object") {
         const owner = descriptor.owner;
         if (
@@ -14779,6 +14809,9 @@ async function applyDefaultQaDispositionRouting(input: {
           blockedBy: updatedRelations.blockedBy,
           blocks: updatedRelations.blocks,
         };
+      }
+      if (req.body.description !== undefined || req.body.projectWorkspaceId !== undefined) {
+        await pinIssueWorkspaceToLinkedPullRequest(db, issue.id);
       }
       await routinesSvc.syncRunStatusForIssue(issue.id);
 

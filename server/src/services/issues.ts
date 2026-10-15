@@ -501,6 +501,9 @@ function buildPreRealizationExecutionWorkspaceSettings(
       ...(settings.workspaceStrategy.existingBranch
         ? { existingBranch: settings.workspaceStrategy.existingBranch }
         : {}),
+      ...(settings.workspaceStrategy.existingBranchRemoteRepository
+        ? { existingBranchRemoteRepository: settings.workspaceStrategy.existingBranchRemoteRepository }
+        : {}),
       ...(settings.workspaceStrategy.worktreeParentDir
         ? { worktreeParentDir: settings.workspaceStrategy.worktreeParentDir }
         : {}),

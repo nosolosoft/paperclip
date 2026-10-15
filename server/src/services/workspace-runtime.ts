@@ -1,3 +1,4 @@
+import { normalizeRepositoryIdentityForWorkspaceSelection } from "./repository-identity.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import fs from "node:fs/promises";
@@ -3341,18 +3342,63 @@ export async function realizeExecutionWorkspace(input: {
 
   const repoRoot = await resolveGitOwnerRepoRoot(input.base.baseCwd);
   let branchName: string;
+  let pinnedBranchWarnings: string[] = [];
   if (requestedExistingBranch) {
-    // Exact-branch mode: attach the requested pre-existing branch verbatim.
-    // The branch must already exist; realization never creates, renames, or
-    // resets it, and any mismatch below fails closed instead of falling back
-    // to a derived branch or the shared checkout.
-    const existingBranchSha = await runGit(
+    // Exact-branch mode attaches the requested branch without moving its tip.
+    // A linked PR may create a local ref from its matching remote, but that
+    // branch remains operator-owned for terminal cleanup.
+    let existingBranchSha = await runGit(
       ["rev-parse", "--verify", "--quiet", `refs/heads/${requestedExistingBranch}`],
       repoRoot,
     ).catch(() => null);
+    let fetchFailure = "";
+    if (!existingBranchSha && typeof rawStrategy.existingBranchRemoteRepository === "string") {
+      const repository = rawStrategy.existingBranchRemoteRepository;
+      const expectedRepository = normalizeRepositoryIdentityForWorkspaceSelection(repository);
+      const remotes = (await runGit(["remote"], repoRoot)).split(/\r?\n/).filter(Boolean);
+      let matchingRemote: string | null = null;
+      for (const remote of remotes) {
+        const url = await runGit(["remote", "get-url", remote], repoRoot);
+        if (normalizeRepositoryIdentityForWorkspaceSelection(url) === expectedRepository) {
+          matchingRemote = remote;
+          break;
+        }
+      }
+      if (!matchingRemote) {
+        throw new WorkspaceRuntimeValidationFailure(
+          `Workspace strategy pins pull request branch "${requestedExistingBranch}" from ${repository}, but no git remote in "${repoRoot}" points to that repository.`,
+          {
+            workspaceValidation: {
+              reason: "existing_branch_remote_not_found",
+              requestedExistingBranch,
+              repoRoot,
+            },
+          },
+        );
+      }
+      const fetchWarnings = await refreshRemoteTrackingBaseRef(
+        repoRoot,
+        `${matchingRemote}/${requestedExistingBranch}`,
+        input.resolveGitAuth,
+      );
+      const remoteTrackingRef = `refs/remotes/${matchingRemote}/${requestedExistingBranch}`;
+      existingBranchSha = await runGit(
+        ["rev-parse", "--verify", "--quiet", remoteTrackingRef],
+        repoRoot,
+      ).catch(() => null);
+      if (existingBranchSha) {
+        await runGit(["branch", "--no-track", requestedExistingBranch, remoteTrackingRef], repoRoot);
+        pinnedBranchWarnings = [
+          ...fetchWarnings,
+          `Created local branch ${requestedExistingBranch} from ${matchingRemote}/${requestedExistingBranch} for the linked pull request.`,
+        ];
+      } else {
+        fetchFailure = ` Fetching it from ${matchingRemote} failed: ${fetchWarnings.join(" ")}`;
+      }
+    }
     if (!existingBranchSha) {
       throw new WorkspaceRuntimeValidationFailure(
-        `Workspace strategy pins existing branch "${requestedExistingBranch}", but no local branch with that name exists in "${repoRoot}". Create or fetch the branch first, or remove workspaceStrategy.existingBranch; exact-branch realization never creates a branch.`,
+        `Workspace strategy pins existing branch "${requestedExistingBranch}", but no local branch with that name exists in "${repoRoot}". Create or fetch the branch first, or remove workspaceStrategy.existingBranch; exact-branch realization never creates a branch.${fetchFailure}`,
         {
           workspaceValidation: {
             reason: "existing_branch_not_found",
@@ -3471,7 +3517,7 @@ export async function realizeExecutionWorkspace(input: {
       cwd: reusablePath,
       branchName: effectiveBranchName,
       worktreePath: reusablePath,
-      warnings: [...extraWarnings, ...baseRefreshWarnings, ...baseDrift.warnings],
+      warnings: [...extraWarnings, ...baseRefreshWarnings, ...pinnedBranchWarnings, ...baseDrift.warnings],
       created: false,
       // A fresh realization may still land on the worktree recorded by a
       // previous heartbeat. Preserve that branch's ownership only when the
@@ -3668,9 +3714,9 @@ export async function realizeExecutionWorkspace(input: {
       cwd: worktreePath,
       branchName,
       worktreePath,
-      warnings: baseRefreshWarnings,
-      // The worktree is new, but the pinned branch pre-existed: it stays
-      // operator-owned so terminal cleanup never deletes it.
+      warnings: [...baseRefreshWarnings, ...pinnedBranchWarnings],
+      // The worktree is new, but the pinned branch stays operator-owned so
+      // terminal cleanup never deletes it.
       created: true,
       branchCreatedByRuntime: false,
       baseRefSha: currentBaseRefSha,

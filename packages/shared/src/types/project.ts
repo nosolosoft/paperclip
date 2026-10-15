@@ -9,9 +9,26 @@ import type { AgentEnvConfig } from "./secrets.js";
 export type ProjectWorkspaceSourceType = "local_path" | "git_repo" | "remote_managed" | "non_git_path";
 export type ProjectWorkspaceVisibility = "default" | "advanced";
 
+export interface ProjectQaIntegrationCommand {
+  readonly name: string;
+  readonly command: string;
+  readonly timeoutSeconds?: number;
+}
+
+export interface ProjectQaIntegrationConfig {
+  readonly commands: readonly ProjectQaIntegrationCommand[];
+  readonly migrationDirectories?: readonly string[];
+  readonly autoResolveAdditivePaths?: readonly string[];
+}
+
 export type ProjectQaPolicy =
   | { readonly mode: "staged" }
-  | { readonly mode: "final"; readonly finalQaAgentId: string; readonly mergeApproverUserId?: string };
+  | {
+      readonly mode: "final";
+      readonly finalQaAgentId: string;
+      readonly mergeApproverUserId?: string;
+      readonly integration?: ProjectQaIntegrationConfig;
+    };
 
 export type QaCodeCheckKind = "diff" | "test" | "security" | "migration" | "contract";
 

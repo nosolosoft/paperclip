@@ -21,6 +21,8 @@ export type PullRequestMergeDetails = {
   deletions?: number | null;
   changedFiles?: number | null;
   baseSha?: string | null;
+  headRepoFullName?: string | null;
+  mergeCommitSha?: string | null;
   /** GitHub `mergeable`; null = not yet computed/unknown (take no action). */
   mergeable?: boolean | null;
   mergeableState?: string | null;
@@ -129,6 +131,8 @@ export function createPullRequestMergeDetailsResolver(
       baseSha: typeof data?.baseSha === "string" ? data.baseSha : null,
       mergeable: typeof data?.mergeable === "boolean" ? data.mergeable : null,
       mergeableState: typeof data?.mergeableState === "string" ? data.mergeableState : null,
+      headRepoFullName: typeof data?.headRepoFullName === "string" ? data.headRepoFullName : null,
+      mergeCommitSha: typeof data?.mergeCommitSha === "string" ? data.mergeCommitSha : null,
     };
   };
 }

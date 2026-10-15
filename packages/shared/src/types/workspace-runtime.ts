@@ -85,11 +85,13 @@ export interface ExecutionWorkspaceStrategy {
   baseRef?: string | null;
   branchTemplate?: string | null;
   /**
-   * Pin the worktree to this exact pre-existing branch instead of rendering
-   * `branchTemplate`. Realization attaches (never creates) the branch and
-   * fails closed when the branch does not exist or is not safely attachable.
+   * Pin the worktree to this exact branch instead of rendering `branchTemplate`.
+   * Realization attaches the local branch, or fetches and creates it from
+   * existingBranchRemoteRepository, and fails closed if not safely attachable.
    */
   existingBranch?: string | null;
+  /** Normalized github.com/<owner>/<repo> remote identity used to fetch a missing existingBranch. */
+  existingBranchRemoteRepository?: string | null;
   worktreeParentDir?: string | null;
   provisionCommand?: string | null;
   runtimeProvisionCommand?: string | null;

@@ -399,6 +399,8 @@ export {
   projectExecutionWorkspacePolicySchema,
   projectWorkspaceRuntimeConfigSchema,
   projectQaPolicySchema,
+  projectQaIntegrationCommandSchema,
+  projectQaIntegrationConfigSchema,
   qaReviewEvidenceV1Schema,
   type CreateProject,
   type UpdateProject,

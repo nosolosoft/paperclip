@@ -2073,6 +2073,13 @@
       "when": 1790796608171,
       "tag": "0297_broad_rattler",
       "breakpoints": true
+    },
+    {
+      "idx": 298,
+      "version": "7",
+      "when": 1792047942673,
+      "tag": "0298_handy_greymalkin",
+      "breakpoints": true
     }
   ]
 }

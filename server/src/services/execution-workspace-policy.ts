@@ -60,6 +60,9 @@ function parseExecutionWorkspaceStrategy(raw: unknown): ExecutionWorkspaceStrate
     ...(typeof parsed.existingBranch === "string" && parsed.existingBranch.trim().length > 0
       ? { existingBranch: parsed.existingBranch.trim() }
       : {}),
+    ...(typeof parsed.existingBranchRemoteRepository === "string" && parsed.existingBranchRemoteRepository.trim().length > 0
+      ? { existingBranchRemoteRepository: parsed.existingBranchRemoteRepository.trim() }
+      : {}),
     ...(typeof parsed.worktreeParentDir === "string" || parsed.worktreeParentDir === null ? { worktreeParentDir: parsed.worktreeParentDir } : {}),
     ...(typeof parsed.provisionCommand === "string" || parsed.provisionCommand === null ? { provisionCommand: parsed.provisionCommand } : {}),
     ...(typeof parsed.runtimeProvisionCommand === "string" || parsed.runtimeProvisionCommand === null

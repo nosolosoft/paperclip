@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  projectQaIntegrationConfigSchema,
   projectQaPolicySchema,
   qaReviewEvidenceV1Schema,
 } from "./project.js";
@@ -59,6 +60,63 @@ function expectIssueAt(result: { success: boolean; error?: { issues: { path: Pro
 }
 
 describe("project QA validators", () => {
+  it("accepts and trims integration commands with relative migration and additive paths", () => {
+    const integration = {
+      commands: [{ name: " Test suite ", command: " pnpm test ", timeoutSeconds: 30 }],
+      migrationDirectories: ["server/migrations/*", "packages/db"],
+      autoResolveAdditivePaths: ["CHANGELOG.md", "packages/db/schema.ts"],
+    };
+    expect(projectQaPolicySchema.parse({ mode: "final", finalQaAgentId, integration })).toEqual({
+      mode: "final",
+      finalQaAgentId,
+      integration: { ...integration, commands: [{ name: "Test suite", command: "pnpm test", timeoutSeconds: 30 }] },
+    });
+  });
+
+  it.each([
+    { commands: [] },
+    { commands: Array.from({ length: 11 }, () => ({ name: "test", command: "pnpm test" })) },
+    ...["", " ", "a".repeat(61), "test/unsafe", "test\nname"].map((name) => ({ commands: [{ name, command: "test" }] })),
+    ...["", " ", "a".repeat(2001)].map((command) => ({ commands: [{ name: "test", command }] })),
+    ...[29, 3601, 30.5, "30"].map((timeoutSeconds) => ({ commands: [{ name: "test", command: "test", timeoutSeconds }] })),
+    { commands: [{ name: "test", command: "test", unexpected: true }] },
+    { commands: [{ name: "test", command: "test" }], unexpected: true },
+  ])("rejects invalid integration command configuration %j", (integration) => {
+    expect(projectQaIntegrationConfigSchema.safeParse(integration).success).toBe(false);
+  });
+
+  it.each(["migrationDirectories", "autoResolveAdditivePaths"] as const)("validates %s boundaries and traversal", (field) => {
+    const commands = [{ name: "test", command: "pnpm test", timeoutSeconds: 3600 }];
+    expect(projectQaIntegrationConfigSchema.safeParse({ commands, [field]: Array(20).fill("src/db") }).success).toBe(true);
+    for (const paths of [Array(21).fill("src/db"), ...["", "/src", "src/", "src//db", "../db", "src/../db", "./src", "src\\db"].map((path) => [path])]) {
+      expect(projectQaIntegrationConfigSchema.safeParse({ commands, [field]: paths }).success).toBe(false);
+    }
+    expect(projectQaIntegrationConfigSchema.safeParse({ commands, [field]: ["src/*"] }).success).toBe(field === "migrationDirectories");
+    expect(projectQaIntegrationConfigSchema.safeParse({ commands, [field]: ["src/db*"] }).success).toBe(false);
+  });
+
+  it("requires integration commands for additive auto-resolution", () => {
+    for (const integration of [{ commands: [], autoResolveAdditivePaths: ["CHANGELOG.md"] }, { autoResolveAdditivePaths: ["CHANGELOG.md"] }]) {
+      const result = projectQaIntegrationConfigSchema.safeParse(integration);
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues.some((issue) => issue.path.join(".") === "autoResolveAdditivePaths" && issue.message === "autoResolveAdditivePaths requires integration commands")).toBe(true);
+      }
+    }
+  });
+
+  it("rejects integration configuration on staged policies", () => {
+    expect(projectQaPolicySchema.safeParse({ mode: "staged", integration: { commands: [{ name: "test", command: "test" }] } }).success).toBe(false);
+  });
+
+  it("accepts command count, text length, and timeout upper boundaries", () => {
+    expect(projectQaIntegrationConfigSchema.safeParse({
+      commands: Array.from({ length: 10 }, () => ({ name: "a".repeat(60), command: "a".repeat(2000), timeoutSeconds: 3600 })),
+      migrationDirectories: [],
+      autoResolveAdditivePaths: [],
+    }).success).toBe(true);
+  });
+
   it("accepts staged project QA policy", () => {
     expect(projectQaPolicySchema.parse({ mode: "staged" })).toEqual({ mode: "staged" });
   });

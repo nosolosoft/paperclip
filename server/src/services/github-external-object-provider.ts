@@ -202,6 +202,8 @@ function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string
   const headSha = asNestedString(body, "head", "sha");
   const baseRef = asNestedString(body, "base", "ref");
   const baseSha = asNestedString(body, "base", "sha");
+  const headRepoFullName = asNestedString(asRecord(body.head) ?? {}, "repo", "full_name");
+  const mergeCommitSha = asString(body.merge_commit_sha);
   const mergeable = asBoolean(body.mergeable);
   const mergeableState = asString(body.mergeable_state);
   const reviewDecision = asString(body.review_decision);
@@ -265,6 +267,8 @@ function pullRequestSnapshot(identity: GitHubObjectIdentity, body: Record<string
       ...(headRef ? { headRef } : {}),
       ...(headSha ? { headSha } : {}),
       ...(baseRef ? { baseRef } : {}),
+      ...(headRepoFullName ? { headRepoFullName } : {}),
+      ...(mergeCommitSha ? { mergeCommitSha } : {}),
       baseSha,
       mergeable,
       mergeableState,

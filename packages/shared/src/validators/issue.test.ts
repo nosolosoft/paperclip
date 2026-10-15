@@ -229,6 +229,140 @@ describe("issue validators", () => {
     ).toBe(false);
   });
 
+  for (const [operation, schema] of [
+    ["create", createIssueSchema],
+    ["update", updateIssueSchema],
+  ] as const) {
+    it(`accepts pull request merge conditions on issue ${operation}`, () => {
+      const unblockDescriptor = {
+        owner: "board",
+        action: "Wait for the linked pull request to merge",
+        condition: {
+          type: "pull_request_merged",
+          url: "https://github.com/acme/paperclip/pull/42",
+        },
+      };
+
+      expect(schema.parse({
+        title: "Wait for merge",
+        status: "blocked",
+        unblockDescriptor,
+      }).unblockDescriptor).toEqual(unblockDescriptor);
+      expect(schema.parse({
+        title: "Wait for review",
+        status: "blocked",
+        unblockDescriptor: { ...unblockDescriptor, condition: null },
+      }).unblockDescriptor?.condition).toBeNull();
+    });
+
+    it.each([
+      { type: "pull_request_merged", url: "https://github.com/acme/paperclip/pull/42", extra: true },
+      { type: "pull_request_closed", url: "https://github.com/acme/paperclip/pull/42" },
+      { type: "pull_request_merged", url: "not-a-url" },
+      { type: "pull_request_merged" },
+    ])(`rejects invalid merge conditions on issue ${operation}: %j`, (condition) => {
+      expect(schema.safeParse({
+        title: "Wait for merge",
+        status: "blocked",
+        unblockDescriptor: {
+          owner: "board",
+          action: "Wait for merge",
+          condition,
+        },
+      }).success).toBe(false);
+    });
+
+    it.each([
+      "github.com/acme/paperclip",
+      "github.com/acme-team/paperclip.repo_2",
+    ])(`accepts pinned remote branches on issue ${operation}: %s`, (repository) => {
+      const executionWorkspaceSettings = {
+        mode: "isolated_workspace",
+        workspaceStrategy: {
+          type: "git_worktree",
+          existingBranch: "fix/linked-pr",
+          existingBranchRemoteRepository: repository,
+        },
+      };
+
+      expect(schema.parse({
+        title: "Continue linked pull request",
+        executionWorkspaceSettings,
+      }).executionWorkspaceSettings).toEqual(executionWorkspaceSettings);
+    });
+
+    it.each([
+      "https://github.com/acme/paperclip",
+      "git@github.com:acme/paperclip.git",
+      "gitlab.com/acme/paperclip",
+      "github.com/Acme/paperclip",
+      "github.com/acme/Paperclip",
+      "github.com/acme",
+      "github.com//paperclip",
+      "github.com/acme/",
+      "github.com/acme/paperclip/pull/42",
+      "github.com/acme/paperclip ",
+      "",
+    ])(`rejects invalid remote repository identities on issue ${operation}: %j`, (repository) => {
+      expect(schema.safeParse({
+        title: "Continue linked pull request",
+        executionWorkspaceSettings: {
+          mode: "isolated_workspace",
+          workspaceStrategy: {
+            type: "git_worktree",
+            existingBranch: "fix/linked-pr",
+            existingBranchRemoteRepository: repository,
+          },
+        },
+      }).success).toBe(false);
+    });
+
+    it.each([undefined, null])(`requires a branch for a remote repository on issue ${operation}: %j`, (existingBranch) => {
+      const result = schema.safeParse({
+        title: "Continue linked pull request",
+        executionWorkspaceSettings: {
+          mode: "isolated_workspace",
+          workspaceStrategy: {
+            type: "git_worktree",
+            existingBranch,
+            existingBranchRemoteRepository: "github.com/acme/paperclip",
+          },
+        },
+      });
+
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues).toEqual([
+          expect.objectContaining({
+            message: "existingBranchRemoteRepository requires existingBranch",
+            path: [
+              "executionWorkspaceSettings",
+              "workspaceStrategy",
+              "existingBranchRemoteRepository",
+            ],
+          }),
+        ]);
+      }
+    });
+
+    it.each([
+      { mode: "shared_workspace", type: "git_worktree" },
+      { mode: "isolated_workspace", type: "project_primary" },
+    ])(`retains existing branch workspace restrictions on issue ${operation}: %j`, ({ mode, type }) => {
+      expect(schema.safeParse({
+        title: "Continue linked pull request",
+        executionWorkspaceSettings: {
+          mode,
+          workspaceStrategy: {
+            type,
+            existingBranch: "fix/linked-pr",
+            existingBranchRemoteRepository: "github.com/acme/paperclip",
+          },
+        },
+      }).success).toBe(false);
+    });
+  }
+
   it("rejects invalid task-scoped network egress CIDRs", () => {
     expect(
       updateIssueSchema.safeParse({

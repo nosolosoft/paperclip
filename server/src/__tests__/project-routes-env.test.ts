@@ -88,7 +88,7 @@ function registerModuleMocks() {
   }));
 }
 
-async function createApp() {
+async function createApp(actorType: "board" | "agent" = "board") {
   const [{ projectRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/projects.js")>("../routes/projects.js"),
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
@@ -97,8 +97,10 @@ async function createApp() {
   app.use(express.json());
   app.use((req, _res, next) => {
     (req as any).actor = {
-      type: "board",
+      type: actorType,
       userId: "board-user",
+      agentId: actorType === "agent" ? "agent-1" : undefined,
+      companyId: actorType === "agent" ? "company-1" : undefined,
       companyIds: ["company-1"],
       source: "local_implicit",
       isInstanceAdmin: false,
@@ -172,6 +174,66 @@ describe("project env routes", () => {
     mockProjectService.listWorkspaces.mockResolvedValue([]);
     mockEnvironmentService.getById.mockReset();
     mockSecretService.normalizeEnvBindingsForPersistence.mockImplementation(async (_companyId, env) => env);
+  });
+
+  it.each([
+    { mode: "final", finalQaAgentId: "11111111-1111-4111-8111-111111111111", integration: { commands: [{ name: "new test", command: "pnpm new-test" }] } },
+    { mode: "final", finalQaAgentId: "11111111-1111-4111-8111-111111111111" },
+    { mode: "staged" },
+  ])("forbids agent PATCH integration changes or removal: %j", async (qaPolicy) => {
+    mockProjectService.getById.mockResolvedValue(buildProject({
+      qaPolicy: {
+        mode: "final",
+        finalQaAgentId: "11111111-1111-4111-8111-111111111111",
+        integration: { commands: [{ name: "test", command: "pnpm test" }] },
+      },
+    }));
+    const app = await createApp("agent");
+    const res = await request(app).patch("/api/projects/project-1").send({ qaPolicy });
+    expect(res.status).toBe(403);
+    expect(mockProjectService.update).not.toHaveBeenCalled();
+  });
+
+  it("forbids agent POST integration commands", async () => {
+    const app = await createApp("agent");
+    const res = await request(app).post("/api/companies/company-1/projects").send({
+      name: "Project",
+      qaPolicy: {
+        mode: "final",
+        finalQaAgentId: "11111111-1111-4111-8111-111111111111",
+        integration: { commands: [{ name: "test", command: "pnpm test" }] },
+      },
+    });
+    expect(res.status).toBe(403);
+    expect(mockProjectService.create).not.toHaveBeenCalled();
+  });
+
+  it("forbids agent PATCH introducing integration commands", async () => {
+    mockProjectService.getById.mockResolvedValue(buildProject());
+    const app = await createApp("agent");
+    const res = await request(app).patch("/api/projects/project-1").send({
+      qaPolicy: {
+        mode: "final",
+        finalQaAgentId: "11111111-1111-4111-8111-111111111111",
+        integration: { commands: [{ name: "test", command: "pnpm test" }] },
+      },
+    });
+    expect(res.status).toBe(403);
+    expect(mockProjectService.update).not.toHaveBeenCalled();
+  });
+
+  it("allows agent PATCH retaining identical integration configuration", async () => {
+    const qaPolicy = {
+      mode: "final",
+      finalQaAgentId: "11111111-1111-4111-8111-111111111111",
+      integration: { commands: [{ name: "test", command: "pnpm test" }] },
+    };
+    mockProjectService.getById.mockResolvedValue(buildProject({ qaPolicy }));
+    mockProjectService.update.mockResolvedValue(buildProject({ qaPolicy }));
+    const app = await createApp("agent");
+    const res = await request(app).patch("/api/projects/project-1").send({ qaPolicy });
+    expect(res.status).toBe(200);
+    expect(mockProjectService.update).toHaveBeenCalledWith("project-1", { qaPolicy });
   });
 
   it("normalizes env bindings on create and logs only env keys", async () => {

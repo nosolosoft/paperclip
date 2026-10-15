@@ -343,14 +343,21 @@ unknown, they escalate via human-input (ask the board/human) instead of guessing
 
 **Advisory notice.** For tasks still `in_progress`/`todo` with an agent assignee whose primary open PR
 conflicts, the sweep posts one system comment (same context as above, headline "No status change;
-resolve before handing off to QA") per head/base SHA. It never changes status, assignee, or
-execution state, wakes no agent, and publishes no commit status.
+resolve before handing off to QA") per head/base SHA and publishes a `paperclip/qa` `failure`
+status on that head, so a stale PASS status is never shown on a conflicting head. It never changes
+status, assignee, or execution state and wakes no agent.
+
+**Conflict chains.** When a conflicting PR's head descends from another open, conflicting PR of the
+same repository and base, only the root PR(s) are returned to the engineer. Descendant tasks record
+`issue.qa_merge_gate_conflict_deferred`, keep their assignee, show `failure` "Merge conflicts;
+waiting for root #N", and are returned only after each root gets a new head or merges, with
+instructions to reuse the root's resolution.
 
 **Fallback blocked approver.** If no merge approver can be notified for the blocked conflict, the
 blocked state falls back to an approver so the conflict is never silently dropped.
 
-**PAT permissions.** Conflict detection reads PR mergeability, so the `PAPERCLIP_QA_GITHUB_TOKEN`
-PAT additionally needs *Contents: Read* on the target repositories.
+**PAT permissions.** Conflict provenance and full commit-root tree verification additionally
+require *Contents: Read* for the `PAPERCLIP_QA_GITHUB_TOKEN` PAT on the target repositories.
 
 Phase 2 — automated merge polling and commit status (requires per-company PAT):
 
@@ -358,14 +365,62 @@ Phase 2 — automated merge polling and commit status (requires per-company PAT)
   (never `GITHUB_TOKEN`/`GH_TOKEN`/`PAPERCLIP_GITHUB_TOKEN`, which are agent git credentials) with
   *Pull requests: Read* and *Commit statuses: Read and write* on the target repositories.
 - A server sweep runs every 5 minutes over `in_review` tasks waiting at the approval stage with a
-  QA PASS + head SHA. If the PR is merged at exactly the reviewed SHA, the task is closed as
-  `done` with a system comment and an `issue.qa_merge_gate_completed` activity entry. If it is
-  merged at a different SHA, or closed without merging, the task stays open for the approver with
-  a warning comment (`issue.qa_merge_gate_head_mismatch` / `issue.qa_merge_gate_pr_closed`).
-- If new commits are pushed before the merge (open PR with a new head), the PASS is invalidated:
-  the issue returns to final QA (a wake run is triggered), and the commit status is reset.
+  QA PASS + head SHA. A merged PR closes as `done` if its head is the reviewed SHA or GitHub
+  proves that both immutable commits have the identical complete root Git tree. The system
+  comment and `issue.qa_merge_gate_completed` activity record the original PASS SHA, observed
+  head and tree proof. The original QA evidence remains unchanged; the new SHA is not declared
+  newly reviewed. A different tree or unavailable proof leaves a merged PR open with
+  `issue.qa_merge_gate_head_mismatch`; closing without merging produces `issue.qa_merge_gate_pr_closed`.
+- For an open PR with a different head but an identical complete tree, the sweep retains the
+  original PASS, approval state and assignee, recording one `issue.qa_merge_gate_tree_equivalent`
+  notice per reviewed/observed head pair. A trusted proof recorded by the gate is reused only
+  for the same company, issue, PR and immutable commit pair; later tree-lookup outages do not
+  invalidate that established proof. Otherwise the existing fail-closed behavior applies:
+  a different tree or unavailable initial proof invalidates the PASS, returns the issue to
+  final QA and resets the commit status. An unavailable initial proof can therefore require
+  fresh QA even when the content later proves equal.
+- Tree equivalence is not inferred from a PR diff, commit author or merge parents. It does not
+  validate CI on the new SHA. Already completed tasks are not reopened.
 - Paperclip publishes a `paperclip/qa` commit status on the PR head: `pending` at QA handoff,
-  `success` on PASS, `failure` on FAIL, `pending` again on a post-PASS push.
+  `success` on PASS, `failure` on FAIL, and `pending` again when a post-PASS push invalidates it.
+- A base-branch watcher polls each tracked base every 60 seconds with ETag conditional requests.
+  When the base advances it re-sweeps that repository immediately and again after 30 and 90
+  seconds (GitHub reports `mergeable: null` while recomputing). A merged PR also triggers a
+  repository-scoped sweep.
+
+**Integration checks (`qaPolicy.integration`, optional, board-only).** A final project may set:
+
+```json
+{ "commands": [{ "name": "test", "command": "npm test", "timeoutSeconds": 1200 }],
+  "migrationDirectories": ["db/migrations"],
+  "autoResolveAdditivePaths": ["IMPLEMENTATION_PLAN.md"] }
+```
+
+Agents cannot add, change or remove it (`403`). When a PR head differs from the PASS SHA and the
+trees differ, the gate checks whether the new head is a two-parent merge of the PASS commit with a
+commit reachable from the base. If so, a server runner (bare mirror under the instance root,
+whitelisted environment, per-command timeout) verifies with `git merge-tree` that the head's tree
+is exactly the clean merge, rejects duplicate migration numbers in `migrationDirectories`, and runs
+the commands on that exact tree (`qa_integration_runs`). Results:
+
+- `passed` with the PR open: the original PASS is kept (bound to its original SHA; no new QA
+  review is claimed) and `paperclip/qa` shows `success` "integration checks passed".
+- `passed` with the PR merged: the task closes `done` when the merge commit's tree equals the
+  checked tree, or after a second run validates the merge commit itself.
+- `failed`: the task returns to the engineer with the failing check output, and the head gets
+  `failure`. A merged PR is fixed forward in a new PR.
+- Not eligible (manual edits in the merge, rebase merges, unavailable proof): the existing
+  invalidation/mismatch behavior applies.
+
+The sweep also inventories migrations added by open PRs and comments once when two open PRs add
+the same migration number in the same directory.
+
+**Additive auto-resolve (opt-in).** With `autoResolveAdditivePaths` (requires `commands`) and the
+company secret `PAPERCLIP_CONFLICT_RESOLVER_TOKEN` (contents write, distinct from the read-only QA
+token), a PASS head that conflicts only in listed paths, where both sides only add distinct lines,
+is resolved with a union merge and pushed with `--force-with-lease` against the PASS SHA (never on
+fork PRs). The pushed commit then goes through the integration checks above; the PASS is kept only
+if they pass.
 
 **Without the PAT** the feature degrades gracefully: PASS SHA validation falls back to the
 best-effort check at PATCH time (a PR whose head cannot be read is accepted), no commit status is
@@ -373,6 +428,25 @@ published, and the merge is not tracked — the approver closes the task manuall
 comment, like any other approval stage.
 
 PASS requires an authenticated PATCH carrying `qaVerdict: "pass"` and complete `qaEvidence`, followed immediately by an authenticated GET. QA must verify `status: "done"`, `executionState.qaVerdict: "pass"`, and matching `executionState.qaEvidence`; if GET fails or any value mismatches, do not report PASS. The durable audit copy is `issue_execution_decisions.evidence`. A direct `status: "done"`, free-text "QA PASS" comment, or unverified verdict never closes the issue. Browser `"not_applicable"` requires a non-empty reason and empty evidence. A final FAIL uses an authenticated PATCH and actionable comment naming the phase, failed check or criterion, expected, observed, and reproducible evidence, then returns the issue to the original Engineer. After re-handoff, the same final QA agent must rerun Code, Browser PASS or explicit `"not_applicable"`, and Spec from scratch, with no stale evidence reuse.
+
+#### Linked pull request workspaces
+
+When an issue in an isolated `git_worktree` project links exactly one open, same-repository PR of
+the project's repository (a `pull_request` work product, or otherwise a PR URL in the description)
+before its workspace is realized, Paperclip pins `workspaceStrategy.existingBranch` to the PR's
+head branch and `existingBranchRemoteRepository` to its repository, so the agent works on the PR
+branch instead of creating a new one. If the branch is not local, realization fetches it from the
+matching remote (`existing_branch_remote_not_found` when no remote points to that repository).
+Ambiguous, fork, closed or mismatched PRs leave the workspace unchanged with one explanatory comment.
+
+#### Waiting for a pull request merge
+
+A blocked issue may carry `unblockDescriptor.condition: { "type": "pull_request_merged", "url":
+"https://github.com/<owner>/<repo>/pull/<n>" }` (the repository must belong to one of the company's
+projects, else `422`). Every 2 minutes Paperclip checks the PR: once merged, and with no other
+unresolved blockers or pending interactions/approvals, the issue moves to `todo` and its assignee is
+woken. A PR closed without merging leaves the issue blocked with one comment. Recovery treats such
+an issue as a durable wait (`pull_request_wait`).
 
 ### Precedence
 

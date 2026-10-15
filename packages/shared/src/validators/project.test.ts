@@ -3,6 +3,7 @@ import {
   projectQaIntegrationConfigSchema,
   projectQaPolicySchema,
   qaReviewEvidenceV1Schema,
+  resolveQaIntegrationConfigForRepository,
 } from "./project.js";
 
 const finalQaAgentId = "11111111-1111-4111-8111-111111111111";
@@ -83,6 +84,55 @@ describe("project QA validators", () => {
     { commands: [{ name: "test", command: "test" }], unexpected: true },
   ])("rejects invalid integration command configuration %j", (integration) => {
     expect(projectQaIntegrationConfigSchema.safeParse(integration).success).toBe(false);
+  });
+
+  it("accepts a repositories-only integration map", () => {
+    const integration = {
+      repositories: {
+        "nosolosoft/opptests-backend": { commands: [{ name: "pytest", command: "pytest -q" }], migrationDirectories: ["*/migrations"] },
+        "nosolosoft/opptests-web-frontend": { commands: [{ name: "test", command: "npm test" }] },
+      },
+    };
+    expect(projectQaIntegrationConfigSchema.parse(integration)).toEqual(integration);
+  });
+
+  it.each([
+    { repositories: { "Owner/Repo": { commands: [{ name: "t", command: "t" }] } } },
+    { repositories: { "no-slash": { commands: [{ name: "t", command: "t" }] } } },
+    { repositories: { "owner/repo": { commands: [] } } },
+    { repositories: { "owner/repo": { commands: [{ name: "t", command: "t" }], extra: true } } },
+    { repositories: {} },
+    { migrationDirectories: ["db"] },
+  ])("rejects invalid repositories configuration %j", (integration) => {
+    expect(projectQaIntegrationConfigSchema.safeParse(integration).success).toBe(false);
+  });
+
+  it("reports the combined requirement when neither commands nor repositories exist", () => {
+    const result = projectQaIntegrationConfigSchema.safeParse({});
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error.issues.map((issue) => issue.message)).toContain("integration requires commands or repositories");
+  });
+
+  it("requires repository-level additive paths to have that repository's commands", () => {
+    const result = projectQaIntegrationConfigSchema.safeParse({
+      commands: [{ name: "t", command: "t" }],
+      repositories: { "owner/repo": { autoResolveAdditivePaths: ["CHANGELOG.md"] } },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("resolves per-repository config without merging", () => {
+    const config = {
+      commands: [{ name: "top", command: "top" }],
+      migrationDirectories: ["db"],
+      repositories: { "owner/repo": { commands: [{ name: "repo", command: "repo" }] } },
+    };
+    expect(resolveQaIntegrationConfigForRepository(config, "Owner", "Repo")).toEqual(config.repositories["owner/repo"]);
+    expect(resolveQaIntegrationConfigForRepository(config, "other", "x")).toEqual({
+      commands: config.commands, migrationDirectories: ["db"],
+    });
+    expect(resolveQaIntegrationConfigForRepository({ repositories: config.repositories }, "other", "x")).toBeNull();
+    expect(resolveQaIntegrationConfigForRepository(undefined, "a", "b")).toBeNull();
   });
 
   it.each(["migrationDirectories", "autoResolveAdditivePaths"] as const)("validates %s boundaries and traversal", (field) => {

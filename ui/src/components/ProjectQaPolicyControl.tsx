@@ -205,7 +205,9 @@ export function ProjectQaPolicyControl({
           </p>
           {integration ? (
             <p className="text-xs text-muted-foreground">
-              Integration checks: {integration.commands.length} command(s)
+              Integration checks: {integration.repositories && Object.keys(integration.repositories).length
+                ? `${Object.keys(integration.repositories).length} ${Object.keys(integration.repositories).length === 1 ? "repository" : "repositories"}`
+                : `${integration.commands?.length ?? 0} command(s)`}
               {integration.migrationDirectories?.length ? ", migration check" : ""}
               {integration.autoResolveAdditivePaths?.length ? ", additive auto-resolve" : ""}
               {". Edit via API."}

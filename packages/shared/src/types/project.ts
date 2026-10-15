@@ -15,10 +15,18 @@ export interface ProjectQaIntegrationCommand {
   readonly timeoutSeconds?: number;
 }
 
-export interface ProjectQaIntegrationConfig {
+export interface ProjectQaIntegrationRepositoryConfig {
   readonly commands: readonly ProjectQaIntegrationCommand[];
   readonly migrationDirectories?: readonly string[];
   readonly autoResolveAdditivePaths?: readonly string[];
+}
+
+export interface ProjectQaIntegrationConfig {
+  readonly commands?: readonly ProjectQaIntegrationCommand[];
+  readonly migrationDirectories?: readonly string[];
+  readonly autoResolveAdditivePaths?: readonly string[];
+  /** Per-repository overrides keyed by lowercase `owner/repo`; an entry replaces the top-level config entirely. */
+  readonly repositories?: Readonly<Record<string, ProjectQaIntegrationRepositoryConfig>>;
 }
 
 export type ProjectQaPolicy =

@@ -404,10 +404,10 @@ describeEmbeddedPostgres("qa merge gate sweep", () => {
     approverUserId: string; workProductId: string;
   };
 
-  async function enableIntegration(seeded: SeededApproval) {
+  async function enableIntegration(seeded: SeededApproval, integration: unknown = integrationConfig) {
     await db.update(projects).set({ qaPolicy: {
       mode: "final", finalQaAgentId: seeded.qaAgentId,
-      mergeApproverUserId: seeded.approverUserId, integration: integrationConfig,
+      mergeApproverUserId: seeded.approverUserId, integration,
     } }).where(eq(projects.id, seeded.projectId));
   }
 
@@ -523,6 +523,36 @@ describeEmbeddedPostgres("qa merge gate sweep", () => {
     expect(await service.sweep()).toMatchObject({ invalidated: 1, integrationQueued: 0 });
     expect(await integrationRows(seeded.issueId)).toHaveLength(0);
     expect((await loadIssue(seeded.issueId))!.executionState!.qaVerdict).toBeNull();
+  });
+
+  it("does not enqueue integration when repositories only configure another repository", async () => {
+    const seeded = await seedPendingApprovalIssue();
+    await enableIntegration(seeded, { repositories: { "other/repo": { commands: [{ name: "Other", command: "make test" }] } } });
+    const service = qaMergeGateService(db, {
+      resolvePullRequestDetails: async () => integrationDetails(),
+      resolveCommitTrees: integrationTrees,
+      resolveAncestry: async () => "ancestor",
+    });
+    expect(await service.sweep()).toMatchObject({ invalidated: 1, integrationQueued: 0 });
+    expect(await integrationRows(seeded.issueId)).toHaveLength(0);
+  });
+
+  it("enqueues integration with the digest of the repository entry", async () => {
+    const seeded = await seedPendingApprovalIssue();
+    const entry = { commands: [{ name: "Repo", command: "make test" }], migrationDirectories: ["db/migrations"] };
+    await enableIntegration(seeded, {
+      commands: [{ name: "Top", command: "echo top" }],
+      repositories: { ["Example/Repo".toLowerCase()]: entry },
+    });
+    const service = qaMergeGateService(db, {
+      resolvePullRequestDetails: async () => integrationDetails(),
+      resolveCommitTrees: integrationTrees,
+      resolveAncestry: async () => "ancestor",
+    });
+    expect(await service.sweep()).toMatchObject({ invalidated: 0, integrationQueued: 1 });
+    const rows = await integrationRows(seeded.issueId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.configDigest).toBe(qaIntegrationConfigDigest(entry));
   });
 
   it("requeues an old integration error once without replacing the PASS", async () => {

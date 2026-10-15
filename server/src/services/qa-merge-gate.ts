@@ -43,7 +43,7 @@ import {
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import { logger } from "../middleware/logger.js";
 import { resolveQaMergeGateAncestry } from "./qa-merge-gate-github.js";
-import { projectQaPolicySchema, type ProjectQaIntegrationConfig } from "@paperclipai/shared";
+import { projectQaPolicySchema, resolveQaIntegrationConfigForRepository, type ProjectQaIntegrationRepositoryConfig } from "@paperclipai/shared";
 import { qaIntegrationConfigDigest } from "./qa-integration-runner.js";
 import { enqueueRun, findLatestRun, requeueRun, type QaIntegrationRun } from "./qa-integration-runs.js";
 import { collectPullRequestMigrations } from "./qa-migration-collisions.js";
@@ -625,9 +625,10 @@ export function qaMergeGateService(
   const resolveCommit = opts.resolveCommit ?? ((companyId, reference, sha) =>
     resolveQaMergeGateCommit(db, { companyId, reference, sha }, { fetch: opts.fetch }));
 
-  const integrationConfig = (qaPolicy: unknown): ProjectQaIntegrationConfig | undefined => {
+  const integrationConfig = (qaPolicy: unknown, reference: { owner: string; repo: string }): ProjectQaIntegrationRepositoryConfig | undefined => {
     const parsed = projectQaPolicySchema.safeParse(qaPolicy);
-    return parsed.success && parsed.data.mode === "final" ? parsed.data.integration : undefined;
+    if (!parsed.success || parsed.data.mode !== "final") return undefined;
+    return resolveQaIntegrationConfigForRepository(parsed.data.integration, reference.owner, reference.repo) ?? undefined;
   };
   const hasActivity = async (executor: Pick<Db, "select">, issueId: string, action: string, key: string, value: string) => {
     const rows = await executor.select({ id: activityLog.id }).from(activityLog).where(and(
@@ -658,7 +659,7 @@ export function qaMergeGateService(
   type IntegrationEvaluation = { kind: "not_eligible" } | { kind: "waiting"; queued: boolean }
     | { kind: "passed" | "failed"; run: QaIntegrationRun };
   const evaluateIntegration = async (candidate: QaMergeGateCandidate, details: PullRequestMergeDetails,
-    config: ProjectQaIntegrationConfig, parents: string[] | undefined): Promise<IntegrationEvaluation> => {
+    config: ProjectQaIntegrationRepositoryConfig, parents: string[] | undefined): Promise<IntegrationEvaluation> => {
     const { issue, reference, passSha } = candidate;
     const headSha = details.headSha!.toLowerCase();
     if (!details.baseRef || parents?.length !== 2 || !parents.includes(passSha)) return { kind: "not_eligible" };
@@ -879,7 +880,7 @@ export function qaMergeGateService(
       return "deferred";
     }
     const candidate = qaMergeGateCandidateFromRow(issueRow);
-    const config = integrationConfig(qaPolicy);
+    const config = integrationConfig(qaPolicy, reference);
     if (candidate && headSha === candidate.passSha && config?.autoResolveAdditivePaths?.length && details.baseSha && baseRef) {
       const identity = { issueId: issueRow.id, kind: "auto_resolve", passSha: candidate.passSha,
         targetSha: candidate.passSha, baseSha: details.baseSha.toLowerCase(), configDigest: qaIntegrationConfigDigest(config) };
@@ -1288,10 +1289,10 @@ export function qaMergeGateService(
       ));
     for (const { issue, qaPolicy } of [...rows, ...advisoryRows, ...blockedRows]) {
       try {
-        const patterns = integrationConfig(qaPolicy)?.migrationDirectories;
-        if (!patterns?.length) continue;
         const reference = qaMergeGateCandidateFromRow(issue)?.reference ?? await primaryOpenPullRequestReference(issue.id);
         if (!reference || !matchesScope(reference)) continue;
+        const patterns = integrationConfig(qaPolicy, reference)?.migrationDirectories;
+        if (!patterns?.length) continue;
         const details = await detailsFor(issue.companyId, reference);
         if (details.state !== "open" || !details.headSha) continue;
         const headSha = details.headSha.toLowerCase();
@@ -1401,7 +1402,7 @@ export function qaMergeGateService(
           }
         }
         const contentEquivalent = commitTrees !== null && commitTrees.passTreeSha === commitTrees.headTreeSha;
-        const config = integrationConfig(qaPolicy);
+        const config = integrationConfig(qaPolicy, reference);
         const integration = headSha !== candidate.passSha && !contentEquivalent && config
           ? await evaluateIntegration(candidate, details, config, commitTrees?.headParentShas)
           : { kind: "not_eligible" as const };

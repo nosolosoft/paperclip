@@ -364,6 +364,7 @@ export type {
   ProjectQaPolicy,
   ProjectQaIntegrationCommand,
   ProjectQaIntegrationConfig,
+  ProjectQaIntegrationRepositoryConfig,
   QaCodeCheckKind,
   QaCodeCheck,
   QaCodePhaseEvidence,

@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { companies, createDb, issues, projects, qaIntegrationRuns, type Db } from "@paperclipai/db";
-import type { ProjectQaIntegrationConfig } from "@paperclipai/shared";
+import { resolveQaIntegrationConfigForRepository, type ProjectQaIntegrationConfig } from "@paperclipai/shared";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase, type EmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -151,7 +151,7 @@ describePostgres("QA integration runner with real Git", { timeout: 30_000 }, () 
     const [queued] = await db.insert(qaIntegrationRuns).values({ companyId, issueId, kind,
       pullRequestUrl: "https://github.com/example/repo/pull/1", owner: "example", repo: "repo", pullNumber: 1,
       passSha: repo.pass, targetSha: repo.target, targetKind: "pr_head", baseRef: "main", baseSha: repo.base,
-      configDigest: qaIntegrationConfigDigest(integration), status: "queued",
+      configDigest: qaIntegrationConfigDigest(resolveQaIntegrationConfigForRepository(integration, "example", "repo")!), status: "queued",
     }).returning();
     const runner = qaIntegrationRunnerService(db, { rootDir: path.join(root, "runs"), remoteUrlFor: () => repo.remote,
       resolveGitAuth: () => async () => null });
@@ -167,6 +167,15 @@ describePostgres("QA integration runner with real Git", { timeout: 30_000 }, () 
     expect(result.provenance).toBe("clean_merge");
     expect(result.results?.checks).toEqual(expect.arrayContaining([expect.objectContaining({ name: "consumer", exitCode: 1, timedOut: false })]));
     expect(result.results?.checks?.find((check) => check.name === "consumer")?.outputTail).toContain("AssertionError");
+  });
+
+  it("executes the commands of the repository entry instead of the top-level commands", async () => {
+    const result = await run(await cleanRepository(false), {
+      commands: [{ name: "top-level", command: "node -e 'process.exit(1)'", timeoutSeconds: 30 }],
+      repositories: { "example/repo": { commands: [{ name: "repo-entry", command: "node -e 'process.exit(0)'", timeoutSeconds: 30 }] } },
+    });
+    expect(result.status).toBe("passed");
+    expect(result.results?.checks?.map((check) => check.name)).toEqual(["repo-entry"]);
   });
 
   it("passes the same consumer when the base preserves speedKmh", async () => {

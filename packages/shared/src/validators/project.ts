@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { ProjectQaIntegrationConfig, ProjectQaIntegrationRepositoryConfig } from "../types/project.js";
 import { PROJECT_STATUSES, PROJECT_ICON_NAMES } from "../constants.js";
 import { envConfigSchema } from "./secret.js";
 import { trustAuthorizationPolicySchema } from "./trust-policy.js";
@@ -51,17 +52,40 @@ export const projectQaIntegrationCommandSchema = z.object({
 
 const relativePathSegment = /^(?!\.{1,2}$)[A-Za-z0-9._-]+$/;
 
-export const projectQaIntegrationConfigSchema = z.object({
-  commands: z.array(projectQaIntegrationCommandSchema).min(1).max(10).default([]),
+const projectQaIntegrationPathFields = {
   migrationDirectories: z.array(z.string().refine((value) =>
     value.split("/").every((segment) => segment === "*" || relativePathSegment.test(segment)),
   "Expected a relative POSIX path without parent traversal")).max(20).optional(),
   autoResolveAdditivePaths: z.array(z.string().refine((value) =>
     value.split("/").every((segment) => relativePathSegment.test(segment)),
   "Expected an exact relative POSIX path without parent traversal")).max(20).optional(),
+};
+
+const projectQaIntegrationCommandsSchema = z.array(projectQaIntegrationCommandSchema).min(1).max(10);
+
+export const projectQaIntegrationRepositoryConfigSchema = z.object({
+  commands: projectQaIntegrationCommandsSchema,
+  ...projectQaIntegrationPathFields,
 }).strict().superRefine((integration, ctx) => {
-  if (!integration.commands.length) {
-    ctx.addIssue({ code: "custom", path: ["commands"], message: "Integration requires at least one command" });
+  if (integration.autoResolveAdditivePaths?.length && !integration.commands.length) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["autoResolveAdditivePaths"],
+      message: "autoResolveAdditivePaths requires integration commands",
+    });
+  }
+});
+
+export const projectQaIntegrationConfigSchema = z.object({
+  commands: projectQaIntegrationCommandsSchema.optional(),
+  ...projectQaIntegrationPathFields,
+  repositories: z.record(
+    z.string().regex(/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/, "Expected lowercase owner/repo"),
+    projectQaIntegrationRepositoryConfigSchema,
+  ).refine((value) => Object.keys(value).length <= 20, "At most 20 repositories").optional(),
+}).strict().superRefine((integration, ctx) => {
+  if (!integration.commands?.length && !Object.keys(integration.repositories ?? {}).length) {
+    ctx.addIssue({ code: "custom", path: ["commands"], message: "integration requires commands or repositories" });
   }
   if (integration.autoResolveAdditivePaths?.length && !integration.commands?.length) {
     ctx.addIssue({
@@ -71,6 +95,24 @@ export const projectQaIntegrationConfigSchema = z.object({
     });
   }
 });
+
+export function resolveQaIntegrationConfigForRepository(
+  config: ProjectQaIntegrationConfig | null | undefined,
+  owner: string,
+  repo: string,
+): ProjectQaIntegrationRepositoryConfig | null {
+  if (!config) return null;
+  const key = `${owner}/${repo}`.toLowerCase();
+  for (const [name, entry] of Object.entries(config.repositories ?? {})) {
+    if (name.toLowerCase() === key) return entry;
+  }
+  if (!config.commands?.length) return null;
+  return {
+    commands: config.commands,
+    ...(config.migrationDirectories ? { migrationDirectories: config.migrationDirectories } : {}),
+    ...(config.autoResolveAdditivePaths ? { autoResolveAdditivePaths: config.autoResolveAdditivePaths } : {}),
+  };
+}
 
 export const projectQaPolicySchema = z.discriminatedUnion("mode", [
   z.object({ mode: z.literal("staged") }).strict(),

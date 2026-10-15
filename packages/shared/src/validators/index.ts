@@ -401,6 +401,8 @@ export {
   projectQaPolicySchema,
   projectQaIntegrationCommandSchema,
   projectQaIntegrationConfigSchema,
+  projectQaIntegrationRepositoryConfigSchema,
+  resolveQaIntegrationConfigForRepository,
   qaReviewEvidenceV1Schema,
   type CreateProject,
   type UpdateProject,

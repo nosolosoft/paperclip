@@ -5,7 +5,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { and, eq, sql } from "drizzle-orm";
 import { issues, projects, qaIntegrationRuns, type Db } from "@paperclipai/db";
-import { projectQaPolicySchema, type ProjectQaIntegrationConfig } from "@paperclipai/shared";
+import { projectQaPolicySchema, resolveQaIntegrationConfigForRepository, type ProjectQaIntegrationCommand, type ProjectQaIntegrationRepositoryConfig } from "@paperclipai/shared";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { buildGitAuthInvocation, createGitRemoteAuthProvider, scrubGitCredentialText, type GitRemoteAuthProvider } from "./git-credentials.js";
 import { resolveCompanyGitHubToken } from "./github-external-object-provider.js";
@@ -20,7 +20,7 @@ function sorted(value: unknown): unknown {
   if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, sorted(v)]));
   return value;
 }
-export function qaIntegrationConfigDigest(config: ProjectQaIntegrationConfig): string {
+export function qaIntegrationConfigDigest(config: ProjectQaIntegrationRepositoryConfig): string {
   return createHash("sha256").update(JSON.stringify(sorted({ commands: config.commands, migrationDirectories: config.migrationDirectories ?? [] }))).digest("hex");
 }
 export function matchMigrationFile(file: string, patterns: readonly string[]): { dir: string; number: number; path: string } | null {
@@ -61,7 +61,7 @@ async function assertBranchName(name: string): Promise<void> {
   if (name.startsWith("-") || name.includes(":") || (await git(["check-ref-format", `refs/heads/${name}`])).code !== 0) throw new Error("invalid_run_reference");
 }
 type Check = { name: string; command: string | null; exitCode: number | null; durationMs: number; timedOut: boolean; outputTail: string };
-async function commandCheck(command: ProjectQaIntegrationConfig["commands"][number], cwd: string, logPath: string): Promise<Check> {
+async function commandCheck(command: ProjectQaIntegrationCommand, cwd: string, logPath: string): Promise<Check> {
   const started = Date.now();
   const log = createWriteStream(logPath, { flags: "a" });
   log.write(`\n=== ${command.name}: ${command.command} ===\n`);
@@ -134,7 +134,9 @@ export function qaIntegrationRunnerService(db: Db, opts: QaIntegrationRunnerOpti
       if (![run.companyId, run.owner, run.repo, run.id].every((part) => /^[A-Za-z0-9_.-]+$/.test(part) && part !== "." && part !== "..") || !/^[0-9a-f]{40}$/i.test(run.passSha) || !/^[0-9a-f]{40}$/i.test(run.targetSha) || !/^[0-9a-f]{40}$/i.test(run.baseSha) || (run.verifiedHeadSha !== null && !/^[0-9a-f]{40}$/i.test(run.verifiedHeadSha))) throw new Error("invalid_run_reference");
       const [project] = await db.select({ qaPolicy: projects.qaPolicy }).from(issues).innerJoin(projects, eq(issues.projectId, projects.id)).where(and(eq(issues.id, run.issueId), eq(issues.companyId, run.companyId))).limit(1);
       const policy = projectQaPolicySchema.safeParse(project?.qaPolicy);
-      const config = policy.success && policy.data.mode === "final" ? policy.data.integration : undefined;
+      const config = policy.success && policy.data.mode === "final"
+        ? resolveQaIntegrationConfigForRepository(policy.data.integration, run.owner, run.repo)
+        : null;
       if (!config || qaIntegrationConfigDigest(config) !== run.configDigest) throw new Ineligible("configuration_changed");
       const url = remoteUrlFor(run);
       let resolverToken: string | null = null;

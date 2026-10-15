@@ -396,6 +396,27 @@ Phase 2 — automated merge polling and commit status (requires per-company PAT)
   "autoResolveAdditivePaths": ["IMPLEMENTATION_PLAN.md"] }
 ```
 
+A project with several repositories (for example a Django backend and an Angular frontend) must
+not share one command list. Use `repositories`, keyed by lowercase `owner/repo`:
+
+```json
+{ "repositories": {
+    "nosolosoft/opptests-backend": {
+      "commands": [{ "name": "pytest", "command": "pytest -q" }],
+      "migrationDirectories": ["*/migrations"]
+    },
+    "nosolosoft/opptests-web-frontend": {
+      "commands": [{ "name": "install", "command": "npm ci" }, { "name": "test", "command": "npm test" }]
+    }
+} }
+```
+
+A repository entry replaces the top-level `commands`, `migrationDirectories` and
+`autoResolveAdditivePaths` for that repository (no merging). Top-level fields still apply to
+repositories without an entry, but only when top-level `commands` is non-empty; otherwise
+integration is not applicable to that repository. At least one of top-level `commands` or a
+non-empty `repositories` is required.
+
 Agents cannot add, change or remove it (`403`). When a PR head differs from the PASS SHA and the
 trees differ, the gate checks whether the new head is a two-parent merge of the PASS commit with a
 commit reachable from the base. If so, a server runner (bare mirror under the instance root,

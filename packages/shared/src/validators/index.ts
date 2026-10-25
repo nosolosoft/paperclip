@@ -404,6 +404,8 @@ export {
   projectQaIntegrationRepositoryConfigSchema,
   resolveQaIntegrationConfigForRepository,
   qaReviewEvidenceV1Schema,
+  qaReviewEvidenceV2Schema,
+  qaReviewEvidenceSchema,
   type CreateProject,
   type UpdateProject,
   type CreateProjectWorkspace,

@@ -39,6 +39,15 @@ import {
   WATCHDOG_DEFAULT_MANDATE,
 } from "./server-utils.js";
 
+describe("final QA evidence guidance", () => {
+  it("requires version 2 evidence covering every open pull request", () => {
+    expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain("Use `version: 2` with `qaEvidence.handoffs`");
+    expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain("one entry per open pull request on the issue");
+    expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).toContain("422 qa_review_evidence_pull_request_missing");
+    expect(DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE).not.toContain("set `qaEvidence.handoff`");
+  });
+});
+
 describe("runtime connection tool delivery", () => {
   const access = {
     version: 1 as const,

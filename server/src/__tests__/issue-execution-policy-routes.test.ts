@@ -242,6 +242,11 @@ async function createApp(actor?: TestActor) {
   return app;
 }
 
+function evidenceWithoutHandoff<T extends { handoff: unknown }>(evidence: T): Omit<T, "handoff"> {
+  const { handoff: _handoff, ...rest } = evidence;
+  return rest;
+}
+
 describe("issue execution policy routes", () => {
   beforeEach(() => {
     vi.resetModules();
@@ -2581,7 +2586,7 @@ describe("issue execution policy routes", () => {
       expect.objectContaining({
         issueId: issue.id,
         actorAgentId: qaAgentId,
-        evidence,
+        evidence: { ...evidenceWithoutHandoff(evidence), version: 2, handoffs: [evidence.handoff] },
       }),
     );
   });
@@ -2943,7 +2948,7 @@ describe("issue execution policy routes", () => {
         executionState: expect.objectContaining({
           status: "completed",
           qaVerdict: "pass",
-          qaEvidence: evidence,
+          qaEvidence: { ...evidenceWithoutHandoff(evidence), version: 2, handoffs: [evidence.handoff] },
         }),
       }),
       expect.anything(),
@@ -2954,7 +2959,7 @@ describe("issue execution policy routes", () => {
       issueId: issue.id,
       actorAgentId: qaAgentId,
       outcome: "approved",
-      evidence,
+      evidence: { ...evidenceWithoutHandoff(evidence), version: 2, handoffs: [evidence.handoff] },
     }));
   });
 

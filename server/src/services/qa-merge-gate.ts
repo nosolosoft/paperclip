@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray, isNotNull, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import {
   activityLog,
   heartbeatRuns,
@@ -13,6 +13,7 @@ import type {
   IssueExecutionPolicy,
   IssueExecutionState,
 } from "@paperclipai/shared";
+import { qaReviewEvidenceHandoffs } from "@paperclipai/shared";
 import {
   executeIssuePostCommitActions,
   issueService,
@@ -463,10 +464,7 @@ async function findIssueForPullRequest(
     );
   const match = rows.find((row) => {
     const ref = pullRequestReferenceFromUrl(row.url);
-    return ref !== null
-      && ref.owner.toLowerCase() === reference.owner.toLowerCase()
-      && ref.repo.toLowerCase() === reference.repo.toLowerCase()
-      && ref.number === reference.number;
+    return ref !== null && sameReference(ref, reference);
   });
   return match ? { id: match.id, identifier: match.identifier, title: match.title } : null;
 }
@@ -561,38 +559,29 @@ type QaMergeGateCandidate = {
   stageId: string;
   passSha: string;
   reference: GitHubPullRequestReference;
+  pullRequestUrl: string;
 };
 
-/**
- * A candidate is an `in_review` issue parked on the merge-approval stage after
- * a final QA PASS whose evidence pins the reviewed pull request head SHA.
- */
-function qaMergeGateCandidateFromRow(
-  row: typeof issues.$inferSelect,
-): QaMergeGateCandidate | null {
+function sameReference(a: GitHubPullRequestReference, b: GitHubPullRequestReference): boolean {
+  return a.host.toLowerCase() === b.host.toLowerCase() && a.owner.toLowerCase() === b.owner.toLowerCase()
+    && a.repo.toLowerCase() === b.repo.toLowerCase() && a.number === b.number;
+}
+
+/** One candidate per reviewed PR on an issue parked after final QA PASS. */
+function qaMergeGateCandidatesFromRow(row: typeof issues.$inferSelect): QaMergeGateCandidate[] {
   const state = parseIssueExecutionState(row.executionState);
-  if (!state) return null;
-  if (
-    state.status !== "pending" ||
-    state.currentStageType !== "approval" ||
-    !state.currentStageId
-  ) {
-    return null;
-  }
-  if (state.qaVerdict !== "pass") return null;
-  const handoff = state.qaEvidence?.handoff;
-  const reference = pullRequestReferenceFromUrl(handoff?.url);
-  if (!handoff?.headSha || !reference) return null;
+  if (!state || state.status !== "pending" || state.currentStageType !== "approval" || !state.currentStageId || state.qaVerdict !== "pass") return [];
   const policy = normalizeIssueExecutionPolicy(row.executionPolicy);
-  if (!policy) return null;
-  return {
-    issue: row,
-    policy,
-    state,
-    stageId: state.currentStageId,
-    passSha: handoff.headSha.toLowerCase(),
-    reference,
-  };
+  if (!policy) return [];
+  const candidates: QaMergeGateCandidate[] = [];
+  for (const handoff of qaReviewEvidenceHandoffs(state.qaEvidence)) {
+    if (handoff.kind !== "pull_request") continue;
+    const reference = pullRequestReferenceFromUrl(handoff.url);
+    if (!handoff.headSha || !reference || !handoff.url) return [];
+    candidates.push({ issue: row, policy, state, stageId: state.currentStageId,
+      passSha: handoff.headSha.toLowerCase(), reference, pullRequestUrl: handoff.url });
+  }
+  return candidates;
 }
 
 export function qaMergeGateService(
@@ -691,10 +680,10 @@ export function qaMergeGateService(
       const inserted = await db.transaction(async (tx) => {
         const locked = await issuesSvc.getByIdForUpdate(issue.id, tx);
         if (!locked || locked.status !== "in_review" || !unchanged(locked, issue) || await hasLiveRun(tx, locked)) return null;
-        if (qaMergeGateCandidateFromRow(locked)?.state.qaEvidence?.handoff?.url !== candidate.state.qaEvidence?.handoff?.url) return null;
+        if (!lockedHasCandidate(locked, candidate)) return null;
         return enqueueRun(tx as unknown as Db, {
           ...identity, targetSha, baseSha, targetKind, companyId: issue.companyId,
-          pullRequestUrl: candidate.state.qaEvidence!.handoff!.url!, owner: reference.owner, repo: reference.repo,
+          pullRequestUrl: candidate.pullRequestUrl, owner: reference.owner, repo: reference.repo,
           pullNumber: reference.number, baseRef: details.baseRef!, verifiedHeadSha: targetKind === "merge_result" ? headSha : null,
         });
       });
@@ -714,7 +703,7 @@ export function qaMergeGateService(
       const requeued = await db.transaction(async (tx) => {
         const locked = await issuesSvc.getByIdForUpdate(issue.id, tx);
         if (!locked || locked.status !== "in_review" || !unchanged(locked, issue) || await hasLiveRun(tx, locked)) return false;
-        if (qaMergeGateCandidateFromRow(locked)?.state.qaEvidence?.handoff?.url !== candidate.state.qaEvidence?.handoff?.url) return false;
+        if (!lockedHasCandidate(locked, candidate)) return false;
         await requeueRun(tx as unknown as Db, runId);
         return true;
       });
@@ -755,40 +744,38 @@ export function qaMergeGateService(
     }
     return null;
   };
+  const lockedHasCandidate = (locked: typeof issues.$inferSelect, candidate: QaMergeGateCandidate) =>
+    qaMergeGateCandidatesFromRow(locked).some((c) => c.pullRequestUrl === candidate.pullRequestUrl && c.passSha === candidate.passSha && c.stageId === candidate.stageId);
 
-  /** Reference of the issue's primary open `pull_request` work product, if any. */
-  const primaryOpenPullRequestReference = async (
-    issueId: string,
-    executor: Pick<Db, "select"> = db,
-  ): Promise<GitHubPullRequestReference | null> => {
-    const products = await executor
-      .select({ url: issueWorkProducts.url, isPrimary: issueWorkProducts.isPrimary, status: issueWorkProducts.status })
-      .from(issueWorkProducts)
-      .where(and(eq(issueWorkProducts.issueId, issueId), eq(issueWorkProducts.type, "pull_request")));
-    const open = products.filter((product) =>
-      product.status !== "closed" && product.status !== "archived" && product.status !== "failed");
-    const primary = open.find((product) => product.isPrimary) ?? open[0] ?? null;
-    return pullRequestReferenceFromUrl(primary?.url);
+  /** Open PRs, primary first and then in creation order. */
+  const openPullRequestReferences = async (issueId: string, executor: Pick<Db, "select"> = db): Promise<GitHubPullRequestReference[]> => {
+    const products = await executor.select().from(issueWorkProducts)
+      .where(and(eq(issueWorkProducts.issueId, issueId), eq(issueWorkProducts.type, "pull_request")))
+      .orderBy(asc(issueWorkProducts.createdAt));
+    return products.filter((p) => !["closed", "archived", "failed"].includes(p.status))
+      .sort((a, b) => Number(b.isPrimary) - Number(a.isPrimary))
+      .flatMap((p) => { const r = pullRequestReferenceFromUrl(p.url); return r ? [r] : []; });
+  };
+  const issueReferences = async (row: typeof issues.$inferSelect, executor: Pick<Db, "select"> = db) => {
+    const candidates = qaMergeGateCandidatesFromRow(row);
+    return candidates.length ? candidates.map((c) => c.reference) : openPullRequestReferences(row.id, executor);
   };
 
-  /**
-   * Primary open pull request for an issue parked on a pending QA *review*
-   * stage that is followed by a merge-approval stage; null otherwise.
-   */
-  const reviewStageConflictReference = async (
+  /** Open PRs on a pending final-QA review stage followed by merge approval. */
+  const reviewStageConflictReferences = async (
     row: typeof issues.$inferSelect,
-  ): Promise<GitHubPullRequestReference | null> => {
+  ): Promise<GitHubPullRequestReference[]> => {
     const state = parseIssueExecutionState(row.executionState);
     if (!state || state.status !== "pending" || state.currentStageType !== "review" || !state.currentStageId) {
-      return null;
+      return [];
     }
     const policy = normalizeIssueExecutionPolicy(row.executionPolicy);
-    if (!policy) return null;
+    if (!policy) return [];
     const stageIndex = policy.stages.findIndex((stage) => stage.id === state.currentStageId);
     if (stageIndex < 0 || !policy.stages.slice(stageIndex + 1).some((stage) => stage.type === "approval")) {
-      return null;
+      return [];
     }
-    return primaryOpenPullRequestReference(row.id);
+    return openPullRequestReferences(row.id);
   };
 
   /**
@@ -857,9 +844,7 @@ export function qaMergeGateService(
       const deferred = await db.transaction(async (tx) => {
         const locked = await issuesSvc.getByIdForUpdate(issueRow.id, tx);
         if (!locked || locked.status !== "in_review" || !unchanged(locked, issueRow) || await hasLiveRun(tx, locked)) return false;
-        const lockedReference = qaMergeGateCandidateFromRow(locked)?.reference ?? await primaryOpenPullRequestReference(locked.id, tx);
-        if (!lockedReference || lockedReference.owner.toLowerCase() !== reference.owner.toLowerCase()
-          || lockedReference.repo.toLowerCase() !== reference.repo.toLowerCase() || lockedReference.number !== reference.number) return false;
+        if (!(await issueReferences(locked, tx)).some((r) => sameReference(r, reference))) return false;
         const duplicates = await tx.select({ details: activityLog.details }).from(activityLog).where(and(
           eq(activityLog.entityId, locked.id), eq(activityLog.action, "issue.qa_merge_gate_conflict_deferred"),
           sql`${activityLog.details} ->> 'headSha' = ${headSha}`, sql`${activityLog.details} ->> 'baseSha' = ${baseSha}`,
@@ -879,7 +864,7 @@ export function qaMergeGateService(
         description: `Merge conflicts; waiting for root #${roots[0]!.number}` }, { fetch: opts.fetch });
       return "deferred";
     }
-    const candidate = qaMergeGateCandidateFromRow(issueRow);
+    const candidate = qaMergeGateCandidatesFromRow(issueRow).find((c) => sameReference(c.reference, reference));
     const config = integrationConfig(qaPolicy, reference);
     if (candidate && headSha === candidate.passSha && config?.autoResolveAdditivePaths?.length && details.baseSha && baseRef) {
       const identity = { issueId: issueRow.id, kind: "auto_resolve", passSha: candidate.passSha,
@@ -889,7 +874,7 @@ export function qaMergeGateService(
         const queued = await db.transaction(async (tx) => {
           const locked = await issuesSvc.getByIdForUpdate(issueRow.id, tx);
           if (!locked || locked.status !== "in_review" || !unchanged(locked, issueRow) || await hasLiveRun(tx, locked)) return null;
-          if (qaMergeGateCandidateFromRow(locked)?.state.qaEvidence?.handoff?.url !== candidate.state.qaEvidence?.handoff?.url) return null;
+          if (!lockedHasCandidate(locked, candidate)) return null;
           return enqueueRun(tx as unknown as Db, { ...identity, companyId: issueRow.companyId, pullRequestUrl,
             owner: reference.owner, repo: reference.repo, pullNumber: reference.number, targetKind: "pr_head", baseRef });
         });
@@ -919,9 +904,7 @@ export function qaMergeGateService(
       const locked = await issuesSvc.getByIdForUpdate(issueRow.id, tx);
       if (!locked || locked.status !== "in_review") return null;
       if (!unchanged(locked, issueRow)) return null;
-      const lockedReference = qaMergeGateCandidateFromRow(locked)?.reference ?? await primaryOpenPullRequestReference(locked.id, tx);
-      if (!lockedReference || lockedReference.owner.toLowerCase() !== reference.owner.toLowerCase()
-        || lockedReference.repo.toLowerCase() !== reference.repo.toLowerCase() || lockedReference.number !== reference.number) return null;
+      if (!(await issueReferences(locked, tx)).some((r) => sameReference(r, reference))) return null;
       // An admitted agent PATCH may still finish after this transaction. Let
       // active runs finish before the sweep changes assignment or QA state.
       const liveRun = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
@@ -1113,12 +1096,12 @@ export function qaMergeGateService(
    */
   const handleConflictNotice = async (
     issueRow: typeof issues.$inferSelect,
+    reference: GitHubPullRequestReference,
     detailsFor: PullRequestMergeDetailsResolver,
     matchesScope: (reference: GitHubPullRequestReference) => boolean,
     rootsFor: (issue: typeof issues.$inferSelect, reference: GitHubPullRequestReference, details: PullRequestMergeDetails) => Promise<QaMergeGateConflictRoot[]>,
   ): Promise<boolean> => {
-    const reference = await primaryOpenPullRequestReference(issueRow.id);
-    if (!reference || !matchesScope(reference)) return false;
+    if (!matchesScope(reference)) return false;
     const details = await detailsFor(issueRow.companyId, reference);
     if (details.state !== "open" || details.mergeable !== false || !details.headSha) return false;
 
@@ -1170,9 +1153,7 @@ export function qaMergeGateService(
         return false;
       }
       if (!unchanged(locked, issueRow) || await hasLiveRun(tx, locked)) return false;
-      const lockedReference = await primaryOpenPullRequestReference(locked.id, tx);
-      if (!lockedReference || lockedReference.owner.toLowerCase() !== reference.owner.toLowerCase()
-        || lockedReference.repo.toLowerCase() !== reference.repo.toLowerCase() || lockedReference.number !== reference.number) return false;
+      if (!(await openPullRequestReferences(locked.id, tx)).some((r) => sameReference(r, reference))) return false;
       if (await alreadyNoticed(tx, [baseSha, prBaseSha])) return false;
       const body = contextResult.available
         ? formatQaMergeGateConflictComment({
@@ -1289,8 +1270,8 @@ export function qaMergeGateService(
       ));
     for (const { issue, qaPolicy } of [...rows, ...advisoryRows, ...blockedRows]) {
       try {
-        const reference = qaMergeGateCandidateFromRow(issue)?.reference ?? await primaryOpenPullRequestReference(issue.id);
-        if (!reference || !matchesScope(reference)) continue;
+        for (const reference of await issueReferences(issue)) {
+        if (!matchesScope(reference)) continue;
         const patterns = integrationConfig(qaPolicy, reference)?.migrationDirectories;
         if (!patterns?.length) continue;
         const details = await detailsFor(issue.companyId, reference);
@@ -1312,9 +1293,7 @@ export function qaMergeGateService(
             await db.transaction(async (tx) => {
               const locked = await issuesSvc.getByIdForUpdate(issue.id, tx);
               if (!locked || !unchanged(locked, issue) || await hasLiveRun(tx, locked)) return;
-              const lockedReference = qaMergeGateCandidateFromRow(locked)?.reference ?? await primaryOpenPullRequestReference(locked.id, tx);
-              if (!lockedReference || lockedReference.owner.toLowerCase() !== reference.owner.toLowerCase()
-                || lockedReference.repo.toLowerCase() !== reference.repo.toLowerCase() || lockedReference.number !== reference.number) return;
+              if (!(await issueReferences(locked, tx)).some((r) => sameReference(r, reference))) return;
               if (await hasActivity(tx, issue.id, "issue.qa_merge_gate_migration_inventory", "headSha", headSha)) return;
               await logGateActivity(tx as unknown as Db, locked, "issue.qa_merge_gate_migration_inventory",
                 { headSha, pullRequest: `https://github.com/${reference.owner}/${reference.repo}/pull/${reference.number}`, migrations }, publications);
@@ -1323,13 +1302,16 @@ export function qaMergeGateService(
           }
         }
         if (migrations) inventories.push({ issue, reference, migrations });
+        }
       } catch (error) {
         logger.warn({ err: error, issueId: issue.id }, "qa merge gate migration inventory failed");
       }
     }
     for (const { issue: issueRow } of advisoryRows) {
       try {
-        if (await handleConflictNotice(issueRow, detailsFor, matchesScope, rootsFor)) result.conflictNotices += 1;
+        for (const reference of await openPullRequestReferences(issueRow.id)) {
+          if (await handleConflictNotice(issueRow, reference, detailsFor, matchesScope, rootsFor)) result.conflictNotices += 1;
+        }
       } catch (error) {
         logger.error(
           { err: error, issueId: issueRow.id },
@@ -1340,53 +1322,27 @@ export function qaMergeGateService(
 
     for (const { issue: issueRow, qaPolicy } of rows) {
       try {
-        const candidate = qaMergeGateCandidateFromRow(issueRow);
-        if (!candidate) {
-          const reviewReference = await reviewStageConflictReference(issueRow);
-          if (!reviewReference) {
-            result.skipped += 1;
-            continue;
-          }
-          if (!matchesScope(reviewReference)) continue;
-          const reviewDetails = await detailsFor(issueRow.companyId, reviewReference);
-          if (reviewDetails.state === "open" && reviewDetails.mergeable === false && reviewDetails.headSha) {
-            const outcome = await handleConflict(issueRow, qaPolicy, reviewReference, reviewDetails, await rootsFor(issueRow, reviewReference, reviewDetails), detailsFor);
-            if (outcome === "handled") {
-              result.conflicted += 1;
-              continue;
+        const targets = qaMergeGateCandidatesFromRow(issueRow);
+        if (!targets.length) {
+          let handled = false;
+          for (const reference of await reviewStageConflictReferences(issueRow)) {
+            if (!matchesScope(reference)) continue;
+            const details = await detailsFor(issueRow.companyId, reference);
+            if (details.state === "open" && details.mergeable === false && details.headSha) {
+              const outcome = await handleConflict(issueRow, qaPolicy, reference, details, await rootsFor(issueRow, reference, details), detailsFor);
+              if (outcome === "handled") { result.conflicted++; handled = true; break; }
+              if (outcome === "deferred") result.conflictDeferrals++;
             }
-            if (outcome === "deferred") result.conflictDeferrals += 1;
           }
-          result.skipped += 1;
+          if (!handled) result.skipped++;
           continue;
         }
-        if (!matchesScope(candidate.reference)) continue;
-
-        // GitHub fetch happens outside any transaction: never hold a row lock
-        // across network I/O.
-        const details = await detailsFor(
-          issueRow.companyId,
-          candidate.reference,
-        );
-        if (details.state === "open" && details.mergeable === false && details.headSha) {
-          const outcome = await handleConflict(issueRow, qaPolicy, candidate.reference, details, await rootsFor(issueRow, candidate.reference, details), detailsFor);
-          if (outcome === "handled") result.conflicted += 1;
-          else if (outcome === "deferred") result.conflictDeferrals += 1;
-          else result.skipped += 1;
-          continue;
-        }
-        if (details.state === "unknown" || !details.headSha) {
-          result.skipped += 1;
-          continue;
-        }
-        const headSha = details.headSha.toLowerCase();
+        if (!targets.some((t) => matchesScope(t.reference))) continue;
+        const evaluateTarget = async (candidate: QaMergeGateCandidate, details: PullRequestMergeDetails, observedHeadSha: string) => {
+        const headSha = observedHeadSha.toLowerCase();
         const { reference } = candidate;
         const pullRequestLabel = `${reference.owner}/${reference.repo}#${reference.number}`;
-        const pullRequestUrl = candidate.state.qaEvidence?.handoff?.url;
-        if (typeof pullRequestUrl !== "string" || !pullRequestUrl.trim()) {
-          result.skipped += 1;
-          continue;
-        }
+        const pullRequestUrl = candidate.pullRequestUrl;
         let commitTrees: { passTreeSha: string; headTreeSha: string; headParentShas?: string[] } | null = null;
         let reusedTreeProof = false;
         if (headSha !== candidate.passSha && (details.state === "open" || details.state === "merged")) {
@@ -1406,13 +1362,47 @@ export function qaMergeGateService(
         const integration = headSha !== candidate.passSha && !contentEquivalent && config
           ? await evaluateIntegration(candidate, details, config, commitTrees?.headParentShas)
           : { kind: "not_eligible" as const };
-        if (integration.kind === "waiting") {
+        const integrationPassed = integration.kind === "passed" ? integration.run : null;
+        const failedCheck = integration.kind === "failed"
+          ? integration.run.results?.checks?.find((check) => check.timedOut || check.exitCode !== 0) : undefined;
+        const integrationBody = integrationPassed
+          ? `Merged ${pullRequestLabel} at ${headSha}: clean integration of QA PASS ${candidate.passSha} with ${details.baseRef}; integration checks passed on merged tree ${integrationPassed.targetTreeSha}.`
+          : "";
+        const treeProof = commitTrees ? {
+          passTreeSha: commitTrees.passTreeSha,
+          headTreeSha: commitTrees.headTreeSha,
+          contentEquivalent,
+        } : headSha !== candidate.passSha ? { treeProofUnavailable: true } : {};
+
+          return { candidate, details, headSha, reference, pullRequestLabel, pullRequestUrl, commitTrees, reusedTreeProof, contentEquivalent, integration, integrationPassed, failedCheck, integrationBody, treeProof };
+        };
+        type TargetEvaluation = Awaited<ReturnType<typeof evaluateTarget>>;
+        const evaluations: TargetEvaluation[] = [];
+        let stopped = false;
+        for (const candidate of targets) {
+          const details = await detailsFor(issueRow.companyId, candidate.reference);
+          if (details.state === "open" && details.mergeable === false && details.headSha) {
+            const outcome = await handleConflict(issueRow, qaPolicy, candidate.reference, details, await rootsFor(issueRow, candidate.reference, details), detailsFor);
+            if (outcome === "handled") result.conflicted++;
+            else if (outcome === "deferred") result.conflictDeferrals++;
+            else result.skipped++;
+            stopped = true; break;
+          }
+          if (details.state === "unknown" || !details.headSha) { result.skipped++; stopped = true; break; }
+          evaluations.push(await evaluateTarget(candidate, details, details.headSha));
+        }
+        if (stopped) continue;
+        let waiting = false;
+        for (const evaluation of evaluations) {
+          const { candidate, details, headSha, reference, pullRequestUrl, integration } = evaluation;
+          if (integration.kind !== "waiting") continue;
+          waiting = true;
           if (integration.queued) result.integrationQueued += 1;
           const publications: ActivityPublication[] = [];
           const announced = await db.transaction(async (tx) => {
             const locked = await issuesSvc.getByIdForUpdate(issueRow.id, tx);
             if (!locked || locked.status !== "in_review" || !unchanged(locked, issueRow) || await hasLiveRun(tx, locked)) return false;
-            if (qaMergeGateCandidateFromRow(locked)?.state.qaEvidence?.handoff?.url !== pullRequestUrl) return false;
+            if (!lockedHasCandidate(locked, candidate)) return false;
             const targetSha = details.state === "merged" ? details.mergeCommitSha! : headSha;
             if (await hasActivity(tx, locked.id, "issue.qa_merge_gate_integration_queued", "targetSha", targetSha)) return false;
             await logGateActivity(tx as unknown as Db, locked, "issue.qa_merge_gate_integration_queued",
@@ -1430,64 +1420,23 @@ export function qaMergeGateService(
               opts.onPullRequestMerged?.({ companyId: issueRow.companyId, owner: reference.owner, repo: reference.repo });
             }
           }
-          result.skipped += 1;
-          continue;
-        }
-        const integrationPassed = integration.kind === "passed" ? integration.run : null;
-        const failedCheck = integration.kind === "failed"
-          ? integration.run.results?.checks?.find((check) => check.timedOut || check.exitCode !== 0) : undefined;
-        const integrationBody = integrationPassed
-          ? `Merged ${pullRequestLabel} at ${headSha}: clean integration of QA PASS ${candidate.passSha} with ${details.baseRef}; integration checks passed on merged tree ${integrationPassed.targetTreeSha}.`
-          : "";
-        const treeProof = commitTrees ? {
-          passTreeSha: commitTrees.passTreeSha,
-          headTreeSha: commitTrees.headTreeSha,
-          contentEquivalent,
-        } : headSha !== candidate.passSha ? { treeProofUnavailable: true } : {};
 
+        }
+        if (waiting) { result.skipped++; continue; }
         const publications: ActivityPublication[] = [];
         const postCommitActions: IssuePostCommitAction[] = [];
         const applied = await db.transaction(async (tx) => {
-          // Re-read under the issue row lock so a concurrent mutation (agent,
-          // user, or a sibling sweep) is never overwritten with a stale
-          // decision; everything below commits atomically.
           const locked = await issuesSvc.getByIdForUpdate(issueRow.id, tx);
-          if (!locked) return null;
-          // Do not race a PATCH already admitted by a live agent run.
-          const liveRun = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
-            .where(and(
-              eq(heartbeatRuns.companyId, locked.companyId),
-              sql`${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')`,
-              sql`(${heartbeatRuns.nativeIssueId} = ${locked.id}
-                or ${heartbeatRuns.id} = ${locked.executionRunId}
-                or ${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${locked.id})`,
-            )).limit(1);
-          if (liveRun.length > 0) return null;
-          const lockedCandidate = qaMergeGateCandidateFromRow(locked);
-          if (locked.status !== "in_review" || !lockedCandidate
-            || lockedCandidate.passSha !== candidate.passSha
-            || lockedCandidate.reference.host !== reference.host
-            || lockedCandidate.reference.owner.toLowerCase() !== reference.owner.toLowerCase()
-            || lockedCandidate.reference.repo.toLowerCase() !== reference.repo.toLowerCase()
-            || lockedCandidate.reference.number !== reference.number
-            || lockedCandidate.stageId !== candidate.stageId
-            || locked.updatedAt.getTime() !== issueRow.updatedAt.getTime()
-            || JSON.stringify(locked.executionState) !== JSON.stringify(issueRow.executionState)
-            || JSON.stringify(locked.executionPolicy) !== JSON.stringify(issueRow.executionPolicy)
-            || locked.assigneeAgentId !== issueRow.assigneeAgentId
-            || locked.assigneeUserId !== issueRow.assigneeUserId) {
-            return null;
+          if (!locked || locked.status !== "in_review" || !unchanged(locked, issueRow) || await hasLiveRun(tx, locked)
+            || qaMergeGateCandidatesFromRow(locked).length !== targets.length || !targets.every((c) => lockedHasCandidate(locked, c))) return null;
+          for (const e of evaluations) {
+            if (!e.reusedTreeProof) continue;
+            const proof = await findTrustedTreeProof(tx, locked.companyId, locked.id, e.pullRequestUrl, e.candidate.passSha, e.headSha);
+            if (!proof || proof.passTreeSha !== e.commitTrees?.passTreeSha || proof.headTreeSha !== e.commitTrees.headTreeSha) return null;
           }
-          const lockedPullRequestUrl = lockedCandidate.state.qaEvidence?.handoff?.url;
-          if (typeof lockedPullRequestUrl !== "string" || lockedPullRequestUrl !== pullRequestUrl) return null;
-          const passSha = lockedCandidate.passSha;
-          if (reusedTreeProof) {
-            const lockedProof = await findTrustedTreeProof(tx, locked.companyId, locked.id,
-              lockedPullRequestUrl, passSha, headSha);
-            if (!lockedProof || lockedProof.passTreeSha !== commitTrees?.passTreeSha
-              || lockedProof.headTreeSha !== commitTrees?.headTreeSha) return null;
-          }
-
+          for (const [evaluationIndex, e] of evaluations.entries()) {
+            const { candidate: lockedCandidate, candidate, details, integration, failedCheck, headSha, integrationBody, pullRequestLabel } = e;
+            const passSha = candidate.passSha;
           if (integration.kind === "failed") {
             const patch = buildMergeGateChangesRequestedPatch({ policy: lockedCandidate.policy, state: lockedCandidate.state });
             if (patch) {
@@ -1498,23 +1447,61 @@ export function qaMergeGateService(
                 {}, { authorType: "system" }, tx);
               await logGateActivity(tx as unknown as Db, locked, "issue.qa_merge_gate_integration_failed",
                 { passSha, headSha, targetSha: integration.run.targetSha, integrationRunId: integration.run.id }, publications);
-              return { integrationFailed: { agentId: patch.assigneeAgentId, issueId: locked.id, executionState: patch.executionState } } as const;
+              return { integrationFailed: { agentId: patch.assigneeAgentId, issueId: locked.id, executionState: patch.executionState, evaluationIndex } } as const;
             }
           }
-          if (integrationPassed && details.state === "open") {
-            if (await hasActivity(tx, locked.id, "issue.qa_merge_gate_integration_passed", "runId", integrationPassed.id)) return "skipped" as const;
-            const names = integrationPassed.results?.checks?.map((check) => check.name).join(", ") ?? "project checks";
-            await issuesSvc.addComment(locked.id,
-              `QA PASS remains bound to original SHA ${passSha}. PR head ${headSha} is a ${integrationPassed.provenance === "paperclip_union" ? "Paperclip additive merge" : "clean merge"} of that PASS with ${details.baseRef} and the project integration checks passed on tree ${integrationPassed.targetTreeSha} (${names}). No new QA review is claimed. Waiting for the merge approver to merge ${pullRequestLabel}.`,
-              {}, { authorType: "system" }, tx);
-            await logGateActivity(tx as unknown as Db, locked, "issue.qa_merge_gate_integration_passed", {
-              passSha, headSha, targetTreeSha: integrationPassed.targetTreeSha, provenance: integrationPassed.provenance,
-              runId: integrationPassed.id, configDigest: integrationPassed.configDigest,
-            }, publications);
-            return "integration_passed" as const;
+
           }
-          if (details.state === "merged") {
-            if (headSha === passSha || contentEquivalent || integrationPassed) {
+          const changed = evaluations.filter((e) => e.details.state === "open" && e.headSha !== e.candidate.passSha && !e.contentEquivalent && !e.integrationPassed);
+          if (changed.length) {
+            const lockedCandidate = targets[0];
+          const patch = buildMergeGateReturnToReviewPatch({
+            policy: lockedCandidate.policy,
+            state: lockedCandidate.state,
+          });
+          if (!patch) return null;
+          await issuesSvc.update(
+            locked.id,
+            { ...patch, executionState: { ...patch.executionState }, companyGuard: locked.companyId },
+            tx,
+            publications,
+            postCommitActions,
+          );
+
+            for (const e of changed) {
+              const { pullRequestLabel, headSha, treeProof } = e;
+              const passSha = e.candidate.passSha;
+          await issuesSvc.addComment(
+            locked.id,
+            `New commits on ${pullRequestLabel} after QA PASS (\`${passSha.slice(0, 12)}\` → \`${headSha.slice(0, 12)}\`); returning to final QA.`,
+            {},
+            { authorType: "system" },
+            tx,
+          );
+          await logActivity(
+            tx as unknown as Db,
+            {
+              companyId: locked.companyId,
+              actorType: "system",
+              actorId: QA_MERGE_GATE_SYSTEM_ACTOR_ID,
+              action: "issue.qa_merge_gate_pass_invalidated",
+              entityType: "issue",
+              entityId: locked.id,
+              issueId: locked.id,
+              details: { pullRequest: pullRequestLabel, headSha, passHeadSha: passSha, ...treeProof },
+            },
+            publications,
+          );
+
+            }
+            return { invalidated: { assigneeAgentId: patch.assigneeAgentId, issueId: locked.id, changed: changed.map((e) => ({ reference: e.reference, headSha: e.headSha })) } } as const;
+          }
+          if (evaluations.every((e) => e.details.state === "merged" && (e.headSha === e.candidate.passSha || e.contentEquivalent || e.integrationPassed))) {
+            const lockedCandidate = targets[0];
+            const body = evaluations.map(({ integrationPassed, integrationBody, contentEquivalent, pullRequestLabel, headSha, candidate }) =>
+              integrationPassed ? integrationBody : contentEquivalent
+                ? `Merged ${pullRequestLabel} at ${headSha} has the identical full Git tree as original QA PASS ${candidate.passSha}.`
+                : `Merged ${pullRequestLabel} at QA PASS SHA ${candidate.passSha}.`).join("\n");
               const decisionId = randomUUID();
               const patch = buildMergeGateCompletionPatch({
                 policy: lockedCandidate.policy,
@@ -1531,9 +1518,7 @@ export function qaMergeGateService(
                 actorAgentId: null,
                 actorUserId: null,
                 outcome: "approved",
-                body: integrationPassed ? integrationBody : contentEquivalent
-                  ? `Merged ${pullRequestLabel} at ${headSha} has the identical full Git tree as original QA PASS ${passSha}.`
-                  : `Merged ${pullRequestLabel} at QA PASS SHA ${passSha}.`,
+                body,
                 evidence: null,
               });
               await issuesSvc.update(
@@ -1543,15 +1528,10 @@ export function qaMergeGateService(
                 publications,
                 postCommitActions,
               );
-              await issuesSvc.addComment(
-                locked.id,
-                integrationPassed ? `${integrationBody} QA PASS remains bound to its original SHA; no new QA review is claimed. Closing as done.` : contentEquivalent
+              await issuesSvc.addComment(locked.id, evaluations.map((e) => { const { integrationPassed, contentEquivalent, pullRequestLabel, headSha, candidate, commitTrees, integrationBody } = e; const passSha = candidate.passSha; return integrationPassed ? `${integrationBody} QA PASS remains bound to its original SHA; no new QA review is claimed. Closing as done.` : contentEquivalent
                   ? `Merged ${pullRequestLabel} at \`${headSha.slice(0, 12)}\` has the identical full Git tree \`${commitTrees!.passTreeSha}\` as original QA PASS \`${passSha}\`; preserving that review and closing as done. The new SHA is not a new QA review.`
-                  : `Merged ${pullRequestLabel} at \`${headSha.slice(0, 12)}\` matches the QA PASS commit; closing as done.`,
-                {},
-                { authorType: "system" },
-                tx,
-              );
+                  : `Merged ${pullRequestLabel} at \`${headSha.slice(0, 12)}\` matches the QA PASS commit; closing as done.`; }).join("\n"), {}, { authorType: "system" }, tx);
+            for (const e of evaluations) { const { pullRequestLabel, headSha, integrationPassed, treeProof } = e; const passSha = e.candidate.passSha;
               await logActivity(
                 tx as unknown as Db,
                 {
@@ -1572,9 +1552,27 @@ export function qaMergeGateService(
                 },
                 publications,
               );
-              return "completed" as const;
             }
-
+            return "completed" as const;
+          }
+          const notices = { integrationPassed: [] as TargetEvaluation[], mismatched: 0, closed: 0 };
+          for (const e of evaluations) {
+            const { candidate, details, headSha, pullRequestLabel, commitTrees, contentEquivalent, integrationPassed, integrationBody, treeProof } = e;
+            const passSha = candidate.passSha;
+            const notice = await (async () => {
+          if (integrationPassed && details.state === "open") {
+            if (await hasActivity(tx, locked.id, "issue.qa_merge_gate_integration_passed", "runId", integrationPassed.id)) return "skipped" as const;
+            const names = integrationPassed.results?.checks?.map((check) => check.name).join(", ") ?? "project checks";
+            await issuesSvc.addComment(locked.id,
+              `QA PASS remains bound to original SHA ${passSha}. PR head ${headSha} is a ${integrationPassed.provenance === "paperclip_union" ? "Paperclip additive merge" : "clean merge"} of that PASS with ${details.baseRef} and the project integration checks passed on tree ${integrationPassed.targetTreeSha} (${names}). No new QA review is claimed. Waiting for the merge approver to merge ${pullRequestLabel}.`,
+              {}, { authorType: "system" }, tx);
+            await logGateActivity(tx as unknown as Db, locked, "issue.qa_merge_gate_integration_passed", {
+              passSha, headSha, targetTreeSha: integrationPassed.targetTreeSha, provenance: integrationPassed.provenance,
+              runId: integrationPassed.id, configDigest: integrationPassed.configDigest,
+            }, publications);
+            return "integration_passed" as const;
+          }
+          if (details.state === "merged" && headSha !== passSha && !contentEquivalent && !integrationPassed) {
             const alreadyWarned = await tx
               .select({ id: activityLog.id })
               .from(activityLog)
@@ -1652,10 +1650,10 @@ export function qaMergeGateService(
 
           // Still open: preserve the original review only for the exact commit
           // or proven identical full tree. Unavailable proof fails closed too.
-          if (headSha === passSha) return null;
-          if (contentEquivalent) {
+          if (details.state === "open" && headSha === passSha) return null;
+          if (details.state === "open" && contentEquivalent) {
             const alreadyAudited = await findTrustedTreeProof(tx, locked.companyId, locked.id,
-              lockedPullRequestUrl, passSha, headSha);
+              candidate.pullRequestUrl, passSha, headSha);
             if (!alreadyAudited) {
               await logActivity(tx as unknown as Db, {
                 companyId: locked.companyId,
@@ -1666,7 +1664,7 @@ export function qaMergeGateService(
                 entityId: locked.id,
                 issueId: locked.id,
                 details: {
-                  pullRequestUrl: lockedCandidate.state.qaEvidence!.handoff!.url,
+                  pullRequestUrl: candidate.pullRequestUrl,
                   passSha,
                   observedHeadSha: headSha,
                   ...treeProof,
@@ -1679,63 +1677,37 @@ export function qaMergeGateService(
             }
             return "skipped" as const;
           }
-          const patch = buildMergeGateReturnToReviewPatch({
-            policy: lockedCandidate.policy,
-            state: lockedCandidate.state,
-          });
-          if (!patch) return null;
-          await issuesSvc.update(
-            locked.id,
-            { ...patch, executionState: { ...patch.executionState }, companyGuard: locked.companyId },
-            tx,
-            publications,
-            postCommitActions,
-          );
-          await issuesSvc.addComment(
-            locked.id,
-            `New commits on ${pullRequestLabel} after QA PASS (\`${passSha.slice(0, 12)}\` → \`${headSha.slice(0, 12)}\`); returning to final QA.`,
-            {},
-            { authorType: "system" },
-            tx,
-          );
-          await logActivity(
-            tx as unknown as Db,
-            {
-              companyId: locked.companyId,
-              actorType: "system",
-              actorId: QA_MERGE_GATE_SYSTEM_ACTOR_ID,
-              action: "issue.qa_merge_gate_pass_invalidated",
-              entityType: "issue",
-              entityId: locked.id,
-              issueId: locked.id,
-              details: { pullRequest: pullRequestLabel, headSha, passHeadSha: passSha, ...treeProof },
-            },
-            publications,
-          );
-          return {
-            invalidated: {
-              assigneeAgentId: patch.assigneeAgentId,
-              headSha,
-              issueId: locked.id,
-            },
-          } as const;
-        });
 
-        // Everything below runs strictly after the transaction committed.
+              if (details.state === "merged") {
+                const existing = await tx.select({ id: activityLog.id }).from(activityLog).where(and(eq(activityLog.entityId, locked.id), eq(activityLog.action, "issue.qa_merge_gate_pull_request_merged"), sql`${activityLog.details} ->> 'pullRequest' = ${pullRequestLabel}`, sql`${activityLog.details} ->> 'headSha' = ${headSha}`)).limit(1);
+                if (!existing.length) {
+                  const remainingLabels = evaluations.filter((t) => t.details.state !== "merged").map((t) => t.pullRequestLabel);
+                  await issuesSvc.addComment(locked.id, `Merged ${pullRequestLabel} at \`${headSha.slice(0, 12)}\`, covered by QA PASS; waiting for ${remainingLabels.join(", ")} before closing.`, {}, { authorType: "system" }, tx);
+                  await logGateActivity(tx as unknown as Db, locked, "issue.qa_merge_gate_pull_request_merged", { pullRequest: pullRequestLabel, headSha, passHeadSha: passSha }, publications);
+                }
+              }
+              return null;
+            })();
+            if (notice === "mismatched") notices.mismatched++;
+            if (notice === "closed") notices.closed++;
+            if (notice === "integration_passed") notices.integrationPassed.push(e);
+          }
+          return { notices } as const;
+        });
         for (const publication of publications) publishActivity(publication);
         await executeIssuePostCommitActions(db, postCommitActions);
-        if (details.state === "merged") {
+        for (const { details, candidate, headSha } of evaluations) {
+          if (details.state !== "merged") continue;
           const mergedKey = `${issueRow.companyId}|${candidate.reference.owner}/${candidate.reference.repo}#${candidate.reference.number}|${headSha}`.toLowerCase();
           if (!observedMergedHeads.has(mergedKey)) {
             observedMergedHeads.add(mergedKey);
-            if (observedMergedHeads.size > 2_000) observedMergedHeads.delete(observedMergedHeads.values().next().value!);
+            if (observedMergedHeads.size > 2000) observedMergedHeads.delete(observedMergedHeads.values().next().value!);
             opts.onPullRequestMerged?.({ companyId: issueRow.companyId, owner: candidate.reference.owner, repo: candidate.reference.repo });
           }
         }
-
         if (applied === "completed") {
           result.completed += 1;
-          if (integrationPassed) result.integrationPassed += 1;
+          result.integrationPassed += evaluations.filter((e) => e.integrationPassed).length;
           const completedIssue = await issuesSvc.getById(issueRow.id);
           if (completedIssue?.parentId) {
             const parent = await issuesSvc.getWakeableParentAfterChildCompletion(completedIssue.parentId);
@@ -1744,7 +1716,7 @@ export function qaMergeGateService(
                 source: "automation",
                 triggerDetail: "system",
                 reason: "issue_children_completed",
-                idempotencyKey: `qa-merge-gate:children-completed:${parent.id}:${completedIssue.id}:${headSha}`,
+                idempotencyKey: `qa-merge-gate:children-completed:${parent.id}:${completedIssue.id}:${evaluations.map((e) => e.headSha).join(",")}`,
                 payload: {
                   issueId: parent.id,
                   completedChildIssueId: completedIssue.id,
@@ -1770,14 +1742,9 @@ export function qaMergeGateService(
             }
           }
         }
-        else if (applied === "mismatched") result.mismatched += 1;
-        else if (applied === "integration_passed") {
-          result.integrationPassed += 1;
-          result.skipped += 1;
-          await publishQaCommitStatus(db, { companyId: issueRow.companyId, reference, sha: headSha, state: "success",
-            description: `QA PASS ${candidate.passSha.slice(0, 12)} + integration checks passed` }, { fetch: opts.fetch });
-        }
-        else if (applied && typeof applied === "object" && "integrationFailed" in applied && applied.integrationFailed && integration.kind === "failed") {
+        else if (applied && typeof applied === "object" && "integrationFailed" in applied && applied.integrationFailed) {
+          const { candidate, reference, headSha, integrationBody, integration, failedCheck } = evaluations[applied.integrationFailed.evaluationIndex];
+          if (integration.kind !== "failed") continue;
           const failed = applied.integrationFailed;
           const state = failed.executionState;
           const executionStage = { wakeRole: "executor", stageId: state.currentStageId, stageType: state.currentStageType,
@@ -1794,46 +1761,27 @@ export function qaMergeGateService(
             description: `Integration checks failed: ${failedCheck?.name ?? "unknown"}` }, { fetch: opts.fetch });
           result.integrationFailed += 1;
         }
-        else if (applied === "closed") result.closed += 1;
-        else if (applied === "skipped") result.skipped += 1;
         else if (applied && "invalidated" in applied && applied.invalidated) {
-          const invalidated = applied.invalidated;
-          if (opts.wakeup) {
-            await opts.wakeup(invalidated.assigneeAgentId, {
-              source: "automation",
-              triggerDetail: "system",
-              reason: "execution_review_requested",
-              payload: {
-                issueId: invalidated.issueId,
-                mutation: "qa_merge_gate_pass_invalidated",
-                headSha: invalidated.headSha,
-              },
-              idempotencyKey: `qa-merge-gate:${invalidated.issueId}:${invalidated.headSha}`,
-              requestedByActorType: "system",
-              requestedByActorId: QA_MERGE_GATE_SYSTEM_ACTOR_ID,
-              contextSnapshot: {
-                issueId: invalidated.issueId,
-                taskId: invalidated.issueId,
-                wakeReason: "execution_review_requested",
-                source: "qa_merge_gate",
-              },
-            });
+          result.invalidated++;
+          const { changed, assigneeAgentId } = applied.invalidated;
+          const labels = changed.map((c) => `${c.reference.owner}/${c.reference.repo}#${c.reference.number}`);
+          if (assigneeAgentId && opts.wakeup) await opts.wakeup(assigneeAgentId, {
+            source: "automation", triggerDetail: "system", reason: "execution_review_requested",
+            idempotencyKey: `qa-merge-gate:${issueRow.id}:${changed.map((c) => c.headSha).join(",")}`,
+            payload: { issueId: issueRow.id, mutation: "qa_merge_gate_pass_invalidated", headSha: changed[0].headSha },
+            requestedByActorType: "system", requestedByActorId: QA_MERGE_GATE_SYSTEM_ACTOR_ID,
+            contextSnapshot: { issueId: issueRow.id, taskId: issueRow.id, wakeReason: "execution_review_requested", source: "qa_merge_gate" },
+          });
+          for (const e of evaluations.filter((e) => e.details.state === "open")) await publishQaCommitStatus(db, { companyId: issueRow.companyId, reference: e.reference, sha: e.headSha, state: "pending", description: changed.some((c) => sameReference(c.reference, e.reference)) ? "New commits after QA PASS; re-review pending" : `QA PASS invalidated by new commits on ${labels.join(", ")}; re-review pending` }, { fetch: opts.fetch });
+        } else if (applied && "notices" in applied) {
+          for (const e of applied.notices.integrationPassed) {
+            result.integrationPassed++; result.skipped++;
+            await publishQaCommitStatus(db, { companyId: issueRow.companyId, reference: e.reference, sha: e.headSha, state: "success", description: `QA PASS ${e.candidate.passSha.slice(0, 12)} + integration checks passed` }, { fetch: opts.fetch });
           }
-          await publishQaCommitStatus(
-            db,
-            {
-              companyId: issueRow.companyId,
-              reference,
-              sha: invalidated.headSha,
-              state: "pending",
-              description: "New commits after QA PASS; re-review pending",
-            },
-            opts.fetch ? { fetch: opts.fetch } : undefined,
-          );
-          result.invalidated += 1;
-        } else {
-          result.skipped += 1;
-        }
+          result.mismatched += applied.notices.mismatched;
+          result.closed += applied.notices.closed;
+          if (!applied.notices.integrationPassed.length && !applied.notices.mismatched && !applied.notices.closed) result.skipped++;
+        } else result.skipped++;
       } catch (error) {
         if (error && typeof error === "object" && "status" in error && error.status === 409) {
           result.skipped += 1;
@@ -1866,9 +1814,7 @@ export function qaMergeGateService(
           await db.transaction(async (tx) => {
             const locked = await issuesSvc.getByIdForUpdate(current.id, tx);
             if (!locked || !unchanged(locked, current) || await hasLiveRun(tx, locked)) return;
-            const lockedReference = qaMergeGateCandidateFromRow(locked)?.reference ?? await primaryOpenPullRequestReference(locked.id, tx);
-            if (!lockedReference || lockedReference.owner.toLowerCase() !== entry.reference.owner.toLowerCase()
-              || lockedReference.repo.toLowerCase() !== entry.reference.repo.toLowerCase() || lockedReference.number !== entry.reference.number) return;
+            if (!(await issueReferences(locked, tx)).some((r) => sameReference(r, entry.reference))) return;
             if (await hasActivity(tx, locked.id, "issue.qa_merge_gate_migration_collision", "key", key)) return;
             const links = entries.filter((other) => other.issue.id !== entry.issue.id).map(({ reference }) =>
               `[#${reference.number}](https://github.com/${reference.owner}/${reference.repo}/pull/${reference.number})`).join(", ");

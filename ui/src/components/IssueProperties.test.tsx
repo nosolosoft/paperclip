@@ -2634,6 +2634,41 @@ describe("IssueProperties", () => {
     act(() => root.unmount());
   });
 
+  it("shows every reviewed head SHA while final QA awaits approval", async () => {
+    const root = renderProperties(container, {
+      issue: createIssue({
+        status: "in_review",
+        executionState: createExecutionState({
+          status: "pending",
+          currentStageType: "approval",
+          qaVerdict: "pass",
+          qaEvidence: {
+            version: 2,
+            mode: "final",
+            projectId: "project-1",
+            reviewerAgentId: "agent-1",
+            phases: {
+              code: { outcome: "pass", checks: [{ kind: "test", evidence: "Targeted tests passed" }] },
+              browser: { outcome: "not_applicable", reason: "Backend only", evidence: [] },
+              spec: { outcome: "pass", criteria: [{ criterion: "Acceptance criteria", evidence: "Targeted tests passed" }] },
+            },
+            handoffs: [
+              { kind: "pull_request", id: "PR-1", url: "https://github.com/example/repo/pull/1", headSha: "a".repeat(40) },
+              { kind: "pull_request", id: "PR-2", url: "https://github.com/example/web/pull/2", headSha: "c".repeat(40) },
+            ],
+          },
+        }),
+      }),
+      childIssues: [],
+      onUpdate: vi.fn(),
+    });
+    await flush();
+
+    expect(container.textContent).toContain("QA PASS @ aaaaaaaaaaaa, cccccccccccc");
+
+    act(() => root.unmount());
+  });
+
   it("keeps the run review action available after changes are requested", async () => {
     const root = renderProperties(container, {
       issue: createIssue({

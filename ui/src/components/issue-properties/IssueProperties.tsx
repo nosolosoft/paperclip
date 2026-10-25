@@ -11,6 +11,7 @@ import { Link } from "@/lib/router";
 import {
   deriveOriginatingActor,
   isArtifactReviewDocumentKey,
+  qaReviewEvidenceHandoffs,
   type ExecutionWorkspace,
   type Issue,
   type IssueLabel,
@@ -1066,11 +1067,11 @@ export function IssueProperties({
     if (issue.executionState.status === "changes_requested") {
       return `${stageLabel} requested changes${participantLabel ? ` by ${participantLabel}` : ""}`;
     }
-    const passHeadSha =
+    const passHeadShas =
       issue.executionState.currentStageType === "approval" && issue.executionState.qaVerdict === "pass"
-        ? issue.executionState.qaEvidence?.handoff.headSha
-        : null;
-    return `${stageLabel} pending${participantLabel ? ` with ${participantLabel}` : ""}${passHeadSha ? ` · QA PASS @ ${passHeadSha.slice(0, 12)}` : ""}`;
+        ? qaReviewEvidenceHandoffs(issue.executionState.qaEvidence).map((handoff) => handoff.headSha?.slice(0, 12)).filter(Boolean)
+        : [];
+    return `${stageLabel} pending${participantLabel ? ` with ${participantLabel}` : ""}${passHeadShas.length ? ` · QA PASS @ ${passHeadShas.join(", ")}` : ""}`;
   })();
   useEffect(() => {
     setMonitorAtInput(toDateTimeLocalValue(issue.executionPolicy?.monitor?.nextCheckAt));

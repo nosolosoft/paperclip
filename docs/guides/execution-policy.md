@@ -316,11 +316,13 @@ issue: the task stays `in_review` assigned to that person in an `approval` stage
 `status: "done"` — in the post-PASS GET. The merge itself is still done by the approver manually in
 GitHub.
 
-To close the loop, final QA PASS evidence on a pull-request handoff **must** include the reviewed
-commit SHA in `qaEvidence.handoff`:
+Use `version: 2` with `qaEvidence.handoffs`: one entry per open pull request on the issue, each `{ kind: "pull_request", id, url: <PR URL>, headSha: <full 40-character head commit SHA you reviewed> }`; review and report on exactly those commits. A PASS that omits an open pull request is rejected with `422 qa_review_evidence_pull_request_missing`.
 
 ```json
-{ "kind": "pull_request", "id": "PR-123", "url": "https://github.com/org/repo/pull/123", "headSha": "<full 40-character head commit SHA>" }
+{ "version": 2, "handoffs": [
+  { "kind": "pull_request", "id": "PR-123", "url": "https://github.com/org/repo/pull/123", "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+  { "kind": "pull_request", "id": "PR-456", "url": "https://github.com/org/web/pull/456", "headSha": "cccccccccccccccccccccccccccccccccccccccc" }
+] }
 ```
 
 The server rejects the PASS with `422 qa_review_evidence_head_sha_required` when the SHA is
@@ -490,11 +492,11 @@ Switching a project's `qaPolicy` only affects **future** Engineer→QA handoffs.
 
 `finalQaAgentId` is a UUID, checked for company/role/status validity. An agent literally named `QA`, `QA (Code)`, or anything else is **never** selected for the final lane by name matching — only an exact UUID match against the pinned or project-configured `finalQaAgentId` counts. Conversely, a generically-named QA agent with no `code`/`browser`/`spec` keyword in its name is simply excluded from staged stage classification; it is not treated as a fallback for any stage.
 
-### Durable final evidence (`QaReviewEvidenceV1`)
+### Durable final evidence (`QaReviewEvidenceV2`)
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "mode": "final",
   "projectId": "uuid",
   "reviewerAgentId": "uuid-derived-from-authenticated-actor",
@@ -503,7 +505,10 @@ Switching a project's `qaPolicy` only affects **future** Engineer→QA handoffs.
     "browser": { "outcome": "not_applicable", "reason": "backend-only change, no UI surface", "evidence": [] },
     "spec": { "outcome": "pass", "criteria": [{ "criterion": "returns 422 on invalid UUID", "evidence": "route test line 461" }] }
   },
-  "handoff": { "kind": "pull_request", "id": "PR-123", "url": "https://github.com/org/repo/pull/123" }
+  "handoffs": [
+    { "kind": "pull_request", "id": "PR-123", "url": "https://github.com/org/repo/pull/123", "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    { "kind": "pull_request", "id": "PR-456", "url": "https://github.com/org/web/pull/456", "headSha": "cccccccccccccccccccccccccccccccccccccccc" }
+  ]
 }
 ```
 

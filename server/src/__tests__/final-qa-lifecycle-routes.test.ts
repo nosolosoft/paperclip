@@ -3,6 +3,7 @@ import express from "express";
 import request from "supertest";
 import { asc, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { qaReviewEvidenceSchema, toQaReviewEvidenceV2 } from "@paperclipai/shared";
 import {
   activityLog,
   agentWakeupRequests,
@@ -294,10 +295,10 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
   function finalQaEvidence(
     seeded: Awaited<ReturnType<typeof seedScenario>>,
     criteria: Array<{ criterion: string; evidence: string }>,
-    handoff?: Record<string, unknown>,
+    handoff?: Record<string, unknown> | Array<Record<string, unknown>>,
   ) {
     return {
-      version: 1,
+      version: Array.isArray(handoff) ? 2 : 1,
       mode: "final",
       projectId: seeded.projectId,
       reviewerAgentId: seeded.qaAgentId,
@@ -313,7 +314,9 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
         },
         spec: { outcome: "pass", criteria },
       },
-      handoff: handoff ?? { kind: "pull_request", id: "PR-final-qa-criteria", url: null },
+      ...(Array.isArray(handoff)
+        ? { handoffs: handoff }
+        : { handoff: handoff ?? { kind: "pull_request", id: "PR-final-qa-criteria", url: null } }),
     };
   }
 
@@ -424,7 +427,7 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
       lastDecisionId: decision.id,
       lastDecisionOutcome: "approved",
       qaVerdict: "pass",
-      qaEvidence: evidence,
+      qaEvidence: toQaReviewEvidenceV2(qaReviewEvidenceSchema.parse(evidence)),
       monitor: null,
     };
     expect(completed.body).toMatchObject({ status: "done", assigneeAgentId: null, assigneeUserId: null });
@@ -438,7 +441,7 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
       actorUserId: null,
       outcome: "approved",
       body: passComment,
-      evidence,
+      evidence: toQaReviewEvidenceV2(qaReviewEvidenceSchema.parse(evidence)),
       createdByRunId: seeded.qaRunId,
     });
 
@@ -664,7 +667,7 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
     expect(decisions).toHaveLength(2);
     expect(decisions.map((decision) => decision.outcome)).toEqual(["changes_requested", "approved"]);
     expect(decisions[0]).toMatchObject({ actorAgentId: seeded.qaAgentId, body: failComment, evidence: null });
-    expect(decisions[1]).toMatchObject({ actorAgentId: seeded.qaAgentId, body: passComment, evidence: freshEvidence, createdByRunId: freshQaRunId });
+    expect(decisions[1]).toMatchObject({ actorAgentId: seeded.qaAgentId, body: passComment, evidence: toQaReviewEvidenceV2(qaReviewEvidenceSchema.parse(freshEvidence)), createdByRunId: freshQaRunId });
 
     const completed = await request(app)
       .get(`/api/issues/${seeded.issueId}`)
@@ -679,7 +682,7 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
       lastDecisionId: decisions[1].id,
       lastDecisionOutcome: "approved",
       qaVerdict: "pass",
-      qaEvidence: freshEvidence,
+      qaEvidence: toQaReviewEvidenceV2(qaReviewEvidenceSchema.parse(freshEvidence)),
     });
     const [storedIssue] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
     if (!storedIssue) throw new Error("Expected issue row after fresh final QA PASS");
@@ -687,7 +690,7 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
       status: "completed",
       lastDecisionId: decisions[1].id,
       qaVerdict: "pass",
-      qaEvidence: freshEvidence,
+      qaEvidence: toQaReviewEvidenceV2(qaReviewEvidenceSchema.parse(freshEvidence)),
     });
   });
 
@@ -835,7 +838,7 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
           status: "pending",
           currentStageType: "approval",
           qaVerdict: "pass",
-          qaEvidence: { handoff: { headSha: REVIEWED_SHA } },
+          qaEvidence: { handoffs: [{ headSha: REVIEWED_SHA }] },
         },
       });
       const [stored] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
@@ -913,7 +916,9 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
 
       function statusApp(headSha: string | null) {
         return authenticatedApp({
-          resolvePullRequestDetails: async () => ({ state: "open", headRef: null, headSha }),
+          resolvePullRequestDetails: async (_companyId, reference) => ({
+            state: "open", headRef: null, headSha: reference.number === 2 ? "e".repeat(40) : headSha,
+          }),
         });
       }
 
@@ -921,7 +926,7 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
         app: express.Express,
         seeded: Awaited<ReturnType<typeof seedScenario>>,
         qaToken: string,
-        handoff: Record<string, unknown>,
+        handoff: Record<string, unknown> | Array<Record<string, unknown>>,
       ) {
         return request(app)
           .patch(`/api/issues/${seeded.issueId}`)
@@ -934,6 +939,56 @@ describeEmbeddedPostgres("final QA lifecycle routes", () => {
             qaEvidence: finalQaEvidence(seeded, criteria, handoff),
           });
       }
+
+      const secondUrl = "https://github.com/example/final-qa-backend/pull/2";
+      const secondSha = "e".repeat(40);
+
+      it.each(["pending", "pass", "missing", "stale"] as const)("handles multi-PR %s evidence atomically", async (scenario) => {
+        const seeded = await seedScenario({ mergeApproverUserId: `approver-${randomUUID()}` });
+        await db.insert(issueWorkProducts).values({
+          companyId: seeded.companyId, projectId: seeded.projectId, issueId: seeded.issueId,
+          type: "pull_request", provider: "github", externalId: "PR-final-qa-backend",
+          title: "Backend pull request", url: secondUrl, status: "ready_for_review",
+          isPrimary: false, healthStatus: "healthy",
+        });
+        const app = statusApp(REVIEWED_SHA);
+        const { qaToken } = await handoffToFinalQa(app, seeded);
+        await vi.waitFor(() => expect(publishQaCommitStatusMock).toHaveBeenCalledTimes(2));
+        if (scenario === "pending") {
+          for (const [number, sha] of [[1, REVIEWED_SHA], [2, secondSha]] as const) {
+            expect(publishQaCommitStatusMock).toHaveBeenCalledWith(db, expect.objectContaining({
+              reference: expect.objectContaining({ number }), sha, state: "pending", description: "Final QA pending",
+            }));
+          }
+          return;
+        }
+        publishQaCommitStatusMock.mockClear();
+        const before = await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, seeded.issueId));
+        const first = { kind: "pull_request", id: "first", url: PR_URL, headSha: REVIEWED_SHA };
+        const response = await passRequest(app, seeded, qaToken, scenario === "missing" ? first : [
+          first,
+          { kind: "pull_request", id: "second", url: secondUrl, headSha: scenario === "stale" ? "f".repeat(40) : secondSha },
+        ]);
+        if (scenario === "pass") {
+          expect(response.status).toBe(200);
+          await vi.waitFor(() => expect(publishQaCommitStatusMock).toHaveBeenCalledTimes(2));
+          for (const [number, sha] of [[1, REVIEWED_SHA], [2, secondSha]] as const) {
+            expect(publishQaCommitStatusMock).toHaveBeenCalledWith(db, expect.objectContaining({
+              reference: expect.objectContaining({ number }), sha, state: "success", description: "Final QA PASS",
+            }));
+          }
+          const fetched = await request(app).get(`/api/issues/${seeded.issueId}`).set("Authorization", `Bearer ${qaToken}`);
+          expect(fetched.body.executionState.qaEvidence.handoffs).toHaveLength(2);
+        } else {
+          expect(response.status).toBe(422);
+          expect(response.body.details).toMatchObject(scenario === "missing"
+            ? { code: "qa_review_evidence_pull_request_missing", missingPullRequestUrls: [secondUrl] }
+            : { code: "qa_review_evidence_head_mismatch", handoffUrl: secondUrl });
+          expect(publishQaCommitStatusMock).not.toHaveBeenCalled();
+          const after = await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, seeded.issueId));
+          expect(after).toHaveLength(before.length);
+        }
+      });
 
       it("publishes one pending status at the current head on engineer handoff with an approver", async () => {
         const seeded = await seedScenario({ mergeApproverUserId: `approver-${randomUUID()}` });

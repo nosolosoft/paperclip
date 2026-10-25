@@ -40,7 +40,7 @@ import {
   lowTrustReviewPresetPolicySchema,
   trustAuthorizationPolicySchema,
 } from "./trust-policy.js";
-import { qaReviewEvidenceV1Schema } from "./project.js";
+import { qaReviewEvidenceSchema } from "./project.js";
 import { objectWithoutDefaults } from "./partial.js";
 
 export const issueBlockedInboxStateSchema = z.enum([
@@ -521,7 +521,7 @@ export const issueExecutionStateSchema = z.object({
   lastDecisionId: z.string().guid().nullable(),
   lastDecisionOutcome: z.enum(ISSUE_EXECUTION_DECISION_OUTCOMES).nullable(),
   qaVerdict: z.enum(["pass", "fail"]).nullable().optional().default(null),
-  qaEvidence: qaReviewEvidenceV1Schema.nullable().optional().default(null),
+  qaEvidence: qaReviewEvidenceSchema.nullable().optional().default(null),
   monitor: issueExecutionMonitorStateSchema.optional().nullable(),
   changesRequestedCount: z.number().int().nonnegative().optional().default(0),
 });
@@ -910,7 +910,7 @@ export const updateIssueSchema = objectWithoutDefaults(
     reviewRequest: issueReviewRequestSchema.optional().nullable(),
     qaVerdict: z.enum(["pass", "fail"]).optional(),
     qaBrowserScope: z.enum(["required", "not_applicable"]).optional(),
-    qaEvidence: qaReviewEvidenceV1Schema.optional(),
+    qaEvidence: qaReviewEvidenceSchema.optional(),
     reopen: z.boolean().optional(),
     resume: z.boolean().optional(),
     interrupt: z.boolean().optional(),

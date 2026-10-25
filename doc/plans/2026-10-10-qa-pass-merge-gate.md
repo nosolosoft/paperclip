@@ -3,6 +3,8 @@
 Estado: estudio, sin implementación. Base de código: `paperclip-stable-auto` en
 `379f65afd` (incluye upstream `v2026.1005.0`).
 
+Nota 2026-10-25: las referencias singulares a `qaEvidence.handoff` de este estudio son históricas. El contrato actual usa `QaReviewEvidenceV2` con `handoffs[]`, una entrada y SHA revisado por cada PR abierta; omitir una PR rechaza el PASS. Véase `docs/guides/execution-policy.md`.
+
 ## Objetivo
 
 Flujo para todas las tareas de código de la compañía:

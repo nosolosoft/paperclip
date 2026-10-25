@@ -984,6 +984,8 @@ export type {
   QaHandoffKind,
   QaReviewHandoff,
   QaReviewEvidenceV1,
+  QaReviewEvidenceV2,
+  QaReviewEvidence,
   CompanySearchCountType,
   CompanySearchExtractIssueResult,
   CompanySearchExtractKind,
@@ -1953,6 +1955,8 @@ export {
   projectQaIntegrationRepositoryConfigSchema,
   resolveQaIntegrationConfigForRepository,
   qaReviewEvidenceV1Schema,
+  qaReviewEvidenceV2Schema,
+  qaReviewEvidenceSchema,
   createDocumentAnnotationCommentSchema,
   createDocumentAnnotationThreadSchema,
   documentAnnotationAnchorConfidenceSchema,
@@ -2841,3 +2845,4 @@ export * from "./browser-use.js";
 export * from "./types/skill-source.js";
 export * from "./validators/skill-source.js";
 export * from "./github-skill-repository.js";
+export * from "./qa-review-evidence.js";

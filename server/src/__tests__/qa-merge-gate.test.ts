@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, desc, eq } from "drizzle-orm";
-import { afterEach, beforeAll, afterAll, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, afterAll, describe, expect, it, vi, type MockInstance } from "vitest";
 import {
   activityLog,
   agentWakeupRequests,
@@ -200,6 +200,7 @@ describeEmbeddedPostgres("qa merge gate sweep", () => {
     passSha?: string;
     prUrl?: string;
     engineerReturn?: boolean;
+    handoffs?: Array<{ url: string; headSha: string; id: string }>;
   } = {}) {
     const companyId = randomUUID();
     const projectId = randomUUID();
@@ -274,7 +275,7 @@ describeEmbeddedPostgres("qa merge gate sweep", () => {
       lastDecisionOutcome: null,
       qaVerdict: "pass",
       qaEvidence: {
-        version: 1,
+        version: opts.handoffs ? 2 : 1,
         mode: "final",
         projectId,
         reviewerAgentId: qaAgentId,
@@ -293,12 +294,9 @@ describeEmbeddedPostgres("qa merge gate sweep", () => {
             criteria: [{ criterion: "acceptance met", evidence: "verified" }],
           },
         },
-        handoff: {
-          kind: "pull_request",
-          id: "PR-1",
-          url: prUrl,
-          headSha: passSha,
-        },
+        ...(opts.handoffs
+          ? { handoffs: opts.handoffs.map((h) => ({ kind: "pull_request", id: h.id, url: h.url, headSha: h.headSha })) }
+          : { handoff: { kind: "pull_request", id: "PR-1", url: prUrl, headSha: passSha } }),
       },
       changesRequestedCount: 0,
     };
@@ -319,10 +317,15 @@ describeEmbeddedPostgres("qa merge gate sweep", () => {
     });
 
     const workProductId = randomUUID();
-    await db.insert(issueWorkProducts).values({
-      id: workProductId, companyId, projectId, issueId, type: "pull_request", provider: "github",
-      title: "Reviewed pull request", url: prUrl, status: "active", isPrimary: true,
-    });
+    const productHandoffs = opts.handoffs ?? [{ url: prUrl, headSha: passSha, id: "PR-1" }];
+    for (const [index, handoff] of productHandoffs.entries()) {
+      const id = index === 0 ? workProductId : randomUUID();
+      await db.insert(issueWorkProducts).values({
+        id, companyId, projectId, issueId, type: "pull_request", provider: "github",
+        title: index === 0 ? "Reviewed pull request" : `Reviewed pull request ${index + 1}`,
+        url: handoff.url, status: "active", isPrimary: index === 0,
+      });
+    }
     return { companyId, projectId, issueId, qaAgentId, approverUserId, executionPolicy, workProductId };
   }
 
@@ -1172,6 +1175,130 @@ describeEmbeddedPostgres("qa merge gate sweep", () => {
     expect(options.idempotencyKey).toBe(`qa-merge-gate:${seeded.issueId}:${NEW_SHA}`);
     const invalidated = await gateActivities(seeded.issueId, "issue.qa_merge_gate_pass_invalidated");
     expect(invalidated).toHaveLength(1);
+  });
+
+  describe("multi-PR handoffs", () => {
+    const WEB_SHA = "c".repeat(40);
+    const WEB_URL = "https://github.com/example/web/pull/2";
+    const handoffs = [
+      { url: PR_URL, headSha: PASS_SHA, id: "PR-1" },
+      { url: WEB_URL, headSha: WEB_SHA, id: "PR-2" },
+    ];
+    const multiResolver = (states: { repo: Partial<PullRequestMergeDetails> & { state: PullRequestMergeDetails["state"] }; web: Partial<PullRequestMergeDetails> & { state: PullRequestMergeDetails["state"] } }): PullRequestMergeDetailsResolver =>
+      async (_companyId, reference) => detailsOf(reference.repo === "repo" ? states.repo : states.web);
+    function statusFetch() {
+      return vi.fn<typeof fetch>(async () => new Response("{}", { status: 201 }));
+    }
+    function statusPosts(fetchMock: MockInstance<typeof fetch>) {
+      return fetchMock.mock.calls
+        .filter(([, init]) => init?.method === "POST")
+        .map(([url, init]) => ({
+          sha: String(url).split("/statuses/")[1]!,
+          body: JSON.parse(String(init!.body)) as { state: string; description: string },
+        }));
+    }
+
+    it("invalidates the PASS when the first head changes and marks both heads pending", async () => {
+      resolveCompanyGitHubTokenMock.mockResolvedValue("multi-pr-test-token");
+      const seeded = await seedPendingApprovalIssue({ handoffs });
+      const fetchMock = statusFetch();
+      const wakeup = vi.fn(async (_agentId: string, _options: WakeupOptions) => null);
+      const service = qaMergeGateService(db, {
+        wakeup, fetch: fetchMock,
+        resolveCommitTrees: async () => null,
+        resolvePullRequestDetails: multiResolver({
+          repo: { state: "open", headSha: NEW_SHA },
+          web: { state: "open", headSha: WEB_SHA },
+        }),
+      });
+
+      expect(await service.sweep()).toMatchObject({ checked: 1, completed: 0, invalidated: 1 });
+
+      const issue = await loadIssue(seeded.issueId);
+      expect(issue?.status).toBe("in_review");
+      const executionState = issue?.executionState as Record<string, unknown>;
+      expect(executionState.currentStageType).toBe("review");
+      expect(executionState.status).toBe("pending");
+      expect(executionState.qaVerdict).toBeNull();
+      const posts = statusPosts(fetchMock);
+      expect(posts.map((post) => post.sha).sort()).toEqual([NEW_SHA, WEB_SHA].sort());
+      expect(posts.every((post) => post.body.state === "pending")).toBe(true);
+      expect(posts.find((post) => post.sha === WEB_SHA)?.body.description).toBe("QA PASS invalidated by new commits on example/repo#1; re-review pending");
+      expect(posts.some((post) => post.body.state === "success")).toBe(false);
+      for (const post of posts.filter((post) => post.body.state === "success")) {
+        expect(handoffs.map((handoff) => handoff.headSha)).toContain(post.sha);
+      }
+    });
+
+    it("does not complete while a second PR is open and notifies once about the merged one", async () => {
+      resolveCompanyGitHubTokenMock.mockResolvedValue("multi-pr-test-token");
+      const seeded = await seedPendingApprovalIssue({ handoffs });
+      const fetchMock = statusFetch();
+      const service = qaMergeGateService(db, {
+        fetch: fetchMock,
+        resolveCommitTrees: async () => null,
+        resolvePullRequestDetails: multiResolver({
+          repo: { state: "merged", headSha: PASS_SHA },
+          web: { state: "open", headSha: WEB_SHA },
+        }),
+      });
+
+      expect(await service.sweep()).toMatchObject({ checked: 1, completed: 0 });
+      expect((await loadIssue(seeded.issueId))?.status).toBe("in_review");
+      expect(await gateActivities(seeded.issueId, "issue.qa_merge_gate_pull_request_merged")).toHaveLength(1);
+      const comments = await systemComments(seeded.issueId);
+      expect(comments).toHaveLength(1);
+      expect(comments[0]?.body).toContain("example/web#2");
+
+      await service.sweep();
+      expect(await gateActivities(seeded.issueId, "issue.qa_merge_gate_pull_request_merged")).toHaveLength(1);
+      expect(await systemComments(seeded.issueId)).toHaveLength(1);
+      expect((await loadIssue(seeded.issueId))?.status).toBe("in_review");
+      expect(await db.select().from(issues).where(eq(issues.companyId, seeded.companyId))).toHaveLength(1);
+    });
+
+    it("completes once when every PR merged", async () => {
+      resolveCompanyGitHubTokenMock.mockResolvedValue("multi-pr-test-token");
+      const seeded = await seedPendingApprovalIssue({ handoffs });
+      const fetchMock = statusFetch();
+      const service = qaMergeGateService(db, {
+        fetch: fetchMock,
+        resolveCommitTrees: async () => null,
+        resolvePullRequestDetails: multiResolver({
+          repo: { state: "merged", headSha: PASS_SHA },
+          web: { state: "merged", headSha: WEB_SHA },
+        }),
+      });
+
+      expect(await service.sweep()).toMatchObject({ checked: 1, completed: 1 });
+      expect((await loadIssue(seeded.issueId))?.status).toBe("done");
+      expect(await gateActivities(seeded.issueId, "issue.qa_merge_gate_completed")).toHaveLength(2);
+      const posts = statusPosts(fetchMock);
+      for (const post of posts.filter((post) => post.body.state === "success")) {
+        expect(handoffs.map((handoff) => handoff.headSha)).toContain(post.sha);
+      }
+    });
+
+    it("skips without changes when a second PR state is unknown", async () => {
+      resolveCompanyGitHubTokenMock.mockResolvedValue("multi-pr-test-token");
+      const seeded = await seedPendingApprovalIssue({ handoffs });
+      const before = await loadIssue(seeded.issueId);
+      const fetchMock = statusFetch();
+      const service = qaMergeGateService(db, {
+        fetch: fetchMock,
+        resolveCommitTrees: async () => null,
+        resolvePullRequestDetails: multiResolver({
+          repo: { state: "open", headSha: PASS_SHA },
+          web: { state: "unknown" },
+        }),
+      });
+
+      expect(await service.sweep()).toMatchObject({ checked: 1, completed: 0, invalidated: 0, skipped: 1 });
+      const after = await loadIssue(seeded.issueId);
+      expect(after?.status).toBe(before?.status);
+      expect(after?.executionState).toEqual(before?.executionState);
+      expect(statusPosts(fetchMock)).toHaveLength(0);
+    });
   });
 
   it("warns once when the PR merged with a different head than the QA PASS", async () => {

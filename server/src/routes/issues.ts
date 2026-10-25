@@ -110,7 +110,8 @@ import {
   updateDocumentAnnotationThreadSchema,
   upsertIssueDocumentSchema,
   updateIssueSchema,
-  qaReviewEvidenceV1Schema,
+  qaReviewEvidenceSchema,
+  toQaReviewEvidenceV2,
   isAgentStatusInvokable,
   getClosedIsolatedExecutionWorkspaceMessage,
   isClosedIsolatedExecutionWorkspace,
@@ -145,7 +146,8 @@ import {
   type IssueQueuedCommentQueue,
   type IssueWatchdogDiscoveryKind,
   type ProjectWorkspace,
-  type QaReviewEvidenceV1,
+  type QaReviewEvidenceV2,
+  type QaReviewHandoff,
   type SourceTrustMetadata,
   type SuggestTasksInteraction,
   type SuccessfulRunHandoffState,
@@ -399,9 +401,9 @@ function resolveQaEvidenceForDecision(input: {
   actorStatus: string | null;
   executionPolicy: unknown;
   executionState: unknown;
-}): QaReviewEvidenceV1 | null {
+}): QaReviewEvidenceV2 | null {
   if (input.raw === undefined) return null;
-  const parsed = qaReviewEvidenceV1Schema.safeParse(input.raw);
+  const parsed = qaReviewEvidenceSchema.safeParse(input.raw);
   if (!parsed.success) {
     throw unprocessable("Invalid QA review evidence", {
       code: "invalid_qa_review_evidence",
@@ -420,6 +422,7 @@ function resolveQaEvidenceForDecision(input: {
       reviewerAgentId: input.actorAgentId,
     });
   }
+  const evidence = toQaReviewEvidenceV2(parsed.data);
 
   const policy = normalizeIssueExecutionPolicy(input.executionPolicy);
   const state = parseIssueExecutionState(input.executionState);
@@ -457,10 +460,8 @@ function resolveQaEvidenceForDecision(input: {
   }
   if (
     policy.stages.slice(currentStageIndex + 1).some((stage) => stage.type === "approval")
-    && (
-      parsed.data.handoff.kind !== "pull_request"
-      || !parsed.data.handoff.url
-      || !parsed.data.handoff.headSha
+    && evidence.handoffs.some(
+      (handoff) => handoff.kind !== "pull_request" || !handoff.url || !handoff.headSha,
     )
   ) {
     throw unprocessable("Final QA PASS before a merge approval stage requires the reviewed pull request URL and head SHA", {
@@ -472,7 +473,7 @@ function resolveQaEvidenceForDecision(input: {
     criterion.trim().replace(/\s+/g, " "),
   );
   if (expectedCriteria.length > 0) {
-    const submittedCriteria = parsed.data.phases.spec.criteria.map(({ criterion }) =>
+    const submittedCriteria = evidence.phases.spec.criteria.map(({ criterion }) =>
       criterion.trim().replace(/\s+/g, " "),
     );
     const missingCriteria = [...new Set(expectedCriteria.filter((criterion) => !submittedCriteria.includes(criterion)))];
@@ -499,7 +500,7 @@ function resolveQaEvidenceForDecision(input: {
     }
   }
 
-  return parsed.data;
+  return evidence;
 }
 
 const queuedCommentMutationTargetSchema = z.object({
@@ -4734,7 +4735,7 @@ export function issueRoutes(
   async function scheduleQaMergeGateStatus(input: {
     issue: { id: string; companyId: string };
     qaVerdict: unknown;
-    reviewedHandoff: { kind: string; url?: string | null; headSha?: string | null } | null;
+    reviewedHandoffs: readonly QaReviewHandoff[];
     previousPolicy: NormalizedExecutionPolicy | null;
     nextPolicy: NormalizedExecutionPolicy | null;
     enteredReviewStage?: boolean;
@@ -4758,15 +4759,19 @@ export function issueRoutes(
       description,
     });
 
-    const handoff = input.reviewedHandoff;
-    if (
-      input.qaVerdict === "pass"
-      && handoff?.kind === "pull_request"
-      && handoff.headSha
-    ) {
-      const ref = pullRequestReferenceFromUrl(handoff.url);
-      if (ref) await publish(ref, handoff.headSha, "success", "Final QA PASS");
-      return;
+    if (input.qaVerdict === "pass") {
+      const reviewed = input.reviewedHandoffs.flatMap((handoff) => {
+        const ref = handoff.kind === "pull_request" && handoff.headSha
+          ? pullRequestReferenceFromUrl(handoff.url)
+          : null;
+        return ref && handoff.headSha ? [{ ref, headSha: handoff.headSha }] : [];
+      });
+      if (reviewed.length > 0) {
+        for (const { ref, headSha } of reviewed) {
+          await publish(ref, headSha, "success", "Final QA PASS");
+        }
+        return;
+      }
     }
 
     let state: "pending" | "failure" | null = null;
@@ -4792,12 +4797,13 @@ export function issueRoutes(
       product.status !== "closed" &&
       product.status !== "archived" &&
       product.status !== "failed");
-    const primary = pullRequests.find((product) => product.isPrimary) ?? pullRequests[0] ?? null;
-    const ref = pullRequestReferenceFromUrl(primary?.url);
-    if (!ref) return;
-    const details = await resolveQaMergeGatePullRequest(input.issue.companyId, ref);
-    if (!details.headSha) return;
-    await publish(ref, details.headSha, state, description);
+    for (const product of pullRequests) {
+      const ref = pullRequestReferenceFromUrl(product.url);
+      if (!ref) continue;
+      const details = await resolveQaMergeGatePullRequest(input.issue.companyId, ref);
+      if (!details.headSha) continue;
+      await publish(ref, details.headSha, state, description);
+    }
   }
 
   async function materializeFinalQaHandoff(input: {
@@ -13577,57 +13583,72 @@ async function applyDefaultQaDispositionRouting(input: {
         executionPolicy: existing.executionPolicy,
         executionState: existing.executionState,
       });
-      if (
-        qaEvidenceForDecision
-        && qaEvidenceForDecision.handoff.kind === "pull_request"
-        && qaEvidenceForDecision.handoff.url
-        && qaEvidenceForDecision.handoff.headSha
-      ) {
-        const reviewedHandoff = qaEvidenceForDecision.handoff;
-        const reviewedRef = pullRequestReferenceFromUrl(reviewedHandoff.url);
-        if (!reviewedRef) {
-          throw unprocessable("QA review evidence handoff URL is not a GitHub pull request", {
-            code: "qa_review_evidence_pull_request_required",
-            handoffUrl: reviewedHandoff.url,
-          });
-        }
+      const prHandoffs = qaEvidenceForDecision?.handoffs.filter(
+        (h) => h.kind === "pull_request" && h.url && h.headSha,
+      ) ?? [];
+      if (prHandoffs.length > 0) {
         const issueWorkProducts = await workProductsSvc.listForIssue(existing.id);
-        const matchingWorkProduct = issueWorkProducts.find((product) => {
+        const activePullRequestProducts = issueWorkProducts.filter((product) =>
+          product.type === "pull_request"
+          && product.status !== "closed"
+          && product.status !== "archived"
+          && product.status !== "failed");
+        const sameRef = (a: GitHubPullRequestReference, b: GitHubPullRequestReference) =>
+          a.owner.toLowerCase() === b.owner.toLowerCase()
+          && a.repo.toLowerCase() === b.repo.toLowerCase()
+          && a.number === b.number;
+        const reviewedRefs: GitHubPullRequestReference[] = [];
+        for (const reviewedHandoff of prHandoffs) {
+          const reviewedRef = pullRequestReferenceFromUrl(reviewedHandoff.url);
+          if (!reviewedRef) {
+            throw unprocessable("QA review evidence handoff URL is not a GitHub pull request", {
+              code: "qa_review_evidence_pull_request_required",
+              handoffUrl: reviewedHandoff.url,
+            });
+          }
+          reviewedRefs.push(reviewedRef);
+          const matchingWorkProduct = activePullRequestProducts.find((product) => {
+            const productRef = pullRequestReferenceFromUrl(product.url);
+            return productRef !== null && sameRef(productRef, reviewedRef);
+          });
+          if (!matchingWorkProduct) {
+            throw unprocessable("QA review evidence pull request does not match the issue's pull request work product", {
+              code: "qa_review_evidence_pull_request_mismatch",
+              handoffUrl: reviewedHandoff.url,
+            });
+          }
+          const reviewedPullRequest = await resolveQaMergeGatePullRequest(existing.companyId, reviewedRef);
+          const reviewedHeadSha = reviewedHandoff.headSha;
           if (
-            product.type !== "pull_request"
-            || product.status === "closed"
-            || product.status === "archived"
-            || product.status === "failed"
-          ) return false;
-          const productRef = pullRequestReferenceFromUrl(product.url);
-          return productRef !== null
-            && productRef.owner.toLowerCase() === reviewedRef.owner.toLowerCase()
-            && productRef.repo.toLowerCase() === reviewedRef.repo.toLowerCase()
-            && productRef.number === reviewedRef.number;
-        });
-        if (!matchingWorkProduct) {
-          throw unprocessable("QA review evidence pull request does not match the issue's pull request work product", {
-            code: "qa_review_evidence_pull_request_mismatch",
-            handoffUrl: reviewedHandoff.url,
-          });
+            reviewedPullRequest.headSha
+            && reviewedHeadSha
+            && reviewedPullRequest.headSha.toLowerCase() !== reviewedHeadSha.toLowerCase()
+          ) {
+            throw unprocessable("QA review evidence head SHA does not match the pull request's current head commit", {
+              code: "qa_review_evidence_head_mismatch",
+              handoffUrl: reviewedHandoff.url,
+              reviewedHeadSha,
+              currentHeadSha: reviewedPullRequest.headSha,
+            });
+          }
+          if (reviewedPullRequest.mergeable === false) {
+            throw unprocessable("Pull request has merge conflicts with its base branch; submit a FAIL citing the conflicts instead of a PASS", {
+              code: "qa_review_evidence_pull_request_conflicting",
+              handoffUrl: reviewedHandoff.url,
+              mergeableState: reviewedPullRequest.mergeableState ?? null,
+            });
+          }
         }
-        const reviewedPullRequest = await resolveQaMergeGatePullRequest(existing.companyId, reviewedRef);
-        const reviewedHeadSha = reviewedHandoff.headSha;
-        if (
-          reviewedPullRequest.headSha
-          && reviewedHeadSha
-          && reviewedPullRequest.headSha.toLowerCase() !== reviewedHeadSha.toLowerCase()
-        ) {
-          throw unprocessable("QA review evidence head SHA does not match the pull request's current head commit", {
-            code: "qa_review_evidence_head_mismatch",
-            reviewedHeadSha,
-            currentHeadSha: reviewedPullRequest.headSha,
-          });
-        }
-        if (reviewedPullRequest.mergeable === false) {
-          throw unprocessable("Pull request has merge conflicts with its base branch; submit a FAIL citing the conflicts instead of a PASS", {
-            code: "qa_review_evidence_pull_request_conflicting",
-            mergeableState: reviewedPullRequest.mergeableState ?? null,
+        const missingPullRequestUrls = activePullRequestProducts
+          .filter((product) => {
+            const productRef = pullRequestReferenceFromUrl(product.url);
+            return !productRef || !reviewedRefs.some((ref) => sameRef(ref, productRef));
+          })
+          .map((product) => product.url);
+        if (missingPullRequestUrls.length > 0) {
+          throw unprocessable("QA review evidence must cover every open pull request on the issue", {
+            code: "qa_review_evidence_pull_request_missing",
+            missingPullRequestUrls,
           });
         }
       }
@@ -14688,7 +14709,7 @@ async function applyDefaultQaDispositionRouting(input: {
       void scheduleQaMergeGateStatus({
         issue,
         qaVerdict,
-        reviewedHandoff: qaEvidenceForDecision?.handoff ?? null,
+        reviewedHandoffs: qaEvidenceForDecision?.handoffs ?? [],
         previousPolicy: previousExecutionPolicy,
         nextPolicy: nextExecutionPolicy,
         enteredReviewStage: nextInPendingReview && !previousInSamePendingReview,

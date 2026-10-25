@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { qaReviewEvidenceHandoffs, toQaReviewEvidenceV2 } from "../qa-review-evidence.js";
 import {
   projectQaIntegrationConfigSchema,
   projectQaPolicySchema,
+  qaReviewEvidenceSchema,
   qaReviewEvidenceV1Schema,
+  qaReviewEvidenceV2Schema,
   resolveQaIntegrationConfigForRepository,
 } from "./project.js";
 
@@ -254,5 +257,38 @@ describe("project QA validators", () => {
       handoff: { kind: "work_product", id: "   ", url: null },
     }), ["handoff", "id"]);
     expectIssueAt(qaReviewEvidenceV1Schema.safeParse({ ...validFinalEvidence, extra: "not allowed" }), []);
+  });
+
+  describe("evidence v2 with multiple handoffs", () => {
+    const { handoff: _legacyHandoff, ...envelope } = validFinalEvidence;
+    const backend = { kind: "pull_request", id: "PR-1", url: "https://github.com/example/backend/pull/1", headSha: "a".repeat(40) };
+    const frontend = { kind: "pull_request", id: "PR-2", url: "https://github.com/example/frontend/pull/2", headSha: "c".repeat(40) };
+    const v2 = { ...envelope, version: 2, handoffs: [backend, frontend] };
+
+    it("accepts two pull request handoffs and both versions through the union", () => {
+      expect(qaReviewEvidenceV2Schema.parse(v2)).toEqual(v2);
+      expect(qaReviewEvidenceSchema.parse(v2)).toEqual(v2);
+      expect(qaReviewEvidenceSchema.parse(validFinalEvidence)).toEqual(validFinalEvidence);
+    });
+
+    it("rejects empty, duplicate and legacy-keyed handoffs", () => {
+      expectIssueAt(qaReviewEvidenceV2Schema.safeParse({ ...v2, handoffs: [] }), ["handoffs"]);
+      expectIssueAt(qaReviewEvidenceV2Schema.safeParse({ ...v2, handoffs: [backend, { ...frontend, id: backend.id }] }), ["handoffs", "1"]);
+      expectIssueAt(
+        qaReviewEvidenceV2Schema.safeParse({ ...v2, handoffs: [backend, { ...frontend, url: backend.url.replace("example", "EXAMPLE") }] }),
+        ["handoffs", "1"],
+      );
+      expect(qaReviewEvidenceV2Schema.safeParse({ ...v2, handoff: backend }).success).toBe(false);
+    });
+
+    it("normalizes v1 into a single-handoff v2", () => {
+      expect(toQaReviewEvidenceV2(validFinalEvidence as never)).toEqual({
+        ...envelope,
+        version: 2,
+        handoffs: [validFinalEvidence.handoff],
+      });
+      expect(qaReviewEvidenceHandoffs(null)).toEqual([]);
+      expect(qaReviewEvidenceHandoffs(v2 as never)).toHaveLength(2);
+    });
   });
 });

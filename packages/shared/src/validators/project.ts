@@ -190,6 +190,29 @@ export const qaReviewEvidenceV1Schema = z.object({
   handoff: qaReviewHandoffSchema,
 }).strict();
 
+export const qaReviewEvidenceV2Schema = z.object({
+  version: z.literal(2),
+  mode: z.literal("final"),
+  projectId: z.string().uuid(),
+  reviewerAgentId: z.string().uuid(),
+  phases: qaPhaseEvidenceSchema,
+  handoffs: z.array(qaReviewHandoffSchema).min(1).max(20),
+}).strict().superRefine((evidence, ctx) => {
+  const seenIds = new Set<string>();
+  const seenUrls = new Set<string>();
+  evidence.handoffs.forEach((handoff, index) => {
+    const idKey = `${handoff.kind}\u0000${handoff.id}`;
+    const urlKey = handoff.url?.toLowerCase() ?? null;
+    if (seenIds.has(idKey) || (urlKey !== null && seenUrls.has(urlKey))) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["handoffs", index], message: "duplicate QA handoff" });
+    }
+    seenIds.add(idKey);
+    if (urlKey !== null) seenUrls.add(urlKey);
+  });
+});
+
+export const qaReviewEvidenceSchema = z.union([qaReviewEvidenceV2Schema, qaReviewEvidenceV1Schema]);
+
 const projectWorkspaceFields = {
   name: z.string().min(1).optional(),
   sourceType: projectWorkspaceSourceTypeSchema.optional(),

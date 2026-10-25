@@ -377,6 +377,8 @@ export type {
   QaHandoffKind,
   QaReviewHandoff,
   QaReviewEvidenceV1,
+  QaReviewEvidenceV2,
+  QaReviewEvidence,
 } from "./project.js";
 export type {
   CompanySearchCountType,

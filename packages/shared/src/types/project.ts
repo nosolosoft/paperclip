@@ -103,6 +103,17 @@ export interface QaReviewEvidenceV1 {
   readonly handoff: QaReviewHandoff;
 }
 
+export interface QaReviewEvidenceV2 {
+  readonly version: 2;
+  readonly mode: "final";
+  readonly projectId: string;
+  readonly reviewerAgentId: string;
+  readonly phases: QaPhaseEvidence;
+  readonly handoffs: readonly QaReviewHandoff[];
+}
+
+export type QaReviewEvidence = QaReviewEvidenceV1 | QaReviewEvidenceV2;
+
 export interface ProjectGoalRef {
   id: string;
   title: string;

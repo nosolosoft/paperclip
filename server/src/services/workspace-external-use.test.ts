@@ -14,6 +14,8 @@ function makeDeps(opts: {
   docker?: (args: string[]) => Promise<string>;
   /** pid -> owning uid; pids missing here make ownerUid reject. */
   owners?: Record<string, number>;
+  /** pid -> raw /proc/<pid>/cmdline content. */
+  cmdlines?: Record<string, string>;
 }): Partial<ExternalWorkspaceUseDeps> {
   const procs = opts.procs ?? {};
   return {
@@ -37,6 +39,12 @@ function makeDeps(opts: {
       return v;
     },
     docker: opts.docker ?? (async () => ""),
+    readFile: async (p) => {
+      const m = /^\/proc\/(\d+)\/cmdline$/.exec(p);
+      const v = m ? opts.cmdlines?.[m[1]!] : undefined;
+      if (v === undefined) throw enoent();
+      return v;
+    },
     uid: SELF_UID,
     ownerUid: async (p) => {
       const m = /^\/proc\/(\d+)$/.exec(p);
@@ -110,20 +118,27 @@ describe("inspectExternalWorkspaceUse", () => {
     expect(r3).toEqual({ busy: false, reason: null });
   });
 
-  it("returns inspection_failed on EACCES for a same-uid process", async () => {
+  it("falls back to cmdline for a same-uid process with unreadable cwd/fd", async () => {
     const eacces = Object.assign(new Error("denied"), { code: "EACCES" });
-    const r1 = await inspectExternalWorkspaceUse(
+    const unrelated = await inspectExternalWorkspaceUse(
       WS,
-      makeDeps({ owners: { "15": SELF_UID }, procs: { "15": { cwd: eacces, fds: {} } } }),
+      makeDeps({
+        owners: { "15": SELF_UID },
+        procs: { "15": { cwd: eacces, fds: {} } },
+        cmdlines: { "15": "/usr/bin/sunshine\0--config\0/etc/x" },
+      }),
     );
-    expect(r1.busy).toBe(true);
-    expect(r1.reason).toBe("inspection_failed: denied");
-    const r2 = await inspectExternalWorkspaceUse(
+    expect(unrelated).toEqual({ busy: false, reason: null });
+    const fdDenied = await inspectExternalWorkspaceUse(
       WS,
-      makeDeps({ owners: { "16": SELF_UID }, procs: { "16": { cwd: "/", fds: eacces } } }),
+      makeDeps({
+        owners: { "16": SELF_UID },
+        procs: { "16": { cwd: "/", fds: eacces } },
+        cmdlines: { "16": `tool\0--dir=${WS}/sub` },
+      }),
     );
-    expect(r2.busy).toBe(true);
-    expect(r2.reason).toBe("inspection_failed: denied");
+    expect(fdDenied.busy).toBe(true);
+    expect(fdDenied.reason).toContain("process 16 cmdline references");
   });
 
   it("returns inspection_failed on EACCES when the owner cannot be determined or uid is unknown", async () => {
@@ -170,32 +185,68 @@ describe("inspectExternalWorkspaceUse", () => {
     expect(equal.busy).toBe(true);
   });
 
-  it("blocks on a bind mount whose source is an ancestor of the workspace (including /)", async () => {
-    for (const source of ["/work", "/"]) {
-      const result = await inspectExternalWorkspaceUse(
-        WS,
-        makeDeps({
-          docker: async (args) =>
-            args[0] === "ps" ? "x\n" : JSON.stringify([{ Id: "x", Mounts: [{ Type: "bind", Source: source }] }]),
-        }),
-      );
-      expect(result.busy).toBe(true);
-      expect(result.reason).toContain("bind-mounts");
-    }
+  it("does not block on an ancestor mount when no container process uses the workspace", async () => {
+    const calls: string[][] = [];
+    const docker = async (args: string[]) => {
+      calls.push(args);
+      if (args[0] === "ps") return "x\n";
+      if (args[0] === "inspect") {
+        return JSON.stringify([
+          { Id: "x", Mounts: [{ Type: "bind", Source: "/work", Destination: "/code" }] },
+        ]);
+      }
+      return "/code/other\n/code/ws-sibling/f\n/tmp/z\n/\n";
+    };
+    const result = await inspectExternalWorkspaceUse(WS, makeDeps({ docker }));
+    expect(result).toEqual({ busy: false, reason: null });
+    expect(calls[2]?.slice(0, 3)).toEqual(["exec", "x", "sh"]);
   });
 
-  it("blocks on an ancestor mount reached through a symlinked source (canonical comparison)", async () => {
-    const result = await inspectExternalWorkspaceUse(
-      WS,
-      {
-        ...makeDeps({
-          docker: async (args) =>
-            args[0] === "ps" ? "x\n" : JSON.stringify([{ Id: "x", Mounts: [{ Type: "bind", Source: "/link" }] }]),
-        }),
-        realpath: async (p) => (p === "/link" ? "/work" : p),
-      },
-    );
+  it("blocks on an ancestor mount when a container process cwd or fd maps inside the workspace", async () => {
+    const docker = async (args: string[]) => {
+      if (args[0] === "ps") return "abcdef1234567890\n";
+      if (args[0] === "inspect") {
+        return JSON.stringify([
+          {
+            Id: "abcdef1234567890",
+            Mounts: [
+              { Type: "bind", Source: "/work", Destination: "/code" },
+              { Type: "bind", Source: "/elsewhere", Destination: "/code/ws" },
+            ],
+          },
+        ]);
+      }
+      return "/tmp\n/code/ws/src\n";
+    };
+    // /code/ws maps to /elsewhere/src (longest destination wins): not inside WS.
+    expect((await inspectExternalWorkspaceUse(WS, makeDeps({ docker }))).busy).toBe(false);
+
+    const docker2 = async (args: string[]) => {
+      if (args[0] === "ps") return "abcdef1234567890\n";
+      if (args[0] === "inspect") {
+        return JSON.stringify([
+          { Id: "abcdef1234567890", Mounts: [{ Type: "bind", Source: "/work", Destination: "/code" }] },
+        ]);
+      }
+      return "/tmp\n/code/ws/src (deleted)\n";
+    };
+    const busy = await inspectExternalWorkspaceUse(WS, makeDeps({ docker: docker2 }));
+    expect(busy.busy).toBe(true);
+    expect(busy.reason).toContain("abcdef123456");
+    expect(busy.reason).toContain("/work/ws/src");
+  });
+
+  it("defers when docker exec fails on a container with an ancestor mount", async () => {
+    const docker = async (args: string[]) => {
+      if (args[0] === "ps") return "x\n";
+      if (args[0] === "inspect") {
+        return JSON.stringify([{ Id: "x", Mounts: [{ Type: "bind", Source: "/", Destination: "/host" }] }]);
+      }
+      throw new Error("exec: sh not found");
+    };
+    const result = await inspectExternalWorkspaceUse(WS, makeDeps({ docker }));
     expect(result.busy).toBe(true);
+    expect(result.reason).toBe("inspection_failed: exec: sh not found");
   });
 
   it("does not block on unrelated sibling mounts or non-bind mounts", async () => {

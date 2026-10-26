@@ -2368,7 +2368,12 @@ describe("realizeExecutionWorkspace", () => {
           "if [ \"$1\" = \"paperclipai\" ] && [ \"$2\" = \"--help\" ]; then",
           "  exit 1",
           "fi",
-          "if [ \"$1\" = \"install\" ] && [ \"$2\" = \"--prod=false\" ] && [ \"$3\" = \"--frozen-lockfile\" ]; then",
+          "if [ \"$1\" = \"store\" ] && [ \"$2\" = \"path\" ]; then",
+          `  mkdir -p ${JSON.stringify(path.join(tempRoot, "pnpm-store"))}`,
+          `  echo ${JSON.stringify(path.join(tempRoot, "pnpm-store"))}`,
+          "  exit 0",
+          "fi",
+          "if [ \"$1\" = \"install\" ] && [ \"$2\" = \"--prod=false\" ] && [ \"$3\" = \"--config.package-import-method=hardlink\" ] && [ \"$4\" = \"--frozen-lockfile\" ]; then",
           "  mkdir -p \"$PWD/node_modules\"",
           `  echo "install:$*" >> ${JSON.stringify(installLogPath)}`,
           "  exit 0",
@@ -2393,7 +2398,7 @@ describe("realizeExecutionWorkspace", () => {
       await runScript();
       await runScript();
       await expect(fs.readFile(installLogPath, "utf8")).resolves.toBe(
-        "install:install --prod=false --frozen-lockfile\n",
+        "install:install --prod=false --config.package-import-method=hardlink --frozen-lockfile\n",
       );
 
       await fs.writeFile(
@@ -2408,12 +2413,439 @@ describe("realizeExecutionWorkspace", () => {
 
       await runScript();
       await expect(fs.readFile(installLogPath, "utf8")).resolves.toBe(
-        "install:install --prod=false --frozen-lockfile\ninstall:install --prod=false --frozen-lockfile\n",
+        "install:install --prod=false --config.package-import-method=hardlink --frozen-lockfile\ninstall:install --prod=false --config.package-import-method=hardlink --frozen-lockfile\n",
       );
     } finally {
       await fs.rm(tempRoot, { recursive: true, force: true });
     }
   }, 30_000);
+
+  async function createProvisionFixture(prefix: string) {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+    const baseRoot = path.join(tempRoot, "base");
+    const worktreeRoot = path.join(tempRoot, "worktree");
+    const fakeBin = path.join(tempRoot, "bin");
+    const scriptPath = path.join(worktreeRoot, "provision-worktree.sh");
+    const logPath = path.join(tempRoot, "provision.log");
+    await fs.mkdir(baseRoot, { recursive: true });
+    await writeRegisteredSourceConfig(baseRoot);
+    await fs.mkdir(worktreeRoot, { recursive: true });
+    await fs.mkdir(fakeBin, { recursive: true });
+    await fs.copyFile(provisionWorktreeScriptPath, scriptPath);
+    await fs.chmod(scriptPath, 0o755);
+    const runScript = (env: Record<string, string> = {}) => execFileAsync(scriptPath, [], {
+      cwd: worktreeRoot,
+      env: {
+        ...process.env,
+        PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+        PAPERCLIP_WORKSPACE_BASE_CWD: baseRoot,
+        PAPERCLIP_WORKSPACE_CWD: worktreeRoot,
+        ...env,
+      },
+    });
+    const runScriptExpectingFailure = async (env: Record<string, string> = {}) => {
+      try {
+        await runScript(env);
+      } catch (error) {
+        return error instanceof Error && "stderr" in error ? String(error.stderr) : "";
+      }
+      throw new Error("Expected provision-worktree.sh to fail");
+    };
+    const readLog = async () => fs.readFile(logPath, "utf8").catch(() => "");
+    return { tempRoot, baseRoot, worktreeRoot, fakeBin, logPath, runScript, runScriptExpectingFailure, readLog };
+  }
+
+  // pnpm stand-in: `paperclipai` is unavailable so the script takes its fallback path.
+  function fakePnpmScript(logPath: string, storePath: string, installBody: string[]) {
+    return [
+      "#!/bin/sh",
+      "if [ \"$1\" = \"paperclipai\" ]; then",
+      "  exit 1",
+      "fi",
+      "if [ \"$1\" = \"store\" ] && [ \"$2\" = \"path\" ]; then",
+      `  mkdir -p ${JSON.stringify(storePath)}`,
+      `  echo "store:$PWD" >> ${JSON.stringify(logPath)}`,
+      `  echo ${JSON.stringify(storePath)}`,
+      "  exit 0",
+      "fi",
+      "if [ \"$1\" = \"install\" ]; then",
+      `  echo "install:$*" >> ${JSON.stringify(logPath)}`,
+      ...installBody,
+      "fi",
+      "exit 1",
+      "",
+    ].join("\n");
+  }
+
+  // Directory on a different device than `reference`, or null when none is available.
+  async function createCrossDeviceDir(reference: string) {
+    try {
+      const shm = "/dev/shm";
+      const [shmStat, referenceStat] = await Promise.all([fs.stat(shm), fs.stat(reference)]);
+      if (shmStat.dev === referenceStat.dev) return null;
+      return await fs.mkdtemp(path.join(shm, "paperclip-cross-device-"));
+    } catch {
+      return null;
+    }
+  }
+
+  async function writeFakeUv(fakeBin: string, logPath: string) {
+    const fakeUvPath = path.join(fakeBin, "uv");
+    await fs.writeFile(
+      fakeUvPath,
+      [
+        "#!/bin/sh",
+        "if [ \"$1\" = \"--version\" ]; then",
+        "  echo \"uv 9.9.9-fake\"",
+        "  exit 0",
+        "fi",
+        "if [ \"$1\" = \"venv\" ]; then",
+        `  echo "venv:$*" >> ${JSON.stringify(logPath)}`,
+        "  mkdir -p \"$4/bin\"",
+        "  ln -s \"$3\" \"$4/bin/python\"",
+        "  exit 0",
+        "fi",
+        "if [ \"$1\" = \"pip\" ] && [ \"$2\" = \"install\" ]; then",
+        `  echo "pip-install:$*" >> ${JSON.stringify(logPath)}`,
+        "  [ -n \"$FAKE_UV_FAIL_INSTALL\" ] && exit 1",
+        "  exit 0",
+        "fi",
+        "if [ \"$1\" = \"pip\" ] && [ \"$2\" = \"check\" ]; then",
+        `  echo "pip-check:$*" >> ${JSON.stringify(logPath)}`,
+        "  [ -n \"$FAKE_UV_FAIL_CHECK\" ] && exit 1",
+        "  exit 0",
+        "fi",
+        "exit 1",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.chmod(fakeUvPath, 0o755);
+  }
+
+  async function writePythonWorktree(worktreeRoot: string, withConstraints = true) {
+    await fs.writeFile(path.join(worktreeRoot, "requirements.txt"), "six==1.16.0\n", "utf8");
+    if (withConstraints) {
+      await fs.writeFile(path.join(worktreeRoot, "constraints.txt"), "six<2\n", "utf8");
+    }
+  }
+
+  it("provisions Python dependencies through uv with hardlinks and skips an unchanged fingerprint", async () => {
+    const fixture = await createProvisionFixture("paperclip-worktree-uv-");
+    try {
+      const { tempRoot, worktreeRoot, fakeBin, logPath, runScript, readLog } = fixture;
+      await writeFakeUv(fakeBin, logPath);
+      await writePythonWorktree(worktreeRoot);
+      const uvCacheDir = path.join(tempRoot, "uv-cache");
+      const venvPython = path.join(worktreeRoot, ".venv", "bin", "python");
+      const fingerprintPath = path.join(worktreeRoot, ".paperclip", "python-install-fingerprint");
+
+      await runScript({ UV_CACHE_DIR: uvCacheDir });
+      const firstLog = await readLog();
+      expect(firstLog).toContain(`venv:venv --python `);
+      expect(firstLog).toContain(
+        `pip-install:pip install --python ${venvPython} --link-mode hardlink -r ${path.join(worktreeRoot, "requirements.txt")} -c ${path.join(worktreeRoot, "constraints.txt")}\n`,
+      );
+      expect(firstLog).not.toContain("--reinstall");
+      expect(firstLog).toContain(`pip-check:pip check --python ${venvPython}\n`);
+      const fingerprint = (await fs.readFile(fingerprintPath, "utf8")).trim();
+      expect(fingerprint).toMatch(/^[0-9a-f]{64}$/);
+      expect((await fs.stat(uvCacheDir)).isDirectory()).toBe(true);
+
+      const second = await runScript({ UV_CACHE_DIR: uvCacheDir });
+      expect(second.stderr).toContain("Skipping unchanged Python dependency install");
+      expect(await readLog()).toBe(`${firstLog}pip-check:pip check --python ${venvPython}\n`);
+
+      // Changed requirements on an existing venv reinstall in place via uv.
+      await fs.writeFile(path.join(worktreeRoot, "requirements.txt"), "six==1.17.0\n", "utf8");
+      await runScript({ UV_CACHE_DIR: uvCacheDir });
+      const thirdLog = await readLog();
+      expect(thirdLog.match(/pip-install:/g)).toHaveLength(2);
+      expect(thirdLog).toContain(
+        `pip-install:pip install --python ${venvPython} --link-mode hardlink -r ${path.join(worktreeRoot, "requirements.txt")} -c ${path.join(worktreeRoot, "constraints.txt")} --reinstall\n`,
+      );
+      expect((await fs.readFile(fingerprintPath, "utf8")).trim()).not.toBe(fingerprint);
+    } finally {
+      await fs.rm(fixture.tempRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("omits uv constraints when constraints.txt is absent", async () => {
+    const fixture = await createProvisionFixture("paperclip-worktree-uv-noconstraints-");
+    try {
+      const { tempRoot, worktreeRoot, fakeBin, logPath, runScript, readLog } = fixture;
+      await writeFakeUv(fakeBin, logPath);
+      await writePythonWorktree(worktreeRoot, false);
+      await runScript({ UV_CACHE_DIR: path.join(tempRoot, "uv-cache") });
+      const log = await readLog();
+      expect(log).toContain(`--link-mode hardlink -r ${path.join(worktreeRoot, "requirements.txt")}\n`);
+      expect(log).not.toContain(" -c ");
+    } finally {
+      await fs.rm(fixture.tempRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("reinstalls a pre-existing pip-built venv through uv with --reinstall", async () => {
+    const fixture = await createProvisionFixture("paperclip-worktree-uv-legacy-");
+    try {
+      const { tempRoot, worktreeRoot, fakeBin, logPath, runScript, readLog } = fixture;
+      await writeFakeUv(fakeBin, logPath);
+      await writePythonWorktree(worktreeRoot);
+      const venvPython = path.join(worktreeRoot, ".venv", "bin", "python");
+      await fs.mkdir(path.dirname(venvPython), { recursive: true });
+      const { stdout: python3Path } = await execFileAsync("sh", ["-c", "command -v python3"]);
+      await fs.symlink(python3Path.trim(), venvPython);
+      // Fingerprint written by the previous pip-based provisioner (different format).
+      await fs.mkdir(path.join(worktreeRoot, ".paperclip"), { recursive: true });
+      await fs.writeFile(path.join(worktreeRoot, ".paperclip", "python-install-fingerprint"), "legacy-pip-fingerprint\n", "utf8");
+
+      await runScript({ UV_CACHE_DIR: path.join(tempRoot, "uv-cache") });
+      const log = await readLog();
+      expect(log).not.toContain("venv:");
+      expect(log).toContain(
+        `pip-install:pip install --python ${venvPython} --link-mode hardlink -r ${path.join(worktreeRoot, "requirements.txt")} -c ${path.join(worktreeRoot, "constraints.txt")} --reinstall\n`,
+      );
+      expect(
+        (await fs.readFile(path.join(worktreeRoot, ".paperclip", "python-install-fingerprint"), "utf8")).trim(),
+      ).toMatch(/^[0-9a-f]{64}$/);
+    } finally {
+      await fs.rm(fixture.tempRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("fails when uv is not on PATH", async () => {
+    const fixture = await createProvisionFixture("paperclip-worktree-uv-missing-");
+    try {
+      const { tempRoot, worktreeRoot, runScriptExpectingFailure } = fixture;
+      await writePythonWorktree(worktreeRoot);
+      // PATH mirroring the real one minus any uv binary.
+      const isolatedBin = path.join(tempRoot, "isolated-bin");
+      await fs.mkdir(isolatedBin, { recursive: true });
+      for (const dir of (process.env.PATH ?? "").split(path.delimiter).filter(Boolean)) {
+        const entries = await fs.readdir(dir).catch(() => [] as string[]);
+        for (const name of entries) {
+          if (name === "uv" || name === "uvx") continue;
+          await fs.symlink(path.join(dir, name), path.join(isolatedBin, name)).catch(() => undefined);
+        }
+      }
+      const stderr = await runScriptExpectingFailure({
+        PATH: isolatedBin,
+        UV_CACHE_DIR: path.join(tempRoot, "uv-cache"),
+      });
+      expect(stderr).toContain("uv is required to provision Python dependencies");
+      await expect(fs.stat(path.join(worktreeRoot, ".venv"))).rejects.toThrow();
+    } finally {
+      await fs.rm(fixture.tempRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("refuses a uv cache on a different device than the worktree", async () => {
+    const fixture = await createProvisionFixture("paperclip-worktree-uv-cross-device-");
+    const crossDeviceDir = await createCrossDeviceDir(fixture.tempRoot);
+    try {
+      if (!crossDeviceDir) return;
+      const { worktreeRoot, fakeBin, logPath, runScriptExpectingFailure, readLog } = fixture;
+      await writeFakeUv(fakeBin, logPath);
+      await writePythonWorktree(worktreeRoot);
+      const stderr = await runScriptExpectingFailure({ UV_CACHE_DIR: path.join(crossDeviceDir, "uv-cache") });
+      expect(stderr).toContain("are on different devices; refusing to copy packages");
+      expect(stderr).toContain("uv cache device check");
+      expect(await readLog()).toBe("");
+      await expect(fs.stat(path.join(worktreeRoot, ".venv"))).rejects.toThrow();
+      await expect(fs.stat(path.join(worktreeRoot, ".paperclip", "python-install-fingerprint"))).rejects.toThrow();
+    } finally {
+      if (crossDeviceDir) await fs.rm(crossDeviceDir, { recursive: true, force: true });
+      await fs.rm(fixture.tempRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("does not record a Python fingerprint when uv install or uv check fails", async () => {
+    const fixture = await createProvisionFixture("paperclip-worktree-uv-failure-");
+    try {
+      const { tempRoot, worktreeRoot, fakeBin, logPath, runScript, runScriptExpectingFailure } = fixture;
+      await writeFakeUv(fakeBin, logPath);
+      await writePythonWorktree(worktreeRoot);
+      const uvCacheDir = path.join(tempRoot, "uv-cache");
+      const fingerprintPath = path.join(worktreeRoot, ".paperclip", "python-install-fingerprint");
+
+      const installStderr = await runScriptExpectingFailure({ UV_CACHE_DIR: uvCacheDir, FAKE_UV_FAIL_INSTALL: "1" });
+      expect(installStderr).toContain("during uv pip install");
+      await expect(fs.stat(fingerprintPath)).rejects.toThrow();
+
+      const checkStderr = await runScriptExpectingFailure({ UV_CACHE_DIR: uvCacheDir, FAKE_UV_FAIL_CHECK: "1" });
+      expect(checkStderr).toContain("during uv pip check");
+      await expect(fs.stat(fingerprintPath)).rejects.toThrow();
+
+      await runScript({ UV_CACHE_DIR: uvCacheDir });
+      expect((await fs.readFile(fingerprintPath, "utf8")).trim()).toMatch(/^[0-9a-f]{64}$/);
+    } finally {
+      await fs.rm(fixture.tempRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  async function writePnpmWorktree(worktreeRoot: string) {
+    await fs.mkdir(path.join(worktreeRoot, "node_modules"), { recursive: true });
+    await fs.writeFile(
+      path.join(worktreeRoot, "package.json"),
+      JSON.stringify({ name: "workspace-root", private: true, packageManager: "pnpm@9.15.4" }, null, 2),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(worktreeRoot, "pnpm-lock.yaml"),
+      ["lockfileVersion: '9.0'", "", "importers:", "  .: {}", ""].join("\n"),
+      "utf8",
+    );
+  }
+
+  it("installs pnpm dependencies with hardlinks, resolving the store from the worktree", async () => {
+    const fixture = await createProvisionFixture("paperclip-worktree-pnpm-hardlink-");
+    try {
+      const { tempRoot, worktreeRoot, fakeBin, logPath, runScript, readLog } = fixture;
+      await writePnpmWorktree(worktreeRoot);
+      await fs.writeFile(
+        path.join(fakeBin, "pnpm"),
+        fakePnpmScript(logPath, path.join(tempRoot, "pnpm-store"), ["  exit 0"]),
+        "utf8",
+      );
+      await fs.chmod(path.join(fakeBin, "pnpm"), 0o755);
+
+      await runScript();
+      const lines = (await readLog()).trim().split("\n");
+      expect(lines).toEqual([
+        `store:${await fs.realpath(worktreeRoot)}`,
+        "install:install --prod=false --config.package-import-method=hardlink --frozen-lockfile",
+      ]);
+    } finally {
+      await fs.rm(fixture.tempRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("keeps the hardlink import method when retrying pnpm install after an outdated lockfile", async () => {
+    const fixture = await createProvisionFixture("paperclip-worktree-pnpm-outdated-");
+    try {
+      const { tempRoot, worktreeRoot, fakeBin, logPath, runScript, readLog } = fixture;
+      await writePnpmWorktree(worktreeRoot);
+      await fs.writeFile(
+        path.join(fakeBin, "pnpm"),
+        fakePnpmScript(logPath, path.join(tempRoot, "pnpm-store"), [
+          "  case \"$*\" in",
+          "    *--frozen-lockfile*) echo \"ERR_PNPM_OUTDATED_LOCKFILE lockfile out of date\" >&2; exit 1 ;;",
+          "    *) exit 0 ;;",
+          "  esac",
+        ]),
+        "utf8",
+      );
+      await fs.chmod(path.join(fakeBin, "pnpm"), 0o755);
+
+      const { stderr } = await runScript();
+      expect(stderr).toContain("retrying install without --frozen-lockfile");
+      expect((await readLog()).trim().split("\n").slice(1)).toEqual([
+        "install:install --prod=false --config.package-import-method=hardlink --frozen-lockfile",
+        "install:install --prod=false --config.package-import-method=hardlink --no-frozen-lockfile",
+      ]);
+    } finally {
+      await fs.rm(fixture.tempRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("refuses a pnpm store on a different device than the worktree", async () => {
+    const fixture = await createProvisionFixture("paperclip-worktree-pnpm-cross-device-");
+    const crossDeviceDir = await createCrossDeviceDir(fixture.tempRoot);
+    try {
+      if (!crossDeviceDir) return;
+      const { worktreeRoot, fakeBin, logPath, runScriptExpectingFailure, readLog } = fixture;
+      await writePnpmWorktree(worktreeRoot);
+      await fs.writeFile(
+        path.join(fakeBin, "pnpm"),
+        fakePnpmScript(logPath, path.join(crossDeviceDir, "pnpm-store"), ["  exit 0"]),
+        "utf8",
+      );
+      await fs.chmod(path.join(fakeBin, "pnpm"), 0o755);
+
+      const stderr = await runScriptExpectingFailure();
+      expect(stderr).toContain("pnpm store");
+      expect(stderr).toContain("are on different devices; refusing to copy packages");
+      expect(await readLog()).not.toContain("install:");
+    } finally {
+      if (crossDeviceDir) await fs.rm(crossDeviceDir, { recursive: true, force: true });
+      await fs.rm(fixture.tempRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  describe("shared node_modules verification", () => {
+    async function setup(prefix: string, options: { baseDependency: boolean }) {
+      const fixture = await createProvisionFixture(prefix);
+      await fs.writeFile(path.join(fixture.fakeBin, "pnpm"), "#!/bin/sh\nexit 1\n", "utf8");
+      await fs.chmod(path.join(fixture.fakeBin, "pnpm"), 0o755);
+      await fs.writeFile(
+        path.join(fixture.worktreeRoot, "package.json"),
+        JSON.stringify({ name: "workspace-root", private: true, dependencies: { "fake-dep": "1.0.0" } }, null, 2),
+        "utf8",
+      );
+      await fs.mkdir(path.join(fixture.baseRoot, "node_modules"), { recursive: true });
+      if (options.baseDependency) {
+        const depDir = path.join(fixture.baseRoot, "node_modules", "fake-dep");
+        await fs.mkdir(depDir, { recursive: true });
+        await fs.writeFile(
+          path.join(depDir, "package.json"),
+          JSON.stringify({ name: "fake-dep", version: "1.0.0", main: "index.js" }),
+          "utf8",
+        );
+        await fs.writeFile(path.join(depDir, "index.js"), "module.exports = {};\n", "utf8");
+      }
+      return fixture;
+    }
+
+    it("links the base node_modules and verifies that a dependency resolves through it", async () => {
+      const fixture = await setup("paperclip-worktree-verify-ok-", { baseDependency: true });
+      try {
+        await fixture.runScript();
+        const linkPath = path.join(fixture.worktreeRoot, "node_modules");
+        expect((await fs.lstat(linkPath)).isSymbolicLink()).toBe(true);
+        expect(await fs.realpath(linkPath)).toBe(await fs.realpath(path.join(fixture.baseRoot, "node_modules")));
+      } finally {
+        await fs.rm(fixture.tempRoot, { recursive: true, force: true });
+      }
+    }, 30_000);
+
+    it("fails when the linked base node_modules cannot resolve the first dependency", async () => {
+      const fixture = await setup("paperclip-worktree-verify-empty-", { baseDependency: false });
+      try {
+        const stderr = await fixture.runScriptExpectingFailure();
+        expect(stderr).toContain("Shared node_modules for");
+        expect(stderr).toContain("node cannot resolve dependency fake-dep");
+      } finally {
+        await fs.rm(fixture.tempRoot, { recursive: true, force: true });
+      }
+    }, 30_000);
+
+    it("fails when the base node_modules target is missing", async () => {
+      const fixture = await setup("paperclip-worktree-verify-missing-", { baseDependency: false });
+      try {
+        await fs.rm(path.join(fixture.baseRoot, "node_modules"), { recursive: true, force: true });
+        const stderr = await fixture.runScriptExpectingFailure();
+        expect(stderr).toContain("Shared node_modules for");
+        expect(stderr).toContain("node_modules is missing");
+      } finally {
+        await fs.rm(fixture.tempRoot, { recursive: true, force: true });
+      }
+    }, 30_000);
+
+    it("fails when the worktree node_modules link is broken", async () => {
+      const fixture = await setup("paperclip-worktree-verify-broken-", { baseDependency: true });
+      try {
+        await fs.symlink(
+          path.join(fixture.tempRoot, "does-not-exist"),
+          path.join(fixture.worktreeRoot, "node_modules"),
+        );
+        const stderr = await fixture.runScriptExpectingFailure();
+        expect(stderr).toContain("Shared node_modules for");
+        expect(stderr).toContain("node_modules is a broken link");
+      } finally {
+        await fs.rm(fixture.tempRoot, { recursive: true, force: true });
+      }
+    }, 30_000);
+  });
 
   it("fails instead of writing an unseeded fallback config when worktree init errors after CLI detection succeeds", async () => {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-provision-fail-"));
@@ -2604,11 +3036,15 @@ describe("realizeExecutionWorkspace", () => {
           "if [ \"$1\" = \"paperclipai\" ] && [ \"$2\" = \"--help\" ]; then",
           "  exit 1",
           "fi",
-          "if [ \"$1\" = \"install\" ] && [ \"$2\" = \"--prod=false\" ] && [ \"$3\" = \"--frozen-lockfile\" ]; then",
+          "if [ \"$1\" = \"store\" ] && [ \"$2\" = \"path\" ]; then",
+          `  echo ${JSON.stringify(path.join(tempRoot, "pnpm-store"))}`,
+          "  exit 0",
+          "fi",
+          "if [ \"$1\" = \"install\" ] && [ \"$2\" = \"--prod=false\" ] && [ \"$3\" = \"--config.package-import-method=hardlink\" ] && [ \"$4\" = \"--frozen-lockfile\" ]; then",
           "  echo \"ERR_PNPM_OUTDATED_LOCKFILE\" >&2",
           "  exit 1",
           "fi",
-          "if [ \"$1\" = \"install\" ] && [ \"$2\" = \"--prod=false\" ] && [ \"$3\" = \"--no-frozen-lockfile\" ]; then",
+          "if [ \"$1\" = \"install\" ] && [ \"$2\" = \"--prod=false\" ] && [ \"$3\" = \"--config.package-import-method=hardlink\" ] && [ \"$4\" = \"--no-frozen-lockfile\" ]; then",
           "  mkdir -p \"$PWD/node_modules\"",
           "  : > \"$PWD/node_modules/.retry-success\"",
           "  exit 0",

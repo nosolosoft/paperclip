@@ -57,35 +57,6 @@ async function classifyProcess(deps: ExternalWorkspaceUseDeps, procDir: string):
   }
 }
 
-/**
- * Fallback for same-uid processes whose cwd/fd links are unreadable (non-dumpable
- * processes such as /usr/bin/sunshine). /proc/<pid>/cmdline stays readable, so the
- * process counts as busy only when its command line mentions a workspace path.
- * RESIDUAL RISK: such a process could still hold the workspace as cwd or an open fd
- * without naming it on its command line; that case is not detected.
- */
-async function scanCmdline(
-  deps: ExternalWorkspaceUseDeps,
-  roots: string[],
-  entry: string,
-  procDir: string,
-): Promise<string | null> {
-  let raw: string;
-  try {
-    raw = await deps.readFile(path.join(procDir, "cmdline"));
-  } catch (err) {
-    if (isVanished(err)) return null;
-    throw err;
-  }
-  logger.debug({ pid: entry }, "workspace external-use: cwd/fd unreadable for same-uid process; using cmdline");
-  for (const arg of raw.split("\0")) {
-    const hit = arg ? roots.find((r) => arg.includes(r)) : undefined;
-    if (hit) return `process ${entry} cmdline references ${hit}`;
-  }
-  return null;
-}
-
-
 function isVanished(err: unknown): boolean {
   const code = (err as NodeJS.ErrnoException | null)?.code;
   return code === "ENOENT" || code === "ESRCH";
@@ -103,51 +74,110 @@ function matchesAny(candidate: string, roots: string[]): boolean {
 
 const DELETED_SUFFIX = " (deleted)";
 
-async function scanProcessLinks(deps: ExternalWorkspaceUseDeps, roots: string[], entry: string, procDir: string): Promise<string | null> {
-  const links: Array<{ kind: string; linkPath: string }> = [{ kind: "cwd", linkPath: path.join(procDir, "cwd") }];
-  try {
-    const fds = await deps.readdir(path.join(procDir, "fd"));
-    for (const fd of fds) links.push({ kind: `fd ${fd}`, linkPath: path.join(procDir, "fd", fd) });
-  } catch (err) {
-    if (isVanished(err)) return null;
-    throw err;
-  }
-
-  for (const { kind, linkPath } of links) {
-    let target: string;
-    try {
-      target = await deps.readlink(linkPath);
-    } catch (err) {
-      if (isVanished(err)) continue;
-      throw err;
-    }
-    if (target.endsWith(DELETED_SUFFIX)) target = target.slice(0, -DELETED_SUFFIX.length);
-    if (matchesAny(target, roots)) {
-      return `process ${entry} ${kind} is ${target}`;
-    }
-  }
-  return null;
+/** One process as seen at snapshot time. `links` are cwd + open fd targets. */
+interface ProcessEntry {
+  pid: string;
+  links: Array<{ kind: string; target: string }>;
+  /** Set (NUL-separated) only for same-uid processes whose cwd/fd were unreadable. */
+  cmdline: string | null;
 }
 
-async function scanProcess(deps: ExternalWorkspaceUseDeps, roots: string[], entry: string): Promise<string | null> {
-  const procDir = path.join(deps.procRoot, entry);
+interface ProcessSnapshot {
+  takenAt: number;
+  entries: ProcessEntry[];
+}
+
+async function readProcessEntry(deps: ExternalWorkspaceUseDeps, pid: string): Promise<{ entry: ProcessEntry | null; cmdlineFallback: boolean }> {
+  const procDir = path.join(deps.procRoot, pid);
+  const links: ProcessEntry["links"] = [];
   try {
-    return await scanProcessLinks(deps, roots, entry, procDir);
+    const linkPaths = [{ kind: "cwd", linkPath: path.join(procDir, "cwd") }];
+    const fds = await deps.readdir(path.join(procDir, "fd"));
+    for (const fd of fds) linkPaths.push({ kind: `fd ${fd}`, linkPath: path.join(procDir, "fd", fd) });
+    for (const { kind, linkPath } of linkPaths) {
+      let target: string;
+      try {
+        target = await deps.readlink(linkPath);
+      } catch (err) {
+        if (isVanished(err)) continue;
+        throw err;
+      }
+      if (target.endsWith(DELETED_SUFFIX)) target = target.slice(0, -DELETED_SUFFIX.length);
+      links.push({ kind, target });
+    }
+    return { entry: { pid, links, cmdline: null }, cmdlineFallback: false };
   } catch (err) {
+    if (isVanished(err)) return { entry: null, cmdlineFallback: false };
     if (!isPermissionDenied(err)) throw err;
     const ownership = await classifyProcess(deps, procDir);
-    if (ownership === "foreign") return null;
-    if (ownership === "same") return scanCmdline(deps, roots, entry, procDir);
-    throw err;
+    if (ownership === "foreign") return { entry: null, cmdlineFallback: false };
+    if (ownership !== "same") throw err;
+    // Same-uid but unreadable (non-dumpable, e.g. /usr/bin/sunshine): /proc/<pid>/cmdline
+    // stays readable, so the process counts as busy only when its command line mentions a
+    // workspace path. RESIDUAL RISK: such a process could still hold the workspace as cwd
+    // or an open fd without naming it on its command line; that case is not detected.
+    try {
+      const cmdline = await deps.readFile(path.join(procDir, "cmdline"));
+      return { entry: { pid, links, cmdline }, cmdlineFallback: true };
+    } catch (readErr) {
+      if (isVanished(readErr)) return { entry: null, cmdlineFallback: false };
+      throw readErr;
+    }
   }
 }
 
-async function scanProcesses(deps: ExternalWorkspaceUseDeps, roots: string[]): Promise<string | null> {
-  const entries = await deps.readdir(deps.procRoot);
-  for (const entry of entries) {
-    if (!/^[1-9][0-9]*$/.test(entry)) continue;
-    const reason = await scanProcess(deps, roots, entry);
-    if (reason) return reason;
+async function takeProcessSnapshot(deps: ExternalWorkspaceUseDeps): Promise<ProcessSnapshot> {
+  const names = await deps.readdir(deps.procRoot);
+  const entries: ProcessEntry[] = [];
+  let fallbacks = 0;
+  for (const name of names) {
+    if (!/^\d+$/.test(name)) continue;
+    const { entry, cmdlineFallback } = await readProcessEntry(deps, name);
+    if (entry) entries.push(entry);
+    if (cmdlineFallback) fallbacks += 1;
+  }
+  if (fallbacks > 0) {
+    logger.debug({ count: fallbacks }, "workspace external-use: used cmdline fallback for same-uid processes with unreadable cwd/fd");
+  }
+  return { takenAt: Date.now(), entries };
+}
+
+/** Short-lived /proc snapshot shared across workspaces inside one sweep/inventory batch. */
+export const PROCESS_SNAPSHOT_TTL_MS = 5_000;
+let cachedSnapshot: { key: string; promise: Promise<ProcessSnapshot>; takenAt: number } | null = null;
+
+export function clearProcessSnapshotCache(): void {
+  cachedSnapshot = null;
+}
+
+async function getProcessSnapshot(deps: ExternalWorkspaceUseDeps, useCache: boolean): Promise<ProcessSnapshot> {
+  if (!useCache) return takeProcessSnapshot(deps);
+  const nowMs = Date.now();
+  if (cachedSnapshot && cachedSnapshot.key === deps.procRoot && nowMs - cachedSnapshot.takenAt < PROCESS_SNAPSHOT_TTL_MS) {
+    return cachedSnapshot.promise;
+  }
+  const promise = takeProcessSnapshot(deps);
+  const slot = { key: deps.procRoot, promise, takenAt: nowMs };
+  cachedSnapshot = slot;
+  // A failed snapshot must not be served to later callers.
+  promise.catch(() => {
+    if (cachedSnapshot === slot) cachedSnapshot = null;
+  });
+  return promise;
+}
+
+async function scanProcesses(deps: ExternalWorkspaceUseDeps, roots: string[], useCache: boolean): Promise<string | null> {
+  const snapshot = await getProcessSnapshot(deps, useCache);
+  for (const entry of snapshot.entries) {
+    for (const { kind, target } of entry.links) {
+      if (matchesAny(target, roots)) return `process ${entry.pid} ${kind} is ${target}`;
+    }
+    if (entry.cmdline !== null) {
+      for (const arg of entry.cmdline.split("\0")) {
+        const hit = arg ? roots.find((r) => arg.includes(r)) : undefined;
+        if (hit) return `process ${entry.pid} cmdline references ${hit}`;
+      }
+    }
   }
   return null;
 }
@@ -235,17 +265,20 @@ async function scanDocker(deps: ExternalWorkspaceUseDeps, roots: string[]): Prom
 }
 
 /**
- * Reports whether any process (cwd or open fd) or running Docker container
- * (bind mount source equal to, inside, or an ancestor of `workspacePath`,
- * canonicalized; a "/" mount also blocks) uses the workspace.
- * Never throws: inspection failures (same-uid permission errors, unexpected
- * errors, docker missing/unreachable) yield `busy: true` with reason
+ * Reports whether any process (cwd or open fd) or running Docker container uses
+ * `workspacePath`. Never throws: inspection failures (same-uid permission errors,
+ * unexpected errors, docker missing/unreachable) yield `busy: true` with reason
  * `inspection_failed: <msg>` so callers defer. Permission errors on processes
  * owned by a different uid are ignored.
+ *
+ * `useProcessCache: true` (batch mode, e.g. inventory/sweep) shares a 5 s
+ * /proc snapshot across calls and clears stale entries itself. Deletion paths
+ * must call with a fresh scan (cache off).
  */
 export async function inspectExternalWorkspaceUse(
   workspacePath: string,
   overrides: Partial<ExternalWorkspaceUseDeps> = {},
+  { useProcessCache = false }: { useProcessCache?: boolean } = {},
 ): Promise<ExternalWorkspaceUse> {
   try {
     const deps = { ...defaultDeps, ...overrides };
@@ -258,7 +291,7 @@ export async function inspectExternalWorkspaceUse(
       if (!isVanished(err)) throw err;
     }
 
-    const processReason = await scanProcesses(deps, roots);
+    const processReason = await scanProcesses(deps, roots, useProcessCache);
     if (processReason) return { busy: true, reason: processReason };
 
     const dockerReason = await scanDocker(deps, roots);

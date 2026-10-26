@@ -885,6 +885,152 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await expect(fs.access(path.join(prunable.worktreePath, "node_modules"))).resolves.toBeUndefined();
   });
 
+  async function inventoryEntryFor(executionWorkspaceId: string) {
+    const inventory = await reaperService({ deleteEnabled: true }).inventoryTerminalWorkspaces();
+    return inventory.find((entry) => entry.id === executionWorkspaceId);
+  }
+
+  it.each([false, true])("treats top-level .paperclip-runtime/.paperclip/.gstack/dist/test-results as prunable with dirty=%s", async (dirty) => {
+    const seeded = await seedAncestryTerminalWorkspace();
+    const directories = [".paperclip-runtime", ".paperclip", ".gstack", "dist", "test-results"];
+    for (const directory of directories) {
+      await ignoreInWorktrees(seeded.worktreePath, directory);
+      await fs.mkdir(path.join(seeded.worktreePath, directory), { recursive: true });
+      await fs.writeFile(path.join(seeded.worktreePath, directory, "artifact.txt"), "regenerable\n");
+    }
+    if (dirty) await fs.writeFile(path.join(seeded.worktreePath, "README.md"), "keep local code\n");
+
+    expect(await inventoryEntryFor(seeded.executionWorkspaceId)).toMatchObject({
+      decision: dirty ? "prune_regenerable" : "delete_tree",
+    });
+    for (const directory of directories) {
+      await expect(fs.access(path.join(seeded.worktreePath, directory))).resolves.toBeUndefined();
+    }
+
+    expect(await reaperService({ deleteEnabled: true }).sweepTerminalWorkspaces()).toMatchObject({
+      archived: dirty ? 0 : 1,
+      cleanupFailed: dirty ? 1 : 0,
+    });
+    if (dirty) {
+      for (const directory of directories) {
+        await expect(fs.access(path.join(seeded.worktreePath, directory))).rejects.toThrow();
+      }
+      await expect(fs.access(path.join(seeded.worktreePath, "README.md"))).resolves.toBeUndefined();
+    } else {
+      await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+    }
+  });
+
+  it("blocks a nested sub/dist as valuable or unknown ignored data", async () => {
+    const seeded = await seedAncestryTerminalWorkspace();
+    await ignoreInWorktrees(seeded.worktreePath, "dist");
+    await fs.mkdir(path.join(seeded.worktreePath, "sub", "dist"), { recursive: true });
+    await fs.writeFile(path.join(seeded.worktreePath, "sub", "tracked.txt"), "t\n");
+    await runGit(seeded.worktreePath, ["add", "sub/tracked.txt"]);
+    await runGit(seeded.worktreePath, ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "track"]);
+    await fs.writeFile(path.join(seeded.worktreePath, "sub", "dist", "out.js"), "x\n");
+
+    const entry = await inventoryEntryFor(seeded.executionWorkspaceId);
+    expect(entry).toMatchObject({ decision: "blocked" });
+    expect(entry?.reason).toContain("Valuable or unknown ignored data");
+  });
+
+  it("still allows a nested .venv anywhere", async () => {
+    const seeded = await seedAncestryTerminalWorkspace();
+    await ignoreInWorktrees(seeded.worktreePath, ".venv");
+    // Track a file in sub/deep so git reports the nested .venv itself, not a collapsed `sub/`.
+    await fs.mkdir(path.join(seeded.worktreePath, "sub", "deep", ".venv"), { recursive: true });
+    await fs.writeFile(path.join(seeded.worktreePath, "sub", "deep", "tracked.txt"), "t\n");
+    await runGit(seeded.worktreePath, ["add", "sub/deep/tracked.txt"]);
+    await runGit(seeded.worktreePath, ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "track"]);
+    await fs.writeFile(path.join(seeded.worktreePath, "sub", "deep", ".venv", "pyvenv.cfg"), "x\n");
+    await fs.writeFile(path.join(seeded.worktreePath, "README.md"), "keep local code\n");
+    const venvEntry = await inventoryEntryFor(seeded.executionWorkspaceId);
+    expect(venvEntry).toMatchObject({ decision: "prune_regenerable" });
+  });
+
+  describe(".paperclip-repositories", () => {
+    const gitIdentity = ["-c", "user.name=Test", "-c", "user.email=test@example.com"];
+
+    async function seedRepositories(
+      worktreePath: string,
+      mutateRepoB?: (repoB: string) => Promise<void>,
+      options: { repoBAsFile?: boolean } = {},
+    ) {
+      await ignoreInWorktrees(worktreePath, ".paperclip-repositories");
+      const root = path.join(worktreePath, ".paperclip-repositories");
+      await fs.mkdir(root, { recursive: true });
+      const makeRepo = async (name: string) => {
+        const repo = path.join(root, name);
+        await fs.mkdir(repo, { recursive: true });
+        await runGit(repo, ["init", "-b", "main"]);
+        await fs.writeFile(path.join(repo, "tracked.txt"), "one\n");
+        await runGit(repo, ["add", "tracked.txt"]);
+        await runGit(repo, [...gitIdentity, "commit", "-m", "init"]);
+        await runGit(repo, ["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        return repo;
+      };
+      await makeRepo("repo-a");
+      if (options.repoBAsFile) {
+        await fs.writeFile(path.join(root, "repo-b"), "loose\n");
+      } else {
+        const repoB = await makeRepo("repo-b");
+        await mutateRepoB?.(repoB);
+      }
+    }
+
+    it("prunes when every nested repository is clean and published, then sweeps", async () => {
+      const seeded = await seedAncestryTerminalWorkspace();
+      await seedRepositories(seeded.worktreePath);
+      await fs.writeFile(path.join(seeded.worktreePath, "README.md"), "keep local code\n");
+
+      expect(await inventoryEntryFor(seeded.executionWorkspaceId)).toMatchObject({ decision: "prune_regenerable" });
+      expect(await reaperService({ deleteEnabled: true }).sweepTerminalWorkspaces()).toMatchObject({ archived: 0, cleanupFailed: 1 });
+      await expect(fs.access(path.join(seeded.worktreePath, ".paperclip-repositories"))).rejects.toThrow();
+      await expect(fs.access(path.join(seeded.worktreePath, "README.md"))).resolves.toBeUndefined();
+    });
+
+    it("lets a clean worktree with only clean nested repositories be deleted entirely", async () => {
+      const seeded = await seedAncestryTerminalWorkspace();
+      await seedRepositories(seeded.worktreePath);
+
+      expect(await reaperService({ deleteEnabled: true }).sweepTerminalWorkspaces()).toMatchObject({ archived: 1, cleanupFailed: 0 });
+      await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+    });
+
+    const blockedCases: Array<[string, (repoB: string) => Promise<void>, { repoBAsFile?: boolean }?]> = [
+      ["an uncommitted file", async (repoB) => { await fs.writeFile(path.join(repoB, "new.txt"), "wip\n"); }],
+      ["an ahead commit", async (repoB) => {
+        await fs.writeFile(path.join(repoB, "tracked.txt"), "two\n");
+        await runGit(repoB, ["add", "tracked.txt"]);
+        await runGit(repoB, [...gitIdentity, "commit", "-m", "ahead"]);
+      }],
+      ["a stash", async (repoB) => {
+        await fs.writeFile(path.join(repoB, "tracked.txt"), "stashed\n");
+        await runGit(repoB, [...gitIdentity, "stash", "push"]);
+      }],
+      ["a MERGE_HEAD file", async (repoB) => {
+        const head = await readGit(repoB, ["rev-parse", "HEAD"]);
+        await fs.writeFile(path.join(repoB, ".git", "MERGE_HEAD"), `${head}\n`);
+      }],
+      ["a loose file child", async () => undefined, { repoBAsFile: true }],
+      ["a failing git command", async (repoB) => {
+        await fs.rm(path.join(repoB, ".git"), { recursive: true, force: true });
+        await fs.writeFile(path.join(repoB, ".git"), "gitdir: /nonexistent/gitdir\n");
+      }],
+    ];
+
+    it.each(blockedCases)("blocks when repo-b has %s", async (_label, mutate, options) => {
+      const seeded = await seedAncestryTerminalWorkspace();
+      await seedRepositories(seeded.worktreePath, mutate, options);
+
+      const entry = await inventoryEntryFor(seeded.executionWorkspaceId);
+      expect(entry).toMatchObject({ decision: "blocked" });
+      expect(entry?.reason).toContain("nested repository repo-b has unpublished work");
+      await expect(fs.access(path.join(seeded.worktreePath, ".paperclip-repositories", "repo-a"))).resolves.toBeUndefined();
+    });
+  });
+
   it("cleanupTerminalWorkspaceArtifacts removes a clean published worktree and refuses a dirty one", async () => {
     const clean = await seedAncestryTerminalWorkspace();
     const service = reaperService({ deleteEnabled: true });
@@ -952,7 +1098,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     const service = executionWorkspaceService(db, { workspaceReaperDeleteEnabled: true, inspectExternalWorkspaceUse: inspect });
 
     expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, cleanupFailed: 0 });
-    expect(inspect).toHaveBeenCalledWith(seeded.worktreePath);
+    expect(inspect).toHaveBeenCalledWith(seeded.worktreePath, {}, { useProcessCache: false });
     expect(await readReaperWorkspace(seeded.executionWorkspaceId)).toMatchObject({ status: "active", closedAt: null });
     await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
   });

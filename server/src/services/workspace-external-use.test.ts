@@ -1,4 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { logger } from "../middleware/logger.js";
+import {
+  PROCESS_SNAPSHOT_TTL_MS,
+  clearProcessSnapshotCache,
+} from "./workspace-external-use.js";
 import { inspectExternalWorkspaceUse, type ExternalWorkspaceUseDeps } from "./workspace-external-use.js";
 
 const WS = "/work/ws";
@@ -324,5 +329,96 @@ describe("inspectExternalWorkspaceUse", () => {
       realpath: async () => "/real/ws",
     });
     expect(result.busy).toBe(true);
+  });
+
+  describe("process snapshot cache", () => {
+    function countingDeps(base: Partial<ExternalWorkspaceUseDeps>) {
+      const counter = { procReads: 0 };
+      const inner = base.readdir!;
+      return {
+        counter,
+        deps: {
+          ...base,
+          readdir: async (dir: string) => {
+            if (dir === "/proc") counter.procReads += 1;
+            return inner(dir);
+          },
+        } as Partial<ExternalWorkspaceUseDeps>,
+      };
+    }
+
+    beforeEach(() => {
+      clearProcessSnapshotCache();
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+      clearProcessSnapshotCache();
+    });
+
+    it("reads /proc once for consecutive cached calls, then re-reads after clear and after TTL expiry", async () => {
+      const { counter, deps } = countingDeps(makeDeps({ procs: { "20": { cwd: "/elsewhere", fds: {} } } }));
+      await inspectExternalWorkspaceUse(WS, deps, { useProcessCache: true });
+      await inspectExternalWorkspaceUse(WS, deps, { useProcessCache: true });
+      expect(counter.procReads).toBe(1);
+
+      clearProcessSnapshotCache();
+      await inspectExternalWorkspaceUse(WS, deps, { useProcessCache: true });
+      expect(counter.procReads).toBe(2);
+
+      vi.advanceTimersByTime(PROCESS_SNAPSHOT_TTL_MS - 1);
+      await inspectExternalWorkspaceUse(WS, deps, { useProcessCache: true });
+      expect(counter.procReads).toBe(2);
+
+      vi.advanceTimersByTime(1);
+      await inspectExternalWorkspaceUse(WS, deps, { useProcessCache: true });
+      expect(counter.procReads).toBe(3);
+    });
+
+    it("always re-reads /proc without useProcessCache", async () => {
+      const { counter, deps } = countingDeps(makeDeps({ procs: { "20": { cwd: "/elsewhere", fds: {} } } }));
+      await inspectExternalWorkspaceUse(WS, deps);
+      await inspectExternalWorkspaceUse(WS, deps);
+      expect(counter.procReads).toBe(2);
+      await inspectExternalWorkspaceUse(WS, deps, { useProcessCache: true });
+      await inspectExternalWorkspaceUse(WS, deps);
+      expect(counter.procReads).toBe(4);
+    });
+
+    it("still busy-detects a cmdline-fallback workspace path from a cached snapshot for a second workspace", async () => {
+      const eacces = Object.assign(new Error("denied"), { code: "EACCES" });
+      const { counter, deps } = countingDeps(
+        makeDeps({
+          owners: { "16": SELF_UID },
+          procs: { "16": { cwd: "/", fds: eacces } },
+          cmdlines: { "16": "tool\0--dir=/work/other/sub" },
+        }),
+      );
+      const first = await inspectExternalWorkspaceUse(WS, deps, { useProcessCache: true });
+      const second = await inspectExternalWorkspaceUse("/work/other", deps, { useProcessCache: true });
+      expect(first).toEqual({ busy: false, reason: null });
+      expect(second.busy).toBe(true);
+      expect(second.reason).toContain("process 16 cmdline references");
+      expect(counter.procReads).toBe(1);
+    });
+
+    it("emits one aggregated debug log per snapshot, not per process", async () => {
+      const eacces = Object.assign(new Error("denied"), { code: "EACCES" });
+      const debug = vi.spyOn(logger, "debug").mockImplementation(() => undefined);
+      const { deps } = countingDeps(
+        makeDeps({
+          owners: { "15": SELF_UID, "16": SELF_UID },
+          procs: { "15": { cwd: eacces, fds: {} }, "16": { cwd: eacces, fds: {} } },
+          cmdlines: { "15": "a\0b", "16": "c\0d" },
+        }),
+      );
+      await inspectExternalWorkspaceUse(WS, deps, { useProcessCache: true });
+      await inspectExternalWorkspaceUse("/work/two", deps, { useProcessCache: true });
+      const fallbackLogs = debug.mock.calls.filter((c) => String(c[1]).includes("used cmdline fallback"));
+      expect(fallbackLogs).toHaveLength(1);
+      expect(fallbackLogs[0]![0]).toEqual({ count: 2 });
+    });
   });
 });

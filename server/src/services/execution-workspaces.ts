@@ -1,9 +1,10 @@
 import { createWorkspaceGitInspectionCache } from "./workspace-git-inspection-cache.js";
+import type { Dirent } from "node:fs";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { inspectExternalWorkspaceUse as inspectHostWorkspaceUse } from "./workspace-external-use.js";
+import { clearProcessSnapshotCache, inspectExternalWorkspaceUse as inspectHostWorkspaceUse } from "./workspace-external-use.js";
 import {
   acquireGitWorktreeCleanupLock,
   WorkspaceCleanupDeferredError,
@@ -1338,6 +1339,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     (opts.workspaceReaperCooldownDays ?? 0) * 24 * 60 * 60 * 1000,
   );
   const inspectExternalUse = opts.inspectExternalWorkspaceUse ?? inspectHostWorkspaceUse;
+  // Non-null while inventoryTerminalWorkspaces() is running: preflight calls then
+  // share the 5 s /proc snapshot between workspaces. Null in sweeps and deletion.
+  let batchProcessCache: { useProcessCache: true } | null = null;
   const pullRequestStateCache = new Map<
     string,
     {
@@ -1544,6 +1548,50 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   }
   type CleanupPreflight = { busy: boolean; reason: string | null; regenerable: string[] };
 
+  // Regenerable directory names allowed at any depth.
+  const REGENERABLE_ANYWHERE: Record<string, true> = { ".venv": true, node_modules: true, ".tokensave": true, coverage: true };
+  // Additional names allowed only as exact top-level entries of the workspace.
+  const REGENERABLE_TOP_LEVEL: Record<string, true> = {
+    ".paperclip-runtime": true,
+    ".paperclip": true,
+    ".gstack": true,
+    dist: true,
+    "test-results": true,
+  };
+  const NESTED_REPOSITORIES_DIR = ".paperclip-repositories";
+
+  // `.paperclip-repositories` holds full clones. It is only disposable when every
+  // immediate child is a real git repo/worktree with no unpublished work.
+  async function nestedRepositoriesUnpublishedReason(directory: string): Promise<string | null> {
+    let children: Dirent[];
+    try {
+      children = await fs.readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      return `nested repositories could not be read: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    for (const child of children) {
+      const childPath = path.join(directory, child.name);
+      const blockedBy = (detail: string) => `nested repository ${child.name} has unpublished work: ${detail}`;
+      if (child.isSymbolicLink() || !child.isDirectory()) return blockedBy("not a plain directory");
+      try {
+        const gitDir = path.resolve(childPath, (await runGit(["rev-parse", "--git-dir"], childPath)).stdout.trim());
+        const status = (await runGit(["status", "--porcelain=v1", "--untracked-files=all"], childPath)).stdout;
+        if (status.trim().length > 0) return blockedBy("uncommitted or untracked changes");
+        const ahead = (await runGit(["rev-list", "--count", "HEAD", "--not", "--remotes"], childPath)).stdout.trim();
+        if (ahead !== "0") return blockedBy(`${ahead} commit(s) not on any remote`);
+        const stash = (await runGit(["stash", "list"], childPath)).stdout;
+        if (stash.trim().length > 0) return blockedBy("stash entries present");
+        for (const marker of ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"]) {
+          const exists = await fs.access(path.join(gitDir, marker)).then(() => true, () => false);
+          if (exists) return blockedBy(`${marker} in progress`);
+        }
+      } catch (error) {
+        return blockedBy(`inspection failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return null;
+  }
+
   // Scan `git status --ignored -z` records for ignored data that must be
   // preserved. Anything that is not a plain regenerable directory blocks.
   async function scanIgnoredData(cwd: string, records: string[]): Promise<{ reason: string | null; regenerable: string[] }> {
@@ -1555,8 +1603,17 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       if (!absolute.startsWith(`${cwd}${path.sep}`)) return { reason: `Ignored path escapes workspace: ${relative}`, regenerable };
       const stat = await fs.lstat(absolute);
       if (stat.isSymbolicLink()) return { reason: `Ignored symlink requires preservation: ${relative}`, regenerable };
-      if (!stat.isDirectory() || ![".venv", "node_modules", ".tokensave", "coverage"].includes(path.basename(relative))) return { reason: `Valuable or unknown ignored data: ${relative}`, regenerable };
+      const topLevel = !relative.includes("/");
+      const name = path.basename(relative);
+      const allowed =
+        Object.hasOwn(REGENERABLE_ANYWHERE, name) ||
+        (topLevel && (Object.hasOwn(REGENERABLE_TOP_LEVEL, name) || name === NESTED_REPOSITORIES_DIR));
+      if (!stat.isDirectory() || !allowed) return { reason: `Valuable or unknown ignored data: ${relative}`, regenerable };
       if (!(await fs.realpath(absolute)).startsWith(`${cwd}${path.sep}`)) return { reason: `Ignored directory escapes workspace: ${relative}`, regenerable };
+      if (topLevel && name === NESTED_REPOSITORIES_DIR) {
+        const nested = await nestedRepositoriesUnpublishedReason(absolute);
+        if (nested) return { reason: nested, regenerable };
+      }
       regenerable.push(absolute);
     }
     return { reason: null, regenerable };
@@ -1595,6 +1652,14 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   ): Promise<CleanupPreflight> {
     const blocked = (reason: string, busy = false): CleanupPreflight => ({ busy, reason, regenerable: [] });
     if (workspace.metadata?.cleanupProtected === true) return blocked("Workspace is cleanupProtected", true);
+    let external: { busy: boolean; reason: string | null };
+    if (!workspace.cwd) return blocked("Workspace path is missing");
+    try {
+      external = await inspectExternalUse(workspace.cwd, {}, { useProcessCache: batchProcessCache !== null });
+    } catch (error) {
+      return blocked(`inspection_failed: ${error instanceof Error ? error.message : String(error)}`, true);
+    }
+    if (external.busy) return blocked(external.reason ?? "Workspace is in use", true);
     if (workspace.metadata?.createdByRuntime !== true || workspace.providerType !== "git_worktree") return blocked("Workspace was not created by the runtime as a git worktree");
     if (!workspace.cwd) return blocked("Workspace path is missing");
     if (!(await pathExists(workspace.cwd))) return blocked(`Workspace path does not exist: ${workspace.cwd}`);
@@ -1614,13 +1679,6 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       )).limit(1);
       if (services.length) return blocked("Workspace has a live runtime service", true);
     }
-    let external: { busy: boolean; reason: string | null };
-    try {
-      external = await inspectExternalUse(workspace.cwd);
-    } catch (error) {
-      return blocked(`inspection_failed: ${error instanceof Error ? error.message : String(error)}`, true);
-    }
-    if (external.busy) return blocked(external.reason ?? "Workspace is in external use", true);
     const commonDir = (await runGit(["rev-parse", "--path-format=absolute", "--git-common-dir"], workspace.cwd)).stdout.trim();
     const root = await fs.realpath(path.dirname(commonDir));
     const cwd = await fs.realpath(workspace.cwd);
@@ -2931,95 +2989,78 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
 
     inventoryTerminalWorkspaces: async (): Promise<TerminalWorkspaceInventoryEntry[]> => {
       const entries: TerminalWorkspaceInventoryEntry[] = [];
-      const pageSize = 200;
-      let cursor: { updatedAt: Date; id: string } | null = null;
-      for (;;) {
-        const page: ExecutionWorkspaceRow[] = await db
-          .select()
-          .from(executionWorkspaces)
-          .where(and(
-            inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
-            isNull(executionWorkspaces.closedAt),
-            sql<boolean>`${executionWorkspaces.sourceIssueId} IS NOT NULL`,
-            cursor
-              ? or(
-                  gt(executionWorkspaces.updatedAt, cursor.updatedAt),
-                  and(eq(executionWorkspaces.updatedAt, cursor.updatedAt), gt(executionWorkspaces.id, cursor.id)),
-                )
-              : undefined,
-          ))
-          .orderBy(asc(executionWorkspaces.updatedAt), asc(executionWorkspaces.id))
-          .limit(pageSize);
-        for (const workspace of page) {
-          const entry = await inventoryTerminalWorkspace(workspace);
-          if (entry) entries.push(entry);
+      clearProcessSnapshotCache();
+      batchProcessCache = { useProcessCache: true };
+      try {
+        const pageSize = 200;
+        let cursor: { updatedAt: Date; id: string } | null = null;
+        for (;;) {
+          const page: ExecutionWorkspaceRow[] = await db
+            .select()
+            .from(executionWorkspaces)
+            .where(and(
+              inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+              isNull(executionWorkspaces.closedAt),
+              sql<boolean>`${executionWorkspaces.sourceIssueId} IS NOT NULL`,
+              cursor
+                ? or(
+                    gt(executionWorkspaces.updatedAt, cursor.updatedAt),
+                    and(eq(executionWorkspaces.updatedAt, cursor.updatedAt), gt(executionWorkspaces.id, cursor.id)),
+                  )
+                : undefined,
+            ))
+            .orderBy(asc(executionWorkspaces.updatedAt), asc(executionWorkspaces.id))
+            .limit(pageSize);
+          for (const workspace of page) {
+            const entry = await inventoryTerminalWorkspace(workspace);
+            if (entry) entries.push(entry);
+          }
+          if (page.length < pageSize) break;
+          const last = page[page.length - 1]!;
+          cursor = { updatedAt: last.updatedAt, id: last.id };
         }
-        if (page.length < pageSize) break;
-        const last = page[page.length - 1]!;
-        cursor = { updatedAt: last.updatedAt, id: last.id };
+        return entries;
+      } finally {
+        batchProcessCache = null;
+        clearProcessSnapshotCache();
       }
-      return entries;
+
     },
 
     sweepTerminalWorkspaces: async (limit = 50) => {
-      // Skip this sweep while another sweep runs. A concurrent sweep would share
-      // the cursor and the boundary and could corrupt the rotation state. A
-      // skipped tick is safe: the next tick runs the sweep with intact state.
       if (terminalSweepInProgress) {
         return {
-          checked: 0,
-          eligible: 0,
-          archived: 0,
-          cleanupFailed: 0,
-          skippedActiveRun: 0,
-          skippedNonTerminalTree: 0,
-          skippedUndelivered: 0,
-          skippedRace: 0,
-          skippedReopened: 0,
-          skippedCooldown: 0,
-          clearedStaleReopenPending: 0,
+          checked: 0, eligible: 0, archived: 0, cleanupFailed: 0,
+          skippedActiveRun: 0, skippedNonTerminalTree: 0, skippedUndelivered: 0,
+          skippedRace: 0, skippedReopened: 0, skippedCooldown: 0, clearedStaleReopenPending: 0,
         };
       }
       terminalSweepInProgress = true;
       try {
-      const baseCandidateFilter = and(
-        inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
-        isNull(executionWorkspaces.closedAt),
-        sql<boolean>`${executionWorkspaces.sourceIssueId} IS NOT NULL`,
-      );
-      // Continue the scan after the previous sweep's last row. The keyset
-      // predicate uses the same (updatedAt, id) order as the query, so each
-      // sweep advances past the rows it already inspected instead of re-reading
-      // the oldest ineligible candidates.
-      const cursor = terminalSweepCursor;
-      // Freeze an upper bound on updatedAt at the start of each rotation. Without
-      // a bound, a steady stream of newer candidates keeps every page full, so
-      // the cursor never reaches the end and never resets, and older candidates
-      // that became eligible are never revisited. The frozen bound makes the
-      // rotation cover a finite set, so the cursor always reaches a short page.
-      if (!cursor) {
-        terminalSweepBoundary = now();
-      }
-      const boundary = terminalSweepBoundary;
-      const boundaryFilter = boundary
-        ? lte(executionWorkspaces.updatedAt, boundary)
-        : undefined;
-      const cursorFilter = cursor
-        ? or(
-            gt(executionWorkspaces.updatedAt, cursor.updatedAt),
-            and(
-              eq(executionWorkspaces.updatedAt, cursor.updatedAt),
-              gt(executionWorkspaces.id, cursor.id),
-            ),
-          )
-        : undefined;
-      const scanFilter = and(baseCandidateFilter, boundaryFilter, cursorFilter);
-      const candidates = await db
-        .select()
-        .from(executionWorkspaces)
-        .where(scanFilter)
-        .orderBy(asc(executionWorkspaces.updatedAt), asc(executionWorkspaces.id))
-        .limit(limit);
+        const baseCandidateFilter = and(
+          inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+          isNull(executionWorkspaces.closedAt),
+          sql<boolean>`${executionWorkspaces.sourceIssueId} IS NOT NULL`,
+        );
+        const cursor = terminalSweepCursor;
+        if (!cursor) {
+          terminalSweepBoundary = now();
+        }
+        const boundary = terminalSweepBoundary;
+        const boundaryFilter = boundary ? lte(executionWorkspaces.updatedAt, boundary) : undefined;
+        const cursorFilter = cursor
+          ? or(
+              gt(executionWorkspaces.updatedAt, cursor.updatedAt),
+              and(eq(executionWorkspaces.updatedAt, cursor.updatedAt), gt(executionWorkspaces.id, cursor.id)),
+            )
+          : undefined;
+        const scanFilter = and(baseCandidateFilter, boundaryFilter, cursorFilter);
+        const candidates = await db
+          .select()
+          .from(executionWorkspaces)
+          .where(scanFilter)
+          .orderBy(asc(executionWorkspaces.updatedAt), asc(executionWorkspaces.id))
+          .limit(limit);
       // Advance the cursor to this page's last row. A short page means the scan
       // reached the end of the bounded candidate set, so reset the cursor and
       // the bound to start a new rotation on the next sweep.

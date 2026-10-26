@@ -664,7 +664,7 @@ list_base_node_modules_paths() {
     find . \
       -mindepth 1 \
       -maxdepth 4 \
-      -type d \
+      \( -type d -o -type l \) \
       -name node_modules \
       ! -path './.git/*' \
       ! -path './.paperclip/*' \
@@ -712,6 +712,7 @@ for (const patch of Object.values(manifest.pnpm?.patchedDependencies ?? {})) {
 files.sort((left, right) => path.relative(root, left).localeCompare(path.relative(root, right)));
 
 const hash = crypto.createHash("sha256");
+hash.update("pnpm-hardlink-v1\0");
 for (const file of files) {
   const relativePath = path.relative(root, file).replaceAll(path.sep, "/");
   hash.update(relativePath);
@@ -722,6 +723,80 @@ for (const file of files) {
 
 process.stdout.write(hash.digest("hex"));
 EOF
+}
+
+# Fail instead of silently copying packages when the shared cache lives on a
+# different filesystem than the worktree (hardlinks cannot cross devices).
+require_same_device() {
+  local label="$1" shared_dir="$2" target_dir="$3" shared_dev target_dev
+  mkdir -p "$shared_dir"
+  shared_dev="$(stat -c %d "$shared_dir" 2>/dev/null || true)"
+  target_dev="$(stat -c %d "$target_dir" 2>/dev/null || true)"
+  if [[ -z "$shared_dev" || -z "$target_dev" || "$shared_dev" != "$target_dev" ]]; then
+    echo "$label ($shared_dir) and worktree $target_dir are on different devices; refusing to copy packages. Use a cache on the worktree's filesystem." >&2
+    return 1
+  fi
+}
+
+# Validate each dependency-bearing package, including packages whose base install
+# is absent (and therefore produced no link during discovery).
+verify_shared_node_modules() {
+  WORKTREE_CWD="$worktree_cwd" node <<'NODE_VERIFY'
+const fs = require("node:fs");
+const path = require("node:path");
+const { createRequire } = require("node:module");
+
+const root = process.env.WORKTREE_CWD;
+function verify(dir) {
+  const manifestPath = path.join(dir, "package.json");
+  const fail = (reason) => {
+    console.error(
+      `Shared node_modules for ${dir} is unusable (${reason}). Reprovision the base checkout dependencies; node_modules are never copied into worktrees.`,
+    );
+    process.exit(1);
+  };
+  const manifest = fs.existsSync(manifestPath)
+    ? JSON.parse(fs.readFileSync(manifestPath, "utf8"))
+    : {};
+  const names = Object.keys({ ...(manifest.dependencies ?? {}), ...(manifest.devDependencies ?? {}) });
+  const modulesPath = path.join(dir, "node_modules");
+  let link;
+  try {
+    link = fs.lstatSync(modulesPath);
+  } catch {
+    if (names.length === 0) return;
+    fail("node_modules is missing");
+  }
+  if (!link.isSymbolicLink()) fail("node_modules is not a shared link");
+  try {
+    if (!fs.statSync(modulesPath).isDirectory()) fail("node_modules is not a directory");
+  } catch {
+    fail("node_modules is a broken link");
+  }
+  if (names.length === 0) return;
+  const requireFromDir = createRequire(manifestPath);
+  const resolves = (specifier) => {
+    try {
+      requireFromDir.resolve(specifier);
+      return true;
+    } catch (error) {
+      return error?.code === "ERR_PACKAGE_PATH_NOT_EXPORTED";
+    }
+  };
+  if (!resolves(`${names[0]}/package.json`) && !resolves(names[0])) {
+    fail(`node cannot resolve dependency ${names[0]}`);
+  }
+}
+function walk(dir, depth = 0) {
+  verify(dir);
+  if (depth === 4) return;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name.startsWith(".") || entry.name === "node_modules") continue;
+    walk(path.join(dir, entry.name), depth + 1);
+  }
+}
+walk(root);
+NODE_VERIFY
 }
 
 python_provision_failure() {
@@ -836,6 +911,14 @@ if [[ -f "$worktree_cwd/package.json" && -f "$worktree_cwd/pnpm-lock.yaml" ]]; t
       done
     }
 
+    pnpm_store_path="$(cd "$worktree_cwd" && pnpm store path)" || {
+      echo "Unable to resolve the pnpm store path for worktree $worktree_cwd." >&2
+      exit 1
+    }
+    if ! require_same_device "pnpm store" "$pnpm_store_path" "$worktree_cwd"; then
+      exit 1
+    fi
+
     run_pnpm_install() {
       local stdout_path stderr_path exit_code
       stdout_path="$(mktemp)"
@@ -846,7 +929,7 @@ if [[ -f "$worktree_cwd/package.json" && -f "$worktree_cwd/pnpm-lock.yaml" ]]; t
         # pnpm 9.15.4 calls the deprecated url.parse() in toNerfDart on every
         # install. Node 24 reports that call as DEP0169. Remove this flag
         # when the pinned pnpm no longer calls url.parse() in that path.
-        NODE_OPTIONS="${NODE_OPTIONS:-} --disable-warning=DEP0169" pnpm install --prod=false "$@"
+        NODE_OPTIONS="${NODE_OPTIONS:-} --disable-warning=DEP0169" pnpm install --prod=false --config.package-import-method=hardlink "$@"
       ) >"$stdout_path" 2>"$stderr_path"; then
         cat "$stdout_path"
         cat "$stderr_path" >&2
@@ -896,11 +979,21 @@ if [[ -f "$worktree_cwd/requirements.txt" ]]; then
     exit 1
   fi
 
+  if ! command -v uv >/dev/null 2>&1; then
+    echo "uv is required to provision Python dependencies for worktree $worktree_cwd but was not found on PATH. Install uv (https://docs.astral.sh/uv/)." >&2
+    exit 1
+  fi
+  export UV_CACHE_DIR="${UV_CACHE_DIR:-$HOME/.cache/uv}"
+  if ! require_same_device "uv cache" "$UV_CACHE_DIR" "$worktree_cwd"; then
+    python_provision_failure "uv cache device check"
+    exit 1
+  fi
+
   venv_dir="$worktree_cwd/.venv"
   venv_python="$venv_dir/bin/python"
   venv_created=0
   if [[ ! -x "$venv_python" ]]; then
-    if ! (cd "$worktree_cwd" && "$python3_command" -m venv "$venv_dir"); then
+    if ! (cd "$worktree_cwd" && uv venv --python "$python3_command" "$venv_dir"); then
       python_provision_failure "venv creation"
       exit 1
     fi
@@ -912,16 +1005,14 @@ if [[ -f "$worktree_cwd/requirements.txt" ]]; then
     exit 1
   fi
 
-  if ! "$venv_python" -m pip --version; then
-    python_provision_failure "pip bootstrap"
-    exit 1
-  fi
-
   interpreter_version=""
   if ! interpreter_version="$("$venv_python" --version 2>&1)"; then
     python_provision_failure "interpreter validation"
     exit 1
   fi
+  # Fingerprint format "uv-hardlink-v2": venvs previously installed with pip never
+  # match and are reinstalled in place through uv.
+  interpreter_version="$interpreter_version;installer=$(uv --version);link-mode=hardlink;format=uv-hardlink-v2"
 
   python_install_fingerprint_path="$paperclip_dir/python-install-fingerprint"
   current_python_install_fingerprint="$(compute_python_install_fingerprint "$interpreter_version")"
@@ -936,16 +1027,21 @@ if [[ -f "$worktree_cwd/requirements.txt" ]]; then
       python_install_args+=(-c "$worktree_cwd/constraints.txt")
     fi
 
-    if ! (cd "$worktree_cwd" && "$venv_python" -m pip install "${python_install_args[@]}"); then
-      python_provision_failure "pip install"
+    # An existing venv (e.g. built by pip, whose files are private copies) must be
+    # reinstalled so uv relinks every package from the shared cache.
+    if [[ "$venv_created" -eq 0 ]]; then
+      python_install_args+=(--reinstall)
+    fi
+    if ! (cd "$worktree_cwd" && uv pip install --python "$venv_python" --link-mode hardlink "${python_install_args[@]}"); then
+      python_provision_failure "uv pip install"
       exit 1
     fi
   else
     echo "Skipping unchanged Python dependency install for worktree $worktree_cwd." >&2
   fi
 
-  if ! (cd "$worktree_cwd" && "$venv_python" -m pip check); then
-    python_provision_failure "pip check"
+  if ! (cd "$worktree_cwd" && uv pip check --python "$venv_python"); then
+    python_provision_failure "uv pip check"
     exit 1
   fi
 
@@ -980,4 +1076,6 @@ if [[ "$node_dependencies_provisioned" -eq 0 ]]; then
   done < <(
     list_base_node_modules_paths
   )
+
+  verify_shared_node_modules
 fi

@@ -3,7 +3,6 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import fs from "node:fs/promises";
 import net from "node:net";
-import os from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -4125,6 +4124,30 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
   };
 }
 
+/**
+ * Cleanup was stopped by a condition that may clear on its own (fetch/network
+ * failure, lock contention, transient I/O, busy workspace). Callers must leave
+ * the workspace untouched and retry later; this is NOT a verdict on the data.
+ */
+export class WorkspaceCleanupDeferredError extends Error {}
+
+/**
+ * Cleanup was stopped by a deterministic blocker (dirty tree, unpublished
+ * commits proven by a successful fetch + negative ancestry, forbidden ignored
+ * data, outside worktree dir, ...). Retrying will not help until a human acts.
+ */
+export class WorkspaceCleanupDeterministicError extends Error {}
+
+/** The lifecycle generation changed (reopen) between archive and destruction. */
+export class WorkspaceCleanupGenerationChangedError extends Error {}
+
+function rewrapCleanupError(message: string, cause: unknown): Error {
+  if (cause instanceof WorkspaceCleanupGenerationChangedError) return cause;
+  if (cause instanceof WorkspaceCleanupDeferredError) return new WorkspaceCleanupDeferredError(message);
+  if (cause instanceof WorkspaceCleanupDeterministicError) return new WorkspaceCleanupDeterministicError(message);
+  return new Error(message);
+}
+
 export async function acquireGitWorktreeCleanupLock(worktreePath: string) {
   const branchRef = await runGit(["symbolic-ref", "--quiet", "HEAD"], worktreePath).catch(() => null);
   const rawLocks = await Promise.all([
@@ -4169,7 +4192,7 @@ export async function acquireGitWorktreeCleanupLock(worktreePath: string) {
   } catch (error) {
     await releaseLocks();
     if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      throw new Error("git worktree cleanup lock is already held");
+      throw new WorkspaceCleanupDeferredError("git worktree cleanup lock is already held");
     }
     throw error;
   }
@@ -4190,39 +4213,20 @@ async function deleteGitBranchAtVerifiedTip(input: {
   recorder?: WorkspaceOperationRecorder | null;
   metadata: Record<string, unknown>;
 }) {
-  const commonDirRaw = await runGit(["rev-parse", "--git-common-dir"], input.repoRoot);
-  const commonDir = path.isAbsolute(commonDirRaw)
-    ? commonDirRaw
-    : path.resolve(input.repoRoot, commonDirRaw);
-  const detachedGitDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-branch-delete-"));
-  const detachedWorktree = `${detachedGitDir}-worktree`;
-
-  try {
-    // `git branch -d` refuses branches checked out by another worktree and its
-    // ref transaction fails if the tip changes concurrently. A detached HEAD
-    // at the delivered SHA additionally lets squash/cross-branch deliveries
-    // delete only the exact branch history that was verified before cleanup.
-    await Promise.all([
-      fs.writeFile(path.join(detachedGitDir, "HEAD"), `${input.expectedHeadSha}\n`, "utf8"),
-      fs.writeFile(path.join(detachedGitDir, "commondir"), `${commonDir}\n`, "utf8"),
-    ]);
-    await recordGitOperation(input.recorder, {
-      phase: "worktree_cleanup",
-      args: [
-        `--git-dir=${detachedGitDir}`,
-        `--work-tree=${detachedWorktree}`,
-        "branch",
-        "-d",
-        input.branchName,
-      ],
-      cwd: input.repoRoot,
-      metadata: input.metadata,
-      successMessage: `Deleted branch ${input.branchName}\n`,
-      failureLabel: `git branch -d ${input.branchName}`,
-    });
-  } finally {
-    await fs.rm(detachedGitDir, { recursive: true, force: true }).catch(() => {});
+  const branchRef = `refs/heads/${input.branchName}`;
+  await runGit(["check-ref-format", branchRef], input.repoRoot);
+  const worktrees = await runGit(["worktree", "list", "--porcelain"], input.repoRoot);
+  if (worktrees.split("\n").includes(`branch ${branchRef}`)) {
+    throw new Error(`Cannot delete branch "${input.branchName}": it is still checked out in a worktree.`);
   }
+  await recordGitOperation(input.recorder, {
+    phase: "worktree_cleanup",
+    args: ["update-ref", "-d", branchRef, input.expectedHeadSha],
+    cwd: input.repoRoot,
+    metadata: input.metadata,
+    successMessage: `Deleted branch ${input.branchName} at ${input.expectedHeadSha}\n`,
+    failureLabel: `git update-ref -d ${branchRef} ${input.expectedHeadSha}`,
+  });
 }
 
 export async function cleanupExecutionWorkspaceArtifacts(input: {
@@ -4248,7 +4252,9 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
   recorder?: WorkspaceOperationRecorder | null;
   assertSafeToCleanup?: (() => Promise<void>) | null;
   beforeBranchDelete?: (() => Promise<void>) | null;
+  beforeWorktreeRemoval?: (() => Promise<void>) | null;
   expectedBranchHeadSha?: string | null;
+  verifiedMergedPullRequestHeadSha?: string | null;
   runCleanupCommands?: boolean;
   forceWorktreeRemoval?: boolean;
 }) {
@@ -4278,12 +4284,63 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
       warnings.push(`Could not read worktree instance pointer: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
-  // Local-directory ownership keeps the historical createdByRuntime signal.
-  // Git branch deletion additionally requires the version marker introduced
-  // with branch-level ownership semantics. Unmarked legacy rows fail closed:
-  // their worktrees are removable, but their branch refs are operator-owned.
+  // Worktree ownership and branch ownership are separate signals. Neither
+  // custom teardown nor instance cleanup may remove an operator-owned worktree.
   const createdByRuntime = input.workspace.metadata?.createdByRuntime === true;
   const branchCreatedByRuntime = isRuntimeOwnedGitBranch(input.workspace.metadata);
+  const assertGitCleanupDelivery = async () => {
+    if (!repoRoot || !input.workspace.branchName || !input.expectedBranchHeadSha) {
+      throw new Error(`Refusing cleanup of "${workspacePath}": repo root, branch and expected branch SHA are required.`);
+    }
+    const branchRef = `refs/heads/${input.workspace.branchName}`;
+    await runGit(["check-ref-format", branchRef], repoRoot);
+    const currentHead = await runGit(["rev-parse", "--verify", branchRef], repoRoot);
+    if (currentHead !== input.expectedBranchHeadSha) {
+      throw new Error(`Refusing cleanup of "${workspacePath}": branch "${input.workspace.branchName}" changed from ${input.expectedBranchHeadSha} to ${currentHead}.`);
+    }
+    if (input.verifiedMergedPullRequestHeadSha === currentHead) return;
+    const baseRef = input.workspace.baseRef?.trim();
+    if (!baseRef) {
+      throw new Error(`Refusing cleanup of "${workspacePath}": no remote base or verified merged pull request proves delivery.`);
+    }
+    const remoteBase = baseRef.startsWith("refs/remotes/origin/")
+      ? baseRef
+      : baseRef.startsWith("origin/")
+        ? `refs/remotes/${baseRef}`
+        : `refs/remotes/origin/${baseRef.replace(/^refs\/heads\//, "")}`;
+    const tracking = parseRemoteTrackingRef(remoteBase);
+    if (!tracking || tracking.remote !== "origin") {
+      throw new Error(`Refusing cleanup of "${workspacePath}": invalid origin base "${baseRef}".`);
+    }
+    await runGit(["check-ref-format", remoteBase], repoRoot);
+    const originUrl = await runGit(["remote", "get-url", "origin"], repoRoot);
+    if (!originUrl.trim()) {
+      throw new Error(`Refusing cleanup of "${workspacePath}": origin is inaccessible.`);
+    }
+    // Cleanup requires a successful fetch, not the best-effort refresh helper's
+    // warnings-only contract (which also permits missing remotes).
+    try {
+      await runGit([
+        "fetch",
+        "--prune",
+        "origin",
+        `+refs/heads/${tracking.branch}:${remoteBase}`,
+      ], repoRoot);
+    } catch (err) {
+      throw new WorkspaceCleanupDeferredError(`Refusing cleanup of "${workspacePath}": could not fetch ${remoteBase} to prove delivery: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    try {
+      await runGit(["merge-base", "--is-ancestor", currentHead, remoteBase], repoRoot);
+    } catch {
+      throw new WorkspaceCleanupDeterministicError(`Refusing cleanup of "${workspacePath}": branch ${currentHead} is not proven delivered to freshly fetched ${remoteBase}.`);
+    }
+  };
+  if (input.workspace.providerType === "git_worktree") {
+    if (!createdByRuntime) {
+      throw new Error(`Refusing cleanup of "${workspacePath}": worktree was not created by the runtime.`);
+    }
+    await assertGitCleanupDelivery();
+  }
   const cleanupCommands = input.runCleanupCommands === false
     ? []
     : [
@@ -4339,6 +4396,9 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
 
   if (worktreeInstancePointer && workspacePath && expectedWorktreeInstanceId) {
     try {
+      // Network delivery proof first, final inspection last.
+      await assertGitCleanupDelivery();
+      await input.assertSafeToCleanup?.();
       const result = await cleanupWorktreeInstanceArtifacts({
         pointer: worktreeInstancePointer,
         workspaceId: input.workspace.id,
@@ -4350,26 +4410,38 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
             : null,
         recorder: input.recorder,
       });
-      if (result.status === "refused") warnings.push(result.warning);
+      if (result.status === "refused") throw new Error(result.warning);
     } catch (err) {
-      warnings.push(`Failed to clean worktree instance: ${err instanceof Error ? err.message : String(err)}`);
+      throw rewrapCleanupError(`Failed to clean worktree instance for "${workspacePath}"; preserve cleanup failure for recovery: ${err instanceof Error ? err.message : String(err)}`, err);
     }
   }
 
   if (input.workspace.providerType === "git_worktree" && workspacePath) {
-    const worktreeExists = await directoryExists(workspacePath);
+    const worktreeExists = await fs.stat(workspacePath).then(() => true).catch((err: NodeJS.ErrnoException) => {
+      if (err.code === "ENOENT") return false;
+      throw new Error(`Cannot inspect git worktree "${workspacePath}"; preserve it for recovery: ${err.message}`);
+    });
     if (worktreeExists) {
       if (!repoRoot) {
         warnings.push(`Could not resolve git repo root for "${workspacePath}".`);
       } else {
         try {
+          // Order matters: the network publication proof (fetch/ancestry) runs
+          // FIRST so the final filesystem/use inspection is the last check
+          // before `git worktree remove`, with no network in between.
+          await assertGitCleanupDelivery();
           await input.assertSafeToCleanup?.();
+          // Cheap last-moment re-check (ignored-data status + generation).
+          // Residual window, stated honestly: non-forced `git worktree remove`
+          // still deletes untracked-ignored files, and git index/HEAD/ref locks
+          // do not stop a process creating an ignored file after this re-check
+          // returns. That window is the few ms between this check and removal.
+          await input.beforeWorktreeRemoval?.();
           await recordGitOperation(input.recorder, {
             phase: "worktree_cleanup",
             args: [
               "worktree",
               "remove",
-              ...(input.forceWorktreeRemoval === false ? [] : ["--force"]),
               workspacePath,
             ],
             cwd: repoRoot,
@@ -4383,7 +4455,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
             failureLabel: `git worktree remove ${workspacePath}`,
           });
         } catch (err) {
-          warnings.push(err instanceof Error ? err.message : String(err));
+          throw rewrapCleanupError(`Failed to remove git worktree "${workspacePath}"; preserve it for recovery: ${err instanceof Error ? err.message : String(err)}`, err);
         }
       }
     }
@@ -4393,33 +4465,24 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
       } else {
         try {
           await input.beforeBranchDelete?.();
+          await assertGitCleanupDelivery();
           const metadata = {
             workspaceId: input.workspace.id,
             workspacePath,
             branchName: input.workspace.branchName,
             cleanupAction: "branch_delete",
           };
-          if (input.expectedBranchHeadSha) {
-            await deleteGitBranchAtVerifiedTip({
-              repoRoot,
-              branchName: input.workspace.branchName,
-              expectedHeadSha: input.expectedBranchHeadSha,
-              recorder: input.recorder,
-              metadata,
-            });
-          } else {
-            await recordGitOperation(input.recorder, {
-              phase: "worktree_cleanup",
-              args: ["branch", "-d", input.workspace.branchName],
-              cwd: repoRoot,
-              metadata,
-              successMessage: `Deleted branch ${input.workspace.branchName}\n`,
-              failureLabel: `git branch -d ${input.workspace.branchName}`,
-            });
-          }
+          await deleteGitBranchAtVerifiedTip({
+            repoRoot,
+            branchName: input.workspace.branchName,
+            expectedHeadSha: input.expectedBranchHeadSha!,
+            recorder: input.recorder,
+            metadata,
+          });
         } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          warnings.push(`Skipped deleting branch "${input.workspace.branchName}": ${message}`);
+          // The worktree is already gone here, so never classify as deferred: a
+          // retry/restore-active would point at a removed directory.
+          throw new Error(`Failed to delete branch "${input.workspace.branchName}" for "${workspacePath}"; preserve cleanup failure for recovery: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
     }

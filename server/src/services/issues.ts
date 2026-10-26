@@ -11050,6 +11050,70 @@ export function issueService(db: Db) {
             }
           }
           if (updated.status === "done" || updated.status === "cancelled") {
+            // Mark the source issue's live workspaces cleanup-eligible in the
+            // same transaction as the terminal status write. Each row is
+            // handled under the same per-workspace lifecycle advisory lock the
+            // reopen and cleanup paths use (locks taken in id order), and the
+            // issue status and row state are re-read under the lock so a
+            // concurrent reopen is never marked.
+            const candidateRows = await tx
+              .select({ id: executionWorkspaces.id })
+              .from(executionWorkspaces)
+              .where(
+                and(
+                  eq(executionWorkspaces.companyId, updated.companyId),
+                  eq(executionWorkspaces.sourceIssueId, updated.id),
+                  inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+                  isNull(executionWorkspaces.closedAt),
+                ),
+              )
+              .orderBy(executionWorkspaces.id);
+            for (const candidate of candidateRows) {
+              await tx.execute(
+                sql`select pg_advisory_xact_lock(hashtextextended(${`execution_workspace_lifecycle:${candidate.id}`}, 0))`,
+              );
+              const [freshIssue] = await tx
+                .select({ status: issues.status })
+                .from(issues)
+                .where(and(eq(issues.id, updated.id), eq(issues.companyId, updated.companyId)))
+                .limit(1);
+              if (freshIssue?.status !== "done" && freshIssue?.status !== "cancelled") continue;
+              const [marked] = await tx
+                .update(executionWorkspaces)
+                .set({
+                  cleanupEligibleAt: sql`coalesce(${executionWorkspaces.cleanupEligibleAt}, now())`,
+                  cleanupReason: "issue_terminal",
+                  updatedAt: new Date(),
+                })
+                .where(
+                  and(
+                    eq(executionWorkspaces.id, candidate.id),
+                    eq(executionWorkspaces.companyId, updated.companyId),
+                    eq(executionWorkspaces.sourceIssueId, updated.id),
+                    inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+                    isNull(executionWorkspaces.closedAt),
+                  ),
+                )
+                .returning({ id: executionWorkspaces.id });
+              if (!marked) continue;
+              await logActivity(tx as unknown as Db, {
+                companyId: updated.companyId,
+                actorType: actorAgentId ? "agent" : actorUserId ? "user" : "system",
+                actorId: actorAgentId ?? actorUserId ?? "issue_service",
+                agentId: actorAgentId ?? null,
+                action: "execution_workspace.marked_cleanup_eligible",
+                entityType: "execution_workspace",
+                entityId: candidate.id,
+                details: {
+                  sourceIssueId: updated.id,
+                  previousIssueStatus: existing.status,
+                  nextIssueStatus: updated.status,
+                  cleanupReason: "issue_terminal",
+                },
+              });
+            }
+          }
+          if (updated.status === "done" || updated.status === "cancelled") {
             await finalizeSummarySlotsForTerminalIssue(tx, updated);
             // Every terminal transition funnels through here, including direct
             // service callers (tree control, recovery, pipelines, status cards)

@@ -22950,7 +22950,19 @@ export function heartbeatService(
                 })
               : null;
       } catch (error) {
-        if (executionWorkspace.created) {
+        if (executionWorkspace.created && executionWorkspace.strategy === "git_worktree") {
+          // A freshly created, unpersisted git worktree has no terminal state,
+          // delivery proof or verified branch tip. Preserve it for recovery.
+          logger.warn(
+            {
+              runId: run.id,
+              issueId,
+              executionWorkspaceCwd: executionWorkspace.cwd,
+              branchName: executionWorkspace.branchName,
+            },
+            "Preserved realized git worktree after persistence failure; safe cleanup proof is unavailable",
+          );
+        } else if (executionWorkspace.created) {
           try {
             await cleanupExecutionWorkspaceArtifacts({
               workspace: {

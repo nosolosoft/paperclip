@@ -180,6 +180,15 @@ async function createTempRepo(defaultBranch = "main") {
   return repoRoot;
 }
 
+/** Give a temp repo a local bare `origin` that already has its base branch pushed. */
+async function addPushedOrigin(repoRoot: string, branch = "main") {
+  const bare = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-origin-"));
+  await runGit(bare, ["init", "--bare"]);
+  await runGit(repoRoot, ["remote", "add", "origin", bare]);
+  await runGit(repoRoot, ["push", "origin", `${branch}:${branch}`]);
+  return bare;
+}
+
 async function expectPersistedBranchMismatchRejected(input: {
   repoRoot: string;
   worktreePath: string;
@@ -4313,6 +4322,7 @@ it("repairs a stale project-primary shared workspace by returning to the current
 
   it("removes a created git worktree and branch during cleanup", async () => {
     const repoRoot = await createTempRepo();
+    await addPushedOrigin(repoRoot);
 
     const workspace = await realizeExecutionWorkspace({
       base: {
@@ -4344,6 +4354,7 @@ it("repairs a stale project-primary shared workspace by returning to the current
     expect(workspace.branchCreatedByRuntime).toBe(true);
 
     const cleanup = await cleanupExecutionWorkspaceArtifacts({
+      expectedBranchHeadSha: await readGit(workspace.cwd, ["rev-parse", "HEAD"]),
       workspace: {
         id: "execution-workspace-1",
         cwd: workspace.cwd,
@@ -4351,7 +4362,7 @@ it("repairs a stale project-primary shared workspace by returning to the current
         providerRef: workspace.worktreePath,
         branchName: workspace.branchName,
         repoUrl: workspace.repoUrl,
-        baseRef: workspace.repoRef,
+        baseRef: "main",
         projectId: workspace.projectId,
         projectWorkspaceId: workspace.workspaceId,
         sourceIssueId: "issue-1",
@@ -4378,6 +4389,7 @@ it("repairs a stale project-primary shared workspace by returning to the current
 
   it("deletes a runtime-created branch at its verified tip after a reuse realization", async () => {
     const repoRoot = await createTempRepo();
+    await addPushedOrigin(repoRoot);
     const realizationInput = {
       base: {
         baseCwd: repoRoot,
@@ -4427,7 +4439,7 @@ it("repairs a stale project-primary shared workspace by returning to the current
         providerRef: reused.worktreePath,
         branchName: reused.branchName,
         repoUrl: reused.repoUrl,
-        baseRef: reused.repoRef,
+        baseRef: "main",
         projectId: reused.projectId,
         projectWorkspaceId: reused.workspaceId,
         sourceIssueId: "issue-reused-cleanup",
@@ -4455,6 +4467,7 @@ it("repairs a stale project-primary shared workspace by returning to the current
 
   it("keeps a runtime-created branch when its tip changes after guarded worktree removal", async () => {
     const repoRoot = await createTempRepo();
+    await addPushedOrigin(repoRoot);
     const workspace = await realizeExecutionWorkspace({
       base: {
         baseCwd: repoRoot,
@@ -4487,7 +4500,7 @@ it("repairs a stale project-primary shared workspace by returning to the current
     await runGit(repoRoot, ["commit", "-m", "Raced branch update"]);
     const racedHeadSha = await readGit(repoRoot, ["rev-parse", "HEAD"]);
 
-    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+    await expect(cleanupExecutionWorkspaceArtifacts({
       workspace: {
         id: "execution-workspace-1",
         cwd: workspace.cwd,
@@ -4495,7 +4508,7 @@ it("repairs a stale project-primary shared workspace by returning to the current
         providerRef: workspace.worktreePath,
         branchName: workspace.branchName,
         repoUrl: workspace.repoUrl,
-        baseRef: workspace.repoRef,
+        baseRef: "main",
         projectId: workspace.projectId,
         projectWorkspaceId: workspace.workspaceId,
         sourceIssueId: "issue-1",
@@ -4509,16 +4522,16 @@ it("repairs a stale project-primary shared workspace by returning to the current
       beforeBranchDelete: async () => {
         await runGit(repoRoot, ["update-ref", `refs/heads/${workspace.branchName}`, racedHeadSha]);
       },
-    });
+    })).rejects.toThrow(/changed from/);
 
-    expect(cleanup.cleaned).toBe(true);
-    expect(cleanup.warnings).toHaveLength(1);
-    expect(cleanup.warnings[0]).toContain(`Skipped deleting branch "${workspace.branchName}"`);
+    // The raced tip is never deleted; the guarded worktree removal already happened.
+    await expect(fs.stat(workspace.cwd)).rejects.toThrow();
     expect(await readGit(repoRoot, ["rev-parse", `refs/heads/${workspace.branchName}`])).toBe(racedHeadSha);
   });
 
   it("keeps an unmerged runtime-created branch and warns instead of force deleting it", async () => {
     const repoRoot = await createTempRepo();
+    await addPushedOrigin(repoRoot);
 
     const workspace = await realizeExecutionWorkspace({
       base: {
@@ -4551,7 +4564,7 @@ it("repairs a stale project-primary shared workspace by returning to the current
     await runGit(workspace.cwd, ["add", "unmerged.txt"]);
     await runGit(workspace.cwd, ["commit", "-m", "Keep unmerged work"]);
 
-    const cleanup = await cleanupExecutionWorkspaceArtifacts({
+    await expect(cleanupExecutionWorkspaceArtifacts({
       workspace: {
         id: "execution-workspace-1",
         cwd: workspace.cwd,
@@ -4559,7 +4572,7 @@ it("repairs a stale project-primary shared workspace by returning to the current
         providerRef: workspace.worktreePath,
         branchName: workspace.branchName,
         repoUrl: workspace.repoUrl,
-        baseRef: workspace.repoRef,
+        baseRef: "main",
         projectId: workspace.projectId,
         projectWorkspaceId: workspace.workspaceId,
         sourceIssueId: "issue-1",
@@ -4571,11 +4584,11 @@ it("repairs a stale project-primary shared workspace by returning to the current
         cwd: repoRoot,
         cleanupCommand: null,
       },
-    });
+      expectedBranchHeadSha: await readGit(workspace.cwd, ["rev-parse", "HEAD"]),
+    })).rejects.toThrow(/not proven delivered/);
 
-    expect(cleanup.cleaned).toBe(true);
-    expect(cleanup.warnings).toHaveLength(1);
-    expect(cleanup.warnings[0]).toContain(`Skipped deleting branch "${workspace.branchName}"`);
+    // Unpublished work: cleanup is refused and both worktree and branch survive.
+    expect((await fs.stat(workspace.cwd)).isDirectory()).toBe(true);
     await expect(
       execFileAsync("git", ["branch", "--list", workspace.branchName!], { cwd: repoRoot }),
     ).resolves.toMatchObject({
@@ -4585,6 +4598,7 @@ it("repairs a stale project-primary shared workspace by returning to the current
 
   it("records teardown and cleanup operations when a recorder is provided", async () => {
     const repoRoot = await createTempRepo();
+    await addPushedOrigin(repoRoot);
     const { recorder, operations } = createWorkspaceOperationRecorderDouble();
 
     const workspace = await realizeExecutionWorkspace({
@@ -4619,6 +4633,13 @@ it("repairs a stale project-primary shared workspace by returning to the current
     const instanceRoot = path.join(worktreesDir, "instances", instanceId);
     await fs.mkdir(path.join(instanceRoot, "db"), { recursive: true });
     await fs.mkdir(path.join(workspace.cwd, ".paperclip"), { recursive: true });
+    // Non-forced `git worktree remove` refuses untracked files; the pointer env file is ignored local state.
+    const infoDir = path.join(
+      await readGit(workspace.cwd, ["rev-parse", "--git-common-dir"]).then((dir) => path.resolve(workspace.cwd, dir)),
+      "info",
+    );
+    await fs.mkdir(infoDir, { recursive: true });
+    await fs.appendFile(path.join(infoDir, "exclude"), "\n.paperclip/.env\n", "utf8");
     await fs.writeFile(
       path.join(workspace.cwd, ".paperclip", ".env"),
       `PAPERCLIP_HOME=${JSON.stringify(worktreesDir)}\nPAPERCLIP_INSTANCE_ID=${JSON.stringify(instanceId)}\n`,
@@ -4627,6 +4648,7 @@ it("repairs a stale project-primary shared workspace by returning to the current
     process.env.PAPERCLIP_WORKTREES_DIR = worktreesDir;
 
     await cleanupExecutionWorkspaceArtifacts({
+      expectedBranchHeadSha: await readGit(workspace.cwd, ["rev-parse", "HEAD"]),
       workspace: {
         id: "execution-workspace-1",
         cwd: workspace.cwd,
@@ -4634,7 +4656,7 @@ it("repairs a stale project-primary shared workspace by returning to the current
         providerRef: workspace.worktreePath,
         branchName: workspace.branchName,
         repoUrl: workspace.repoUrl,
-        baseRef: workspace.repoRef,
+        baseRef: "main",
         projectId: workspace.projectId,
         projectWorkspaceId: workspace.workspaceId,
         sourceIssueId: "issue-1",
@@ -4673,6 +4695,7 @@ it("repairs a stale project-primary shared workspace by returning to the current
 
   it("records skipped repo-managed cleanup and teardown commands without warnings", async () => {
     const repoRoot = await createTempRepo();
+    await addPushedOrigin(repoRoot);
     const { recorder, operations } = createWorkspaceOperationRecorderDouble();
     const workspace = await realizeExecutionWorkspace({
       base: {
@@ -4702,6 +4725,7 @@ it("repairs a stale project-primary shared workspace by returning to the current
     });
 
     const cleanup = await cleanupExecutionWorkspaceArtifacts({
+      expectedBranchHeadSha: await readGit(workspace.cwd, ["rev-parse", "HEAD"]),
       workspace: {
         id: "execution-workspace-1",
         cwd: workspace.cwd,
@@ -4709,7 +4733,7 @@ it("repairs a stale project-primary shared workspace by returning to the current
         providerRef: workspace.worktreePath,
         branchName: workspace.branchName,
         repoUrl: workspace.repoUrl,
-        baseRef: workspace.repoRef,
+        baseRef: "main",
         projectId: workspace.projectId,
         projectWorkspaceId: workspace.workspaceId,
         sourceIssueId: "issue-1",
@@ -4739,6 +4763,7 @@ it("repairs a stale project-primary shared workspace by returning to the current
 
   it("does not execute absent repo-managed cleanup commands without a recorder", async () => {
     const repoRoot = await createTempRepo();
+    await addPushedOrigin(repoRoot);
     const markerPath = path.join(os.tmpdir(), `paperclip-cleanup-should-not-run-${randomUUID()}`);
     const workspace = await realizeExecutionWorkspace({
       base: {
@@ -4768,6 +4793,7 @@ it("repairs a stale project-primary shared workspace by returning to the current
     });
 
     const cleanup = await cleanupExecutionWorkspaceArtifacts({
+      expectedBranchHeadSha: await readGit(workspace.cwd, ["rev-parse", "HEAD"]),
       workspace: {
         id: "execution-workspace-1",
         cwd: workspace.cwd,
@@ -4775,7 +4801,7 @@ it("repairs a stale project-primary shared workspace by returning to the current
         providerRef: workspace.worktreePath,
         branchName: workspace.branchName,
         repoUrl: workspace.repoUrl,
-        baseRef: workspace.repoRef,
+        baseRef: "main",
         projectId: workspace.projectId,
         projectWorkspaceId: workspace.workspaceId,
         sourceIssueId: "issue-1",
@@ -10623,13 +10649,11 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
     expect(workspace.created).toBe(true);
     expect(workspace.branchCreatedByRuntime).toBe(false);
 
-    const cleanup = await cleanupExecutionWorkspaceArtifacts(
-      cleanupWorkspaceInput(workspace, repoRoot, branchTip),
-    );
+    await expect(
+      cleanupExecutionWorkspaceArtifacts(cleanupWorkspaceInput(workspace, repoRoot, branchTip)),
+    ).rejects.toThrow(/worktree was not created by the runtime/);
 
-    expect(cleanup.cleaned).toBe(true);
-    expect(cleanup.warnings).toEqual([]);
-    await expect(fs.stat(workspace.cwd)).rejects.toThrow();
+    expect((await fs.stat(workspace.cwd)).isDirectory()).toBe(true);
     expect(await readGit(repoRoot, ["rev-parse", "refs/heads/feature/operator-owned"])).toBe(branchTip);
   });
 
@@ -10641,6 +10665,7 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
 
     const cleanup = await cleanupExecutionWorkspaceArtifacts({
       ...cleanupInput,
+      verifiedMergedPullRequestHeadSha: branchTip,
       workspace: {
         ...cleanupInput.workspace,
         metadata: { createdByRuntime: true },
@@ -10689,13 +10714,11 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
     expect(workspace.branchCreatedByRuntime).toBe(false);
     expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(branchTip);
 
-    const cleanup = await cleanupExecutionWorkspaceArtifacts(
-      cleanupWorkspaceInput(workspace, repoRoot, branchTip),
-    );
+    await expect(
+      cleanupExecutionWorkspaceArtifacts(cleanupWorkspaceInput(workspace, repoRoot, branchTip)),
+    ).rejects.toThrow(/worktree was not created by the runtime/);
 
-    expect(cleanup.cleaned).toBe(true);
-    expect(cleanup.warnings).toEqual([]);
-    await expect(fs.stat(workspace.cwd)).rejects.toThrow();
+    expect((await fs.stat(workspace.cwd)).isDirectory()).toBe(true);
     expect(await readGit(repoRoot, ["rev-parse", "refs/heads/feature/literal-pin"])).toBe(branchTip);
   });
 

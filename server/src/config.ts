@@ -76,6 +76,7 @@ export interface Config {
   databaseBackupRetentionDays: number;
   databaseBackupDir: string;
   workspaceReaperCooldownDays: number;
+  workspaceReaperDeleteEnabled: boolean;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -275,10 +276,9 @@ export function loadConfig(): Config {
   );
   // The terminal-workspace reaper waits this many days after an issue tree
   // becomes terminal before it archives the workspace. A person can reopen the
-  // work inside this window. A value of 0 disables the cooldown and restores
-  // immediate reaping. A negative or non-numeric value falls back to the
-  // default. The day granularity and the default of 7 obey the
-  // PAPERCLIP_DB_BACKUP_RETENTION_DAYS precedent above.
+  // work inside this window. The default of 0 applies no cooldown. A negative
+  // or non-numeric value falls back to the default. The day granularity obeys
+  // the PAPERCLIP_DB_BACKUP_RETENTION_DAYS precedent above.
   const workspaceReaperCooldownDaysEnv =
     process.env.PAPERCLIP_WORKSPACE_REAPER_COOLDOWN_DAYS?.trim();
   const workspaceReaperCooldownDaysRaw = Number(workspaceReaperCooldownDaysEnv);
@@ -287,7 +287,11 @@ export function loadConfig(): Config {
       && Number.isFinite(workspaceReaperCooldownDaysRaw)
       && workspaceReaperCooldownDaysRaw >= 0
       ? workspaceReaperCooldownDaysRaw
-      : 7;
+      : 0;
+  // Destructive worktree/branch deletion by the reaper is opt-in. Only the
+  // literal value "true" (case-insensitive) enables it.
+  const workspaceReaperDeleteEnabled =
+    process.env.PAPERCLIP_WORKSPACE_REAPER_DELETE_ENABLED?.trim().toLowerCase() === "true";
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -334,6 +338,7 @@ export function loadConfig(): Config {
     databaseBackupRetentionDays,
     databaseBackupDir,
     workspaceReaperCooldownDays,
+    workspaceReaperDeleteEnabled,
     serveUi:
       process.env.SERVE_UI !== undefined
         ? process.env.SERVE_UI === "true"

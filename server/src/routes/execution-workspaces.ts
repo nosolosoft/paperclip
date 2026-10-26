@@ -1189,6 +1189,21 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
         return;
       }
 
+      if (existing.providerType === "git_worktree") {
+        // Read-only terminal preflight BEFORE any state change: archive write,
+        // lease release and issue detach only happen once cleanup is allowed.
+        // The destructive cleanup below still re-runs the full preflight inside
+        // the destruction fence.
+        const assessment = await svc.assessTerminalCleanup(existing.id);
+        if (assessment.busy) {
+          res.status(409).json({
+            error: assessment.reason ?? "Execution workspace cannot be cleaned up right now",
+            terminalCleanup: { busy: true, reason: assessment.reason, deterministic: assessment.deterministic },
+          });
+          return;
+        }
+      }
+
       const closedAt = new Date();
       // Archive under the per-workspace lifecycle lock. The service takes the same
       // lock as a reopen, raises the lifecycle generation, and clears the
@@ -1274,6 +1289,18 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
           workspaceId: id,
           capturedGeneration,
           destroy: async () => {
+            const recorder = workspaceOperationsSvc.createRecorder({
+              companyId: existing.companyId,
+              executionWorkspaceId: existing.id,
+            });
+            const teardownCommand = configForCleanup?.teardownCommand ?? projectPolicy?.workspaceStrategy?.teardownCommand ?? null;
+            const cleanupCommand = configForCleanup?.cleanupCommand ?? null;
+            if (existing.providerType === "git_worktree") {
+              // Git worktrees are destroyed only through the service's unified
+              // preflight (terminal eligibility, branch SHA and delivery proof);
+              // leases and runtime services stay untouched when that refuses.
+              return svc.cleanupTerminalWorkspaceArtifacts(existing.id);
+            }
             await environmentRuntime.destroyReusableSandboxLeases({
               companyId: existing.companyId,
               executionWorkspaceId: existing.id,
@@ -1287,12 +1314,9 @@ export function executionWorkspaceRoutes(db: Db, opts: { pluginWorkerManager?: P
             return cleanupExecutionWorkspaceArtifacts({
               workspace: existing,
               projectWorkspace,
-              teardownCommand: configForCleanup?.teardownCommand ?? projectPolicy?.workspaceStrategy?.teardownCommand ?? null,
-              cleanupCommand: configForCleanup?.cleanupCommand ?? null,
-              recorder: workspaceOperationsSvc.createRecorder({
-                companyId: existing.companyId,
-                executionWorkspaceId: existing.id,
-              }),
+              teardownCommand,
+              cleanupCommand,
+              recorder,
             });
           },
         });

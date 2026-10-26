@@ -1332,6 +1332,7 @@ async function startServerWithDatabaseTeardown(
     });
     const terminalWorkspaces = executionWorkspaceService(db as any, {
       workspaceReaperCooldownDays: config.workspaceReaperCooldownDays,
+      workspaceReaperDeleteEnabled: config.workspaceReaperDeleteEnabled,
     });
     const scheduleMergedPullRequestConfirmationSweep = () => {
       if (heartbeatSchedulerStopped) return;

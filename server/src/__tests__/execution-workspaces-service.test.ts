@@ -974,6 +974,72 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(entry?.reason).toContain(`sub/${directory}`);
   });
 
+  async function seedTrackedLogsWorkspace(ignorePatterns: string[]) {
+    const seeded = await seedAncestryTerminalWorkspace();
+    for (const pattern of ignorePatterns) await ignoreInWorktrees(seeded.worktreePath, pattern);
+    await fs.mkdir(path.join(seeded.worktreePath, "logs"), { recursive: true });
+    await fs.writeFile(path.join(seeded.worktreePath, "logs", "keep.txt"), "tracked\n");
+    await runGit(seeded.worktreePath, ["add", "-f", "logs/keep.txt"]);
+    await runGit(seeded.worktreePath, ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "Track logs file"]);
+    const repoRoot = path.resolve(seeded.worktreePath, "../../..");
+    await runGit(repoRoot, ["merge", "--ff-only", (await readGit(seeded.worktreePath, ["rev-parse", "HEAD"]))!]);
+    await runGit(repoRoot, ["push", "origin", "main"]);
+    return seeded;
+  }
+
+  it.each([false, true])("allows individually listed ignored logs/*.log|jsonl files beside tracked files with dirty=%s", async (dirty) => {
+    const seeded = await seedTrackedLogsWorkspace(["logs/*"]);
+    const jsonlPath = path.join(seeded.worktreePath, "logs", "exam_generation.jsonl");
+    const logPath = path.join(seeded.worktreePath, "logs", "json_recovery.log");
+    await fs.writeFile(jsonlPath, "x".repeat(4096));
+    await fs.writeFile(logPath, "y".repeat(4096));
+    if (dirty) await fs.writeFile(path.join(seeded.worktreePath, "README.md"), "keep local code\n");
+
+    const entry = await inventoryEntryFor(seeded.executionWorkspaceId);
+    expect(entry).toMatchObject({ decision: dirty ? "prune_regenerable" : "delete_tree" });
+    expect(entry?.sizeBytes).toBeGreaterThanOrEqual(8192);
+    await expect(fs.access(jsonlPath)).resolves.toBeUndefined();
+
+    expect(await reaperService({ deleteEnabled: true }).sweepTerminalWorkspaces()).toMatchObject({
+      archived: dirty ? 0 : 1,
+      cleanupFailed: dirty ? 1 : 0,
+    });
+    if (dirty) {
+      await expect(fs.access(jsonlPath)).rejects.toThrow();
+      await expect(fs.access(logPath)).rejects.toThrow();
+      await expect(fs.readFile(path.join(seeded.worktreePath, "logs", "keep.txt"), "utf8")).resolves.toBe("tracked\n");
+      await expect(fs.access(path.join(seeded.worktreePath, "README.md"))).resolves.toBeUndefined();
+    } else {
+      await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
+    }
+  });
+
+  it.each([
+    ["logs/foo.txt", false],
+    ["logs/x/y.log", false],
+    [".env", false],
+    ["data.db", false],
+    ["logs/link.log", true],
+  ])("still blocks %s beside allowlisted logs files and leaves files untouched", async (rel, isSymlink) => {
+    const seeded = await seedTrackedLogsWorkspace(["logs/*", ".env", "*.db"]);
+    const root = seeded.worktreePath;
+    const okPath = path.join(root, "logs", "exam_generation.jsonl");
+    await fs.writeFile(okPath, "ok\n");
+    const target = path.join(root, rel);
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    if (isSymlink) await fs.symlink("../README.md", target);
+    else await fs.writeFile(target, "data\n");
+
+    const entry = await inventoryEntryFor(seeded.executionWorkspaceId);
+    expect(entry).toMatchObject({ decision: "blocked" });
+    expect(entry?.reason).toMatch(/Valuable or unknown ignored data|symlink/i);
+
+    expect(await reaperService({ deleteEnabled: true }).sweepTerminalWorkspaces()).toMatchObject({ archived: 0 });
+    await expect(fs.readFile(okPath, "utf8")).resolves.toBe("ok\n");
+    if (isSymlink) await expect(fs.readlink(target)).resolves.toBe("../README.md");
+    else await expect(fs.readFile(target, "utf8")).resolves.toBe("data\n");
+  });
+
   it.each([false, true])("allows internal upload snapshot symlinks with dirty=%s", async (dirty) => {
     const seeded = await seedAncestryTerminalWorkspace();
     await ignoreInWorktrees(seeded.worktreePath, "uploads");

@@ -196,7 +196,9 @@ async function containerProcessUse(
   id: string,
   mounts: DockerMount[],
 ): Promise<string | null> {
-  const script = 'for p in /proc/[0-9]*; do readlink "$p/cwd"; readlink "$p"/fd/*; done 2>/dev/null';
+  // Trailing `true`: the loop's status is that of its last readlink, which is non-zero for
+  // unreadable fds/exited pids. Only a failing `docker exec` itself (125-127) means "cannot inspect".
+  const script = 'for p in /proc/[0-9]*; do readlink "$p/cwd"; readlink "$p"/fd/*; done 2>/dev/null; true';
   const out = await deps.docker(["exec", id, "sh", "-c", script]);
   const byDestination = mounts
     .filter((m): m is DockerMount & { destination: string } => m.destination !== null)

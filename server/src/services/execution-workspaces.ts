@@ -1657,6 +1657,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       if (!absolute.startsWith(`${cwd}${path.sep}`)) return { reason: `Ignored path escapes workspace: ${relative}`, regenerable };
       const stat = await fs.lstat(absolute);
       if (stat.isSymbolicLink()) return { reason: `Ignored symlink requires preservation: ${relative}`, regenerable };
+      // `logs/` holds tracked files, so git lists its ignored files individually.
+      // Only regular *.log / *.jsonl files directly under top-level logs/ are disposable.
+      if (/^logs\/[^/]+\.(?:log|jsonl)$/.test(relative) && stat.isFile()) {
+        regenerable.push(absolute);
+        continue;
+      }
       const topLevel = !relative.includes("/");
       const name = path.basename(relative);
       const allowed =
@@ -1752,10 +1758,14 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   }
 
   async function pruneRegenerable(workspace: ExecutionWorkspaceRow, directories: string[]) {
-    for (const directory of directories) {
-      const stat = await fs.lstat(directory);
-      if (!stat.isDirectory() || stat.isSymbolicLink() || !workspace.cwd || !(await fs.realpath(directory)).startsWith(`${await fs.realpath(workspace.cwd)}${path.sep}`)) throw conflict(`Regenerable directory changed during cleanup: ${directory}`);
-      await fs.rm(directory, { recursive: true });
+    for (const entry of directories) {
+      const stat = await fs.lstat(entry);
+      if (stat.isSymbolicLink() || !workspace.cwd) throw conflict(`Regenerable entry changed during cleanup: ${entry}`);
+      const real = await fs.realpath(entry);
+      if (!real.startsWith(`${await fs.realpath(workspace.cwd)}${path.sep}`)) throw conflict(`Regenerable entry changed during cleanup: ${entry}`);
+      if (stat.isDirectory()) await fs.rm(entry, { recursive: true });
+      else if (stat.isFile() && /\/logs\/[^/]+\.(?:log|jsonl)$/.test(entry)) await fs.unlink(entry);
+      else throw conflict(`Regenerable entry changed during cleanup: ${entry}`);
     }
   }
 

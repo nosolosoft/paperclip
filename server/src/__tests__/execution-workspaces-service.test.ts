@@ -668,7 +668,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       beforeTerminalWorkspaceCleanup: async () => { busy = true; },
     });
 
-    expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, cleanupFailed: 0, skippedReopened: 1 });
+    expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, cleanupFailed: 0, skippedDeferred: 1 });
     expect(busy).toBe(true);
     expect(await readReaperWorkspace(seeded.executionWorkspaceId)).toMatchObject({ status: "active", closedAt: null });
     await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
@@ -718,6 +718,38 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     });
   }
 
+  it("fails a non-owned local_fs workspace once without any git or external-use inspection", async () => {
+    const seeded = await seedAncestryTerminalWorkspace();
+    await db.update(executionWorkspaces)
+      .set({ providerType: "local_fs", metadata: { createdByRuntime: true } })
+      .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
+    const inspectExternal = vi.fn(async () => ({ busy: false, reason: null }));
+    const inspectGit = vi.fn(async () => ({ git: null, warnings: [] }));
+    const service = executionWorkspaceService(db, {
+      workspaceReaperDeleteEnabled: true,
+      workspaceReaperCooldownDays: 0,
+      inspectExternalWorkspaceUse: inspectExternal,
+      inspectGitCloseReadiness: inspectGit,
+    });
+    const gitSpy = vi.spyOn(workspaceGitOperationScheduler, "run");
+
+    try {
+      expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, cleanupFailed: 1, skippedDeferred: 0, skippedReopened: 0 });
+      const failed = await readReaperWorkspace(seeded.executionWorkspaceId);
+      expect(failed).toMatchObject({ status: "cleanup_failed", cleanupReason: "Workspace was not created by the runtime as a git worktree" });
+      expect(inspectExternal).not.toHaveBeenCalled();
+      expect(inspectGit).not.toHaveBeenCalled();
+      expect(gitSpy).not.toHaveBeenCalled();
+
+      expect(await service.sweepTerminalWorkspaces()).toMatchObject({ checked: 0, cleanupFailed: 0, skippedDeferred: 0 });
+      expect(await readReaperWorkspace(seeded.executionWorkspaceId)).toMatchObject({ status: "cleanup_failed", cleanupReason: failed.cleanupReason });
+      expect(inspectExternal).not.toHaveBeenCalled();
+      await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
+    } finally {
+      gitSpy.mockRestore();
+    }
+  });
+
   it("defers without writes when the external-use inspector throws", async () => {
     const seeded = await seedAncestryTerminalWorkspace();
     const service = reaperService({
@@ -728,7 +760,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     const sweep = await service.sweepTerminalWorkspaces();
     const row = await readReaperWorkspace(seeded.executionWorkspaceId);
 
-    expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, skippedReopened: 1 });
+    expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, skippedDeferred: 1 });
     expect(row).toMatchObject({ status: "active", closedAt: null });
     await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
   });
@@ -740,7 +772,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       inspect: async () => ({ busy: true, reason: "inspection_failed: docker CLI missing" }),
     });
 
-    expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, cleanupFailed: 0, skippedReopened: 1 });
+    expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, cleanupFailed: 0, skippedDeferred: 1 });
     expect(await readReaperWorkspace(seeded.executionWorkspaceId)).toMatchObject({ status: "active", closedAt: null });
     await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
   });
@@ -774,7 +806,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
 
     const sweep = await service.sweepTerminalWorkspaces();
 
-    expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, skippedReopened: 1 });
+    expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, skippedDeferred: 1 });
     expect(await readReaperWorkspace(seeded.executionWorkspaceId)).toMatchObject({ status: "active", closedAt: null });
     await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
   }, 20_000);
@@ -1276,7 +1308,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       inspectExternalWorkspaceUse: async () => { throw new Error("external inspection unavailable"); },
     });
 
-    expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, cleanupFailed: 0, skippedReopened: 1 });
+    expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, cleanupFailed: 0, skippedDeferred: 1 });
     expect(await readReaperWorkspace(seeded.executionWorkspaceId)).toMatchObject({ status: "active", closedAt: null });
     await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
   });
@@ -1339,7 +1371,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       });
 
       const sweep = await svc.sweepTerminalWorkspaces();
-      expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, skippedReopened: 1 });
+      expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, skippedDeferred: 1 });
       const [workspace] = await db
         .select({ status: executionWorkspaces.status })
         .from(executionWorkspaces)
@@ -1364,7 +1396,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
 
     try {
       const sweep = await svc.sweepTerminalWorkspaces();
-      expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, skippedReopened: 1 });
+      expect(sweep).toMatchObject({ archived: 0, cleanupFailed: 0, skippedDeferred: 1 });
       expect(await readReaperWorkspace(seeded.executionWorkspaceId)).toMatchObject({ status: "active", closedAt: null });
       await expect(fs.access(seeded.worktreePath)).resolves.toBeUndefined();
     } finally {
@@ -2084,7 +2116,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
 
     // The live run holds the fence, so the sweep skips the workspace and keeps
     // the flag. It clears nothing.
-    expect(sweep).toMatchObject({ archived: 0, skippedReopened: 1, clearedStaleReopenPending: 0 });
+    expect(sweep).toMatchObject({ archived: 0, skippedDeferred: 1, skippedReopened: 0, clearedStaleReopenPending: 0 });
     expect(workspace?.status).toBe("active");
     expect(metadataHasReopenPendingConsumption(workspace?.metadata as Record<string, unknown> | null)).toBe(true);
     // The rebuilt worktree is intact.
@@ -2644,7 +2676,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       ]));
     const byId = new Map(rows.map((row) => [row.id, row]));
 
-    expect(result).toMatchObject({ archived: 1, cleanupFailed: 1, skippedReopened: 1, skippedNonTerminalTree: 1 });
+    expect(result).toMatchObject({ archived: 1, cleanupFailed: 1, skippedDeferred: 1, skippedReopened: 0, skippedNonTerminalTree: 1 });
     expect(byId.get(eligible.executionWorkspaceId)).toMatchObject({ status: "archived", cleanupReason: "issue_terminal" });
     expect(byId.get(eligible.executionWorkspaceId)?.cleanupEligibleAt).toBeInstanceOf(Date);
     expect(byId.get(activeRun.executionWorkspaceId)?.status).toBe("active");

@@ -1373,6 +1373,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   // removes the upper bound and makes the scan chase newer churn again. This
   // flag lets only one sweep run at a time, so one sweep owns the shared state.
   let terminalSweepInProgress = false;
+  const deferredInfoLoggedAt = new Map<string, number>();
+  const DEFERRED_INFO_LOG_INTERVAL_MS = 60 * 60 * 1000;
+  const NOT_RUNTIME_OWNED_REASON = "Workspace was not created by the runtime as a git worktree";
+  const isRuntimeOwnedGitWorktree = (workspace: Pick<ExecutionWorkspaceRow, "metadata" | "providerType">) =>
+    workspace.metadata?.createdByRuntime === true && workspace.providerType === "git_worktree";
 
   async function listWorkspaceIssueTree(workspace: Pick<ExecutionWorkspaceRow, "companyId" | "sourceIssueId">) {
     if (!workspace.sourceIssueId) return [];
@@ -1716,6 +1721,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   ): Promise<CleanupPreflight> {
     const blocked = (reason: string, busy = false): CleanupPreflight => ({ busy, reason, regenerable: [] });
     if (workspace.metadata?.cleanupProtected === true) return blocked("Workspace is cleanupProtected", true);
+    if (!isRuntimeOwnedGitWorktree(workspace)) return blocked(NOT_RUNTIME_OWNED_REASON);
     let external: { busy: boolean; reason: string | null };
     if (!workspace.cwd) return blocked("Workspace path is missing");
     try {
@@ -1724,7 +1730,6 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       return blocked(`inspection_failed: ${error instanceof Error ? error.message : String(error)}`, true);
     }
     if (external.busy) return blocked(external.reason ?? "Workspace is in use", true);
-    if (workspace.metadata?.createdByRuntime !== true || workspace.providerType !== "git_worktree") return blocked("Workspace was not created by the runtime as a git worktree");
     if (!workspace.cwd) return blocked("Workspace path is missing");
     if (!(await pathExists(workspace.cwd))) return blocked(`Workspace path does not exist: ${workspace.cwd}`);
     if (scope === "terminal") {
@@ -3100,7 +3105,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         return {
           checked: 0, eligible: 0, archived: 0, cleanupFailed: 0,
           skippedActiveRun: 0, skippedNonTerminalTree: 0, skippedUndelivered: 0,
-          skippedRace: 0, skippedReopened: 0, skippedCooldown: 0, clearedStaleReopenPending: 0,
+          skippedRace: 0, skippedReopened: 0, skippedDeferred: 0, skippedCooldown: 0, clearedStaleReopenPending: 0,
         };
       }
       terminalSweepInProgress = true;
@@ -3149,12 +3154,65 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         skippedUndelivered: 0,
         skippedRace: 0,
         skippedReopened: 0,
+        skippedDeferred: 0,
         skippedCooldown: 0,
         clearedStaleReopenPending: 0,
       };
 
+      const deferLogCutoffMs = now().getTime() - DEFERRED_INFO_LOG_INTERVAL_MS;
+      for (const [id, loggedAt] of deferredInfoLoggedAt) {
+        if (loggedAt <= deferLogCutoffMs) deferredInfoLoggedAt.delete(id);
+      }
       for (const workspace of candidates) {
         const executionWorkspace = toExecutionWorkspace(workspace);
+        // Ownership gate: runs before any git or external-use inspection so a
+        // workspace the runtime did not create as a git worktree is never probed.
+        if (!isRuntimeOwnedGitWorktree(workspace)) {
+          const tree = await listWorkspaceIssueTree(workspace);
+          const source = tree.find((issue) => issue.id === workspace.sourceIssueId) ?? null;
+          const treeTerminal = Boolean(source && tree.every((issue) => TERMINAL_ISSUE_STATUSES.has(issue.status)));
+          const unownedReopenPending = metadataHasReopenPendingConsumption(
+            workspace.metadata as Record<string, unknown> | null,
+          );
+          const unownedGeneration = readExecutionWorkspaceLifecycleGeneration(workspace.metadata);
+          if (!treeTerminal) {
+            if (unownedReopenPending) {
+              await clearReopenPendingConsumptionUnderLock(workspace.id, { expectedGeneration: unownedGeneration });
+            }
+            result.skippedNonTerminalTree += 1;
+            continue;
+          }
+          if (workspace.metadata?.cleanupProtected === true) {
+            result.skippedDeferred += 1;
+            continue;
+          }
+          if (unownedReopenPending) {
+            const pendingSince = readMetadataReopenPendingConsumptionSince(
+              workspace.metadata as Record<string, unknown> | null,
+            );
+            const staleBefore = new Date(now().getTime() - STALE_REOPEN_PENDING_CONSUMPTION_GRACE_MS);
+            if (pendingSince !== null && pendingSince.getTime() > staleBefore.getTime()) {
+              result.skippedReopened += 1;
+              continue;
+            }
+          }
+          if (!opts.workspaceReaperDeleteEnabled) {
+            logger.info({ executionWorkspaceId: workspace.id, cwd: workspace.cwd, reason: NOT_RUNTIME_OWNED_REASON }, "Workspace reaper dry-run decision");
+            result.skippedUndelivered += 1;
+            continue;
+          }
+          await fenceLifecycleGenerationWrite({
+            workspaceId: workspace.id, expectedGeneration: unownedGeneration,
+            isWriteTarget: (fresh) => fresh.status !== "archived" && fresh.closedAt === null,
+            onSkip: () => undefined,
+            write: async ({ tx }) => {
+              await tx.update(executionWorkspaces).set({ status: "cleanup_failed", cleanupReason: NOT_RUNTIME_OWNED_REASON, updatedAt: now() }).where(eq(executionWorkspaces.id, workspace.id));
+              await logActivity(tx as unknown as Db, { companyId: workspace.companyId, actorType: "system", actorId: "workspace-reaper", action: "execution_workspace.cleanup_failed", entityType: "execution_workspace", entityId: workspace.id, details: { reason: NOT_RUNTIME_OWNED_REASON, cwd: workspace.cwd } });
+            },
+          });
+          result.cleanupFailed += 1;
+          continue;
+        }
         const { git, statusInspectionSucceeded } = await inspectGitCloseReadiness(executionWorkspace);
         const assessment = await assessDelivery(workspace, git);
         const reopenPending = metadataHasReopenPendingConsumption(
@@ -3178,11 +3236,16 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         }
         const expectedGeneration = readExecutionWorkspaceLifecycleGeneration(workspace.metadata);
         const deferWorkspace = (reason: string | null) => {
-          result.skippedReopened += 1;
-          logger.info(
-            { event: "execution_workspace.cleanup_deferred", executionWorkspaceId: workspace.id, cwd: workspace.cwd, reason },
-            "Workspace reaper deferred cleanup; retrying next sweep",
-          );
+          result.skippedDeferred += 1;
+          const nowMs = now().getTime();
+          const lastLoggedAt = deferredInfoLoggedAt.get(workspace.id);
+          const fields = { event: "execution_workspace.cleanup_deferred", executionWorkspaceId: workspace.id, cwd: workspace.cwd, reason };
+          if (lastLoggedAt === undefined || nowMs - lastLoggedAt >= DEFERRED_INFO_LOG_INTERVAL_MS) {
+            deferredInfoLoggedAt.set(workspace.id, nowMs);
+            logger.info(fields, "Workspace reaper deferred cleanup; retrying next sweep");
+          } else {
+            logger.debug(fields, "Workspace reaper deferred cleanup; retrying next sweep");
+          }
         };
         // Classify the outcome BEFORE any write. A deferred outcome (git status
         // unverifiable, inspection failed, workspace busy) leaves the row
@@ -3478,11 +3541,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
                 await tx.update(executionWorkspaces).set({ status: "active", closedAt: null, cleanupReason: message, updatedAt: now() }).where(eq(executionWorkspaces.id, archived.id));
               },
             });
-            logger.info(
-              { event: "execution_workspace.cleanup_deferred", executionWorkspaceId: archived.id, cwd: archived.cwd, reason: message },
-              "Workspace reaper deferred cleanup after archive; restored to active",
-            );
-            result.skippedReopened += 1;
+            deferWorkspace(message);
             continue;
           }
           await logArchived();

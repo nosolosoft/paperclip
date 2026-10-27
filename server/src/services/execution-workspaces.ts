@@ -1549,7 +1549,16 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   type CleanupPreflight = { busy: boolean; reason: string | null; regenerable: string[] };
 
   // Regenerable directory names allowed at any depth.
-  const REGENERABLE_ANYWHERE: Record<string, true> = { ".venv": true, node_modules: true, ".tokensave": true, coverage: true };
+  const REGENERABLE_ANYWHERE: Record<string, true> = {
+    ".venv": true,
+    node_modules: true,
+    ".tokensave": true,
+    coverage: true,
+    ".pytest_cache": true,
+    __pycache__: true,
+    ".mypy_cache": true,
+    ".ruff_cache": true,
+  };
   // Additional names allowed only as exact top-level entries of the workspace.
   const REGENERABLE_TOP_LEVEL: Record<string, true> = {
     ".paperclip-runtime": true,
@@ -1557,7 +1566,52 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     ".gstack": true,
     dist: true,
     "test-results": true,
+    coverage_html: true,
+    htmlcov: true,
+    logs: true,
+    uploads: true,
   };
+  // Allowed directories whose contents are walked: a symlink inside is fine only
+  // when its target stays inside the workspace. .venv/node_modules/.tokensave/
+  // coverage are excluded because virtualenvs legitimately link to system Python.
+  const SYMLINK_CHECKED: Record<string, true> = {
+    ".pytest_cache": true,
+    __pycache__: true,
+    ".mypy_cache": true,
+    ".ruff_cache": true,
+    coverage_html: true,
+    htmlcov: true,
+    logs: true,
+    uploads: true,
+    ".paperclip-runtime": true,
+    ".paperclip": true,
+    ".gstack": true,
+    dist: true,
+    "test-results": true,
+  };
+
+  // Walk a directory with lstat semantics (never following links). Returns the
+  // first symlink whose target leaves the workspace, or null.
+  async function findEscapingSymlink(workspaceRoot: string, directory: string): Promise<string | null> {
+    const entries = await fs.readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isSymbolicLink()) {
+        const raw = await fs.readlink(entryPath);
+        let target = path.resolve(path.dirname(entryPath), raw);
+        try {
+          target = await fs.realpath(entryPath);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+        if (target !== workspaceRoot && !target.startsWith(`${workspaceRoot}${path.sep}`)) return entryPath;
+      } else if (entry.isDirectory()) {
+        const escaping = await findEscapingSymlink(workspaceRoot, entryPath);
+        if (escaping) return escaping;
+      }
+    }
+    return null;
+  }
   const NESTED_REPOSITORIES_DIR = ".paperclip-repositories";
 
   // `.paperclip-repositories` holds full clones. It is only disposable when every
@@ -1613,6 +1667,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       if (topLevel && name === NESTED_REPOSITORIES_DIR) {
         const nested = await nestedRepositoriesUnpublishedReason(absolute);
         if (nested) return { reason: nested, regenerable };
+      }
+      if (Object.hasOwn(SYMLINK_CHECKED, name)) {
+        const escaping = await findEscapingSymlink(cwd, absolute);
+        if (escaping) return { reason: `Ignored symlink escapes workspace: ${path.relative(cwd, escaping)}`, regenerable };
       }
       regenerable.push(absolute);
     }

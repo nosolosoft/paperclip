@@ -890,9 +890,9 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     return inventory.find((entry) => entry.id === executionWorkspaceId);
   }
 
-  it.each([false, true])("treats top-level .paperclip-runtime/.paperclip/.gstack/dist/test-results as prunable with dirty=%s", async (dirty) => {
+  it.each([false, true])("treats top-level runtime/build/coverage/log/upload directories as prunable with dirty=%s", async (dirty) => {
     const seeded = await seedAncestryTerminalWorkspace();
-    const directories = [".paperclip-runtime", ".paperclip", ".gstack", "dist", "test-results"];
+    const directories = [".paperclip-runtime", ".paperclip", ".gstack", "dist", "test-results", "coverage_html", "htmlcov", "logs", "uploads"];
     for (const directory of directories) {
       await ignoreInWorktrees(seeded.worktreePath, directory);
       await fs.mkdir(path.join(seeded.worktreePath, directory), { recursive: true });
@@ -919,6 +919,106 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     } else {
       await expect(fs.access(seeded.worktreePath)).rejects.toThrow();
     }
+  });
+
+  it.each([false, true])("treats Python caches as prunable at any depth with dirty=%s", async (dirty) => {
+    const seeded = await seedAncestryTerminalWorkspace();
+    await fs.mkdir(path.join(seeded.worktreePath, "sub"));
+    await fs.writeFile(path.join(seeded.worktreePath, "sub", "tracked.txt"), "tracked\n");
+    await runGit(seeded.worktreePath, ["add", "sub/tracked.txt"]);
+    await runGit(seeded.worktreePath, ["commit", "-m", "Track cache parent"]);
+    const repoRoot = path.resolve(seeded.worktreePath, "../../..");
+    await runGit(repoRoot, ["merge", "--ff-only", (await readGit(seeded.worktreePath, ["rev-parse", "HEAD"]))!]);
+    await runGit(repoRoot, ["push", "origin", "main"]);
+    const directories = [".pytest_cache", "__pycache__", ".mypy_cache", ".ruff_cache"];
+    for (const directory of directories) {
+      await ignoreInWorktrees(seeded.worktreePath, directory);
+      for (const parent of ["", "sub"]) {
+        const cachePath = path.join(seeded.worktreePath, parent, directory);
+        await fs.mkdir(cachePath);
+        await fs.writeFile(path.join(cachePath, "artifact.txt"), "regenerable\n");
+      }
+    }
+    if (dirty) await fs.writeFile(path.join(seeded.worktreePath, "README.md"), "keep local code\n");
+
+    expect(await inventoryEntryFor(seeded.executionWorkspaceId)).toMatchObject({
+      decision: dirty ? "prune_regenerable" : "delete_tree",
+    });
+    expect(await reaperService({ deleteEnabled: true }).sweepTerminalWorkspaces()).toMatchObject({
+      archived: dirty ? 0 : 1,
+      cleanupFailed: dirty ? 1 : 0,
+    });
+    for (const directory of directories) {
+      for (const parent of ["", "sub"]) {
+        await expect(fs.access(path.join(seeded.worktreePath, parent, directory))).rejects.toThrow();
+      }
+    }
+    if (dirty) await expect(fs.readFile(path.join(seeded.worktreePath, "sub", "tracked.txt"), "utf8")).resolves.toBe("tracked\n");
+  });
+
+  it.each(["logs", "uploads"])("blocks nested sub/%s as valuable or unknown ignored data", async (directory) => {
+    const seeded = await seedAncestryTerminalWorkspace();
+    await ignoreInWorktrees(seeded.worktreePath, directory);
+    await fs.mkdir(path.join(seeded.worktreePath, "sub", directory), { recursive: true });
+    await fs.writeFile(path.join(seeded.worktreePath, "sub", "tracked.txt"), "tracked\n");
+    await runGit(seeded.worktreePath, ["add", "sub/tracked.txt"]);
+    await runGit(seeded.worktreePath, ["commit", "-m", "Track ignored parent"]);
+    const repoRoot = path.resolve(seeded.worktreePath, "../../..");
+    await runGit(repoRoot, ["merge", "--ff-only", (await readGit(seeded.worktreePath, ["rev-parse", "HEAD"]))!]);
+    await runGit(repoRoot, ["push", "origin", "main"]);
+    await fs.writeFile(path.join(seeded.worktreePath, "sub", directory, "valuable.txt"), "keep\n");
+
+    const entry = await inventoryEntryFor(seeded.executionWorkspaceId);
+    expect(entry).toMatchObject({ decision: "blocked" });
+    expect(entry?.reason).toContain("Valuable or unknown ignored data");
+    expect(entry?.reason).toContain(`sub/${directory}`);
+  });
+
+  it.each([false, true])("allows internal upload snapshot symlinks with dirty=%s", async (dirty) => {
+    const seeded = await seedAncestryTerminalWorkspace();
+    await ignoreInWorktrees(seeded.worktreePath, "uploads");
+    const cachePath = path.join(seeded.worktreePath, "uploads", "model_cache");
+    await fs.mkdir(path.join(cachePath, "snapshots", "x"), { recursive: true });
+    await fs.mkdir(path.join(cachePath, "blobs"));
+    await fs.writeFile(path.join(cachePath, "blobs", "abc"), "cached model\n");
+    await fs.symlink("../../blobs/abc", path.join(cachePath, "snapshots", "x", "file"));
+    const outsideDir = await fs.mkdtemp(path.join(path.dirname(seeded.worktreePath), "outside-"));
+    const outsideTarget = path.join(outsideDir, "keep.txt");
+    await fs.writeFile(outsideTarget, "outside sentinel\n");
+    if (dirty) await fs.writeFile(path.join(seeded.worktreePath, "README.md"), "keep local code\n");
+
+    expect(await inventoryEntryFor(seeded.executionWorkspaceId)).toMatchObject({
+      decision: dirty ? "prune_regenerable" : "delete_tree",
+    });
+    expect(await reaperService({ deleteEnabled: true }).sweepTerminalWorkspaces()).toMatchObject({
+      archived: dirty ? 0 : 1,
+      cleanupFailed: dirty ? 1 : 0,
+    });
+    await expect(fs.access(path.join(seeded.worktreePath, "uploads"))).rejects.toThrow();
+    await expect(fs.readFile(outsideTarget, "utf8")).resolves.toBe("outside sentinel\n");
+  });
+
+  it.each(["absolute", "relative"])("blocks %s upload symlinks escaping the workspace during inventory and sweep", async (kind) => {
+    const seeded = await seedAncestryTerminalWorkspace();
+    await ignoreInWorktrees(seeded.worktreePath, "uploads");
+    const cachePath = path.join(seeded.worktreePath, "uploads", "model_cache");
+    await fs.mkdir(cachePath, { recursive: true });
+    const outsideDir = await fs.mkdtemp(path.join(path.dirname(seeded.worktreePath), "outside-"));
+    const outsideTarget = kind === "absolute"
+      ? path.join(outsideDir, "keep.txt")
+      : path.join(path.dirname(seeded.worktreePath), "outside");
+    await fs.writeFile(outsideTarget, "outside sentinel\n");
+    const linkPath = path.join(cachePath, "file");
+    await fs.symlink(kind === "absolute" ? outsideTarget : "../../../outside", linkPath);
+    await fs.writeFile(path.join(seeded.worktreePath, "README.md"), "keep local code\n");
+
+    const entry = await inventoryEntryFor(seeded.executionWorkspaceId);
+    expect(entry).toMatchObject({ decision: "blocked" });
+    expect(entry?.reason).toContain("Ignored symlink escapes workspace");
+    expect(await reaperService({ deleteEnabled: true }).sweepTerminalWorkspaces()).toMatchObject({ archived: 0 });
+    await expect(fs.access(path.join(seeded.worktreePath, "uploads"))).resolves.toBeUndefined();
+    await expect(fs.readlink(linkPath)).resolves.toBe(kind === "absolute" ? outsideTarget : "../../../outside");
+    await expect(fs.readFile(outsideTarget, "utf8")).resolves.toBe("outside sentinel\n");
   });
 
   it("blocks a nested sub/dist as valuable or unknown ignored data", async () => {

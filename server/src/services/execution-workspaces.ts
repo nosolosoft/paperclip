@@ -1569,6 +1569,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     ".paperclip-runtime": true,
     ".paperclip": true,
     ".gstack": true,
+    // Top-level smoke-test output only; nested names may contain application data.
+    ".smoke": true,
     dist: true,
     "test-results": true,
     coverage_html: true,
@@ -1591,6 +1593,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     ".paperclip-runtime": true,
     ".paperclip": true,
     ".gstack": true,
+    ".smoke": true,
     dist: true,
     "test-results": true,
   };

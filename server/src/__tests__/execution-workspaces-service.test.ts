@@ -45,6 +45,7 @@ import {
   stopRuntimeServicesForExecutionWorkspace,
 } from "../services/workspace-runtime.ts";
 import { workspaceGitOperationScheduler } from "../services/workspace-git-operation-scheduler.ts";
+import { inspectExternalWorkspaceUse } from "../services/workspace-external-use.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -924,7 +925,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
 
   it.each([false, true])("treats top-level runtime/build/coverage/log/upload directories as prunable with dirty=%s", async (dirty) => {
     const seeded = await seedAncestryTerminalWorkspace();
-    const directories = [".paperclip-runtime", ".paperclip", ".gstack", "dist", "test-results", "coverage_html", "htmlcov", "logs", "uploads"];
+    const directories = [".paperclip-runtime", ".paperclip", ".gstack", ".smoke", "dist", "test-results", "coverage_html", "htmlcov", "logs", "uploads"];
     for (const directory of directories) {
       await ignoreInWorktrees(seeded.worktreePath, directory);
       await fs.mkdir(path.join(seeded.worktreePath, directory), { recursive: true });
@@ -988,7 +989,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     if (dirty) await expect(fs.readFile(path.join(seeded.worktreePath, "sub", "tracked.txt"), "utf8")).resolves.toBe("tracked\n");
   });
 
-  it.each(["logs", "uploads"])("blocks nested sub/%s as valuable or unknown ignored data", async (directory) => {
+  it.each(["logs", "uploads", ".smoke"])("blocks nested sub/%s as valuable or unknown ignored data", async (directory) => {
     const seeded = await seedAncestryTerminalWorkspace();
     await ignoreInWorktrees(seeded.worktreePath, directory);
     await fs.mkdir(path.join(seeded.worktreePath, "sub", directory), { recursive: true });
@@ -1004,6 +1005,51 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(entry).toMatchObject({ decision: "blocked" });
     expect(entry?.reason).toContain("Valuable or unknown ignored data");
     expect(entry?.reason).toContain(`sub/${directory}`);
+  });
+
+  it.each(["db.sqlite-shm", "db.sqlite-wal"])("preserves top-level .smoke with an open %s descriptor", async (filename) => {
+    const seeded = await seedAncestryTerminalWorkspace();
+    await ignoreInWorktrees(seeded.worktreePath, ".smoke");
+    await fs.mkdir(path.join(seeded.worktreePath, ".smoke"));
+    const handle = await fs.open(path.join(seeded.worktreePath, ".smoke", filename), "w+");
+    try {
+      const service = reaperService({
+        deleteEnabled: true,
+        inspect: (cwd) => inspectExternalWorkspaceUse(cwd, {
+          // Scan real descriptors of this process, without unrelated host processes.
+          readdir: (directory) => directory === "/proc" ? Promise.resolve([String(process.pid)]) : fs.readdir(directory),
+          docker: async () => "[]",
+        }),
+      });
+      const inventory = await service.inventoryTerminalWorkspaces();
+      expect(inventory.find((entry) => entry.id === seeded.executionWorkspaceId)).toMatchObject({
+        decision: "deferred",
+        reason: expect.stringContaining("fd "),
+      });
+      expect(await service.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, cleanupFailed: 0 });
+      await expect(fs.access(path.join(seeded.worktreePath, ".smoke", filename))).resolves.toBeUndefined();
+    } finally {
+      await handle.close();
+    }
+  });
+
+  it("preserves tracked smoke changes even after verified delivery", async () => {
+    const seeded = await seedAncestryTerminalWorkspace();
+    await fs.mkdir(path.join(seeded.worktreePath, ".smoke"));
+    const databasePath = path.join(seeded.worktreePath, ".smoke", "db.sqlite-shm");
+    await fs.writeFile(databasePath, "tracked smoke state\n");
+    await runGit(seeded.worktreePath, ["add", ".smoke/db.sqlite-shm"]);
+    await runGit(seeded.worktreePath, ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "Track smoke state"]);
+    const repoRoot = path.resolve(seeded.worktreePath, "../../..");
+    await runGit(repoRoot, ["merge", "--ff-only", (await readGit(seeded.worktreePath, ["rev-parse", "HEAD"]))!]);
+    await runGit(repoRoot, ["push", "origin", "main"]);
+    await fs.writeFile(databasePath, "local smoke state\n");
+
+    expect(await inventoryEntryFor(seeded.executionWorkspaceId)).toMatchObject({
+      decision: "blocked", reason: "Workspace has local code changes",
+    });
+    expect(await reaperService({ deleteEnabled: true }).sweepTerminalWorkspaces()).toMatchObject({ archived: 0, cleanupFailed: 1 });
+    expect(await fs.readFile(databasePath, "utf8")).toBe("local smoke state\n");
   });
 
   async function seedTrackedLogsWorkspace(ignorePatterns: string[]) {
@@ -1096,10 +1142,15 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     await expect(fs.readFile(outsideTarget, "utf8")).resolves.toBe("outside sentinel\n");
   });
 
-  it.each(["absolute", "relative"])("blocks %s upload symlinks escaping the workspace during inventory and sweep", async (kind) => {
+  it.each([
+    { directory: "uploads", kind: "absolute" },
+    { directory: "uploads", kind: "relative" },
+    { directory: ".smoke", kind: "absolute" },
+    { directory: ".smoke", kind: "relative" },
+  ])("blocks $kind $directory symlinks escaping the workspace during inventory and sweep", async ({ directory, kind }) => {
     const seeded = await seedAncestryTerminalWorkspace();
-    await ignoreInWorktrees(seeded.worktreePath, "uploads");
-    const cachePath = path.join(seeded.worktreePath, "uploads", "model_cache");
+    await ignoreInWorktrees(seeded.worktreePath, directory);
+    const cachePath = path.join(seeded.worktreePath, directory, "model_cache");
     await fs.mkdir(cachePath, { recursive: true });
     const outsideDir = await fs.mkdtemp(path.join(path.dirname(seeded.worktreePath), "outside-"));
     const outsideTarget = kind === "absolute"
@@ -1114,7 +1165,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(entry).toMatchObject({ decision: "blocked" });
     expect(entry?.reason).toContain("Ignored symlink escapes workspace");
     expect(await reaperService({ deleteEnabled: true }).sweepTerminalWorkspaces()).toMatchObject({ archived: 0 });
-    await expect(fs.access(path.join(seeded.worktreePath, "uploads"))).resolves.toBeUndefined();
+    await expect(fs.access(path.join(seeded.worktreePath, directory))).resolves.toBeUndefined();
     await expect(fs.readlink(linkPath)).resolves.toBe(kind === "absolute" ? outsideTarget : "../../../outside");
     await expect(fs.readFile(outsideTarget, "utf8")).resolves.toBe("outside sentinel\n");
   });

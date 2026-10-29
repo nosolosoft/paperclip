@@ -610,6 +610,37 @@ describe("ACPX engine turn characterization", () => {
     expect(result.costUsd).toBeCloseTo(0.31);
   });
 
+  it("maps a completed turn that stopped with `refusal` to a transient failure and drops the session", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () =>
+        turnRuntime({
+          events: async function* () {
+            yield { type: "done", stopReason: "refusal" };
+          },
+          result: Promise.resolve({ status: "completed", stopReason: "refusal" }),
+        }) as never,
+    });
+
+    const result = await execute({
+      runId: "run-refusal",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("acpx_model_refusal");
+    expect(result.errorFamily).toBe("transient_upstream");
+    expect((result.resultJson as Record<string, unknown>)?.errorFamily).toBe("transient_upstream");
+    expect(result.clearSession).toBe(true);
+  });
+
   it("computes usage the same way summarizeAcpxTurnUsage does for the event fallback", () => {
     // Pin the exported helper the turn path calls: with no getStatus snapshots the
     // event breakdown and cost drive the per-run usage.

@@ -5035,7 +5035,13 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // A completed, non-timed-out turn whose channel stayed live is the one
         // success path. Every other outcome — a failed, cancelled, or timed-out
         // terminal, or a completed terminal with a lost channel — is a failure.
-        const turnSucceeded = terminal.status === "completed" && !timedOut && !channelLost;
+        // A completed turn whose stop reason is `refusal` is a provider-side cut
+        // (OmniRoute/OMP surface Anthropic refusals and content filters this way,
+        // often with a truncated tool call). It carries no work product, so it is
+        // a transient failure: never a clean success.
+        const modelRefusal = terminal.status === "completed" && !timedOut && !channelLost
+          && terminal.stopReason === "refusal";
+        const turnSucceeded = terminal.status === "completed" && !timedOut && !channelLost && !modelRefusal;
         // Read usage before the settlement can discard runtime state.
         const postTurnStatus = await readRuntimeStatus(runtime, sessionHandle);
         const turnUsage = summarizeAcpxTurnUsage({
@@ -5049,7 +5055,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // session so the next bounded turn receives the full task conversation.
         const sessionUnavailable = terminal.status === "failed" &&
           terminal.error.detailCode === "SESSION_RESUME_REQUIRED";
-        if (sessionUnavailable) clearSession = true;
+        if (sessionUnavailable || modelRefusal) clearSession = true;
         // Saving a conversation is independent from certifying tool outcomes.
         // Its next turn receives history, not a replay of pending tool calls.
         preserveInterruptedSession = ctx.signal?.aborted === true && !forcedStop && !timedOut && !channelLost
@@ -5078,7 +5084,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               : failedTurn
                 ? `paperclip turn ${terminal.status}`
                 : "paperclip completed turn cleanup",
-          discardPersistentState: sessionUnavailable || (terminal.status === "cancelled" && !preserveInterruptedSession) || timedOut || channelLost,
+          discardPersistentState: sessionUnavailable || modelRefusal || (terminal.status === "cancelled" && !preserveInterruptedSession) || timedOut || channelLost,
           dropWarmEntry: false,
           recordCloseError: false,
           cancelTurnReason: null,
@@ -5092,7 +5098,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           ? formatAdapterExecutionTimeoutErrorMessage(prepared.timeoutResolution)
           : channelLost
             ? channelLostMessage
-            : formatTerminalSessionFailure(resultErrorMessage(terminal), failureDiagnostic);
+            : modelRefusal
+              ? "The provider ended the turn with a refusal (stopReason: refusal); the partial turn was discarded."
+              : formatTerminalSessionFailure(resultErrorMessage(terminal), failureDiagnostic);
         const terminalStopReason = terminal.status === "failed" ? terminal.error.message : terminal.stopReason;
         const classifiedFailure = !timedOut && !channelLost && terminal.status === "failed"
           ? terminalFailureClassification
@@ -5116,10 +5124,13 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             ? "acpx_timeout"
             : channelLost
               ? DUPLEX_CHANNEL_LOST_ERROR_CODE
-              : terminal.status === "failed"
+              : modelRefusal
+                ? "acpx_model_refusal"
+                : terminal.status === "failed"
                 ? classifiedFailure?.errorCode ?? "acpx_turn_failed"
                 : null,
           ...(classifiedFailure?.errorFamily ? { errorFamily: classifiedFailure.errorFamily } : {}),
+          ...(modelRefusal ? { errorFamily: "transient_upstream" as const } : {}),
           ...(classifiedFailure?.retryNotBefore ? { retryNotBefore: classifiedFailure.retryNotBefore } : {}),
           sessionId: sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
           sessionParams: buildSessionParams({ prepared, handle: sessionHandle }),
@@ -5134,6 +5145,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             ...activityDiagnostics,
             ...(failureDiagnostic ? { terminalSessionFailure: failureDiagnostic } : {}),
             ...(classifiedFailure?.errorFamily ? { errorFamily: classifiedFailure.errorFamily } : {}),
+            ...(modelRefusal ? { errorFamily: "transient_upstream" } : {}),
             ...(classifiedFailure?.retryNotBefore
               ? {
                   retryNotBefore: classifiedFailure.retryNotBefore,
@@ -5198,6 +5210,13 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               kind: "turn_failed",
               error: new Error(channelLostMessage ?? "The sandbox duplex control channel was lost."),
             },
+            resources: emptyConsumed,
+          };
+        }
+        if (modelRefusal) {
+          return {
+            kind: "failed",
+            cause: { kind: "turn_failed", error: new Error("provider refusal") },
             resources: emptyConsumed,
           };
         }

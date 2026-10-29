@@ -3075,7 +3075,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             .select()
             .from(executionWorkspaces)
             .where(and(
-              inArray(executionWorkspaces.status, ["active", "idle", "in_review"]),
+              // Include failed cleanups so operators can inspect their current blockers.
+              inArray(executionWorkspaces.status, ["active", "idle", "in_review", "cleanup_failed"]),
               isNull(executionWorkspaces.closedAt),
               sql<boolean>`${executionWorkspaces.sourceIssueId} IS NOT NULL`,
               cursor

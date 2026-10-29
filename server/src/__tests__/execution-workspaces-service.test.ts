@@ -1050,6 +1050,9 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     });
     expect(await reaperService({ deleteEnabled: true }).sweepTerminalWorkspaces()).toMatchObject({ archived: 0, cleanupFailed: 1 });
     expect(await fs.readFile(databasePath, "utf8")).toBe("local smoke state\n");
+    expect(await inventoryEntryFor(seeded.executionWorkspaceId)).toMatchObject({
+      status: "cleanup_failed", decision: "blocked", reason: "Workspace has local code changes",
+    });
   });
 
   async function seedTrackedLogsWorkspace(ignorePatterns: string[]) {

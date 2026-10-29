@@ -56,6 +56,7 @@ Execution workspaces are durable until a human closes them.
 - Shared workspaces that point at the project primary checkout are treated more conservatively during cleanup than disposable isolated workspaces.
 - The terminal workspace reaper treats an ignored top-level `.smoke/` directory as disposable smoke-test output. A nested `.smoke/` directory is not disposable by name alone. Tracked changes inside `.smoke/` still block whole-tree removal, even after delivery; an operator must review those changes separately.
 - Cleanup still checks for open file descriptors (including SQLite `-shm` and `-wal` files), processes with a working directory inside the workspace, and escaping symlinks inside `.smoke/`. These checks can block cleanup even when the output is otherwise disposable.
+- The read-only reaper inventory includes `cleanup_failed` workspaces so operators can inspect their current blockers. This does not retry cleanup or change the workspace state. Non-terminal issue trees remain outside the terminal inventory.
 
 ## Resolved workspace logic during heartbeat runs
 

@@ -93,6 +93,7 @@ import {
   extractIssueWorkModeChanges,
 } from "../lib/issue-timeline-events";
 import { queryKeys } from "../lib/queryKeys";
+import { randomUuid } from "../lib/random-uuid";
 import { keepPreviousDataForSameQueryTail } from "../lib/query-placeholder-data";
 import {
   mergePendingIssueQueuedComments,
@@ -4536,7 +4537,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
       body: string; reopen?: boolean; interrupt?: boolean; attachmentIds?: string[]; clientRequestId?: string;
     }) => {
       if (issue?.conversationAgentId) clearLegacyChatMessageRequests(`${issue.companyId}:${currentUserId}:${issue.conversationAgentId}`);
-      return issuesApi.addComment(await resolveWritableIssueId(), body, reopen, interrupt, attachmentIds, clientRequestId ?? crypto.randomUUID());
+      return issuesApi.addComment(await resolveWritableIssueId(), body, reopen, interrupt, attachmentIds, clientRequestId ?? randomUuid());
     },
     onMutate: async ({ body, reopen, interrupt }) => {
       // Start cache cancellation immediately but do not put it in front of the

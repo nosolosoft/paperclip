@@ -5,6 +5,7 @@ import {
   useState,
   type RefObject,
 } from "react";
+import { randomUuid } from "../lib/random-uuid";
 import type {
   BrowserUseViewportPreset,
   BrowserUseViewportRequest,
@@ -44,7 +45,7 @@ export function useBrowserViewport({
   active: boolean;
   frameRef: RefObject<HTMLIFrameElement | null>;
 }) {
-  const [viewerId] = useState(() => crypto.randomUUID());
+  const [viewerId] = useState(() => randomUuid());
   const [state, setState] = useState<BrowserUseViewportState>({
     preset: "fit",
   });

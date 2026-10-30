@@ -61,6 +61,7 @@ import {
 } from "../hooks/usePaperclipIssueRuntime";
 import { useOptionalToastActions } from "../context/ToastContext";
 import { copyTextToClipboard } from "../lib/clipboard";
+import { randomUuid } from "../lib/random-uuid";
 import {
   loadDraft,
   loadDraftIfAvailable,
@@ -5058,7 +5059,7 @@ const IssueChatComposer = forwardRef<
         setBody(trimmed);
         return;
       }
-      attemptId = crypto.randomUUID();
+      attemptId = randomUuid();
       if (draftKey) {
         saveDraft(draftKey, trimmed);
         saveDraftSubmission(draftKey, { attemptId, reviewed: false });

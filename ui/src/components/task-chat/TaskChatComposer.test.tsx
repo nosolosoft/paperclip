@@ -317,6 +317,24 @@ describe("TaskChatComposer", () => {
     expect(editable().textContent).toBe("");
   });
 
+  it("sends a comment when crypto.randomUUID is unavailable (plain-HTTP LAN origin)", async () => {
+    const original = globalThis.crypto.randomUUID;
+    Object.defineProperty(globalThis.crypto, "randomUUID", { value: undefined, configurable: true });
+    try {
+      const onAdd = vi.fn().mockResolvedValue(undefined);
+      render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey="insecure-context" />);
+      typeText("Comment from the LAN");
+      pressKey("Enter", { metaKey: true });
+      await flushAsync();
+      expect(onAdd).toHaveBeenCalledTimes(1);
+      expect(onAdd.mock.calls[0]?.[0]).toBe("Comment from the LAN");
+      expect(onAdd.mock.calls[0]?.[4]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+      expect(editable().textContent).toBe("");
+    } finally {
+      Object.defineProperty(globalThis.crypto, "randomUUID", { value: original, configurable: true });
+    }
+  });
+
   it("automatically reconciles a restored submission by its server receipt, not its text", async () => {
     const key = "saved-receipt";
     const attemptId = "9af8228f-0be7-45ae-a104-6fbe0af6f1d3";
